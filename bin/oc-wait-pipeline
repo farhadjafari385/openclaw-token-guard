@@ -1,0 +1,272 @@
+#!/usr/bin/env python3
+"""oc-wait-pipeline: wait for a GitLab CI pipeline to reach a terminal state.
+
+Usage:
+  oc-wait-pipeline --project <id-or-path> --pipeline <id> [--host H] [--every 30] [--timeout 3h] [--json]
+  oc-wait-pipeline --project <id-or-path> --ref <branch> [...]
+  oc-wait-pipeline --project <id-or-path> --mr <iid> [...]
+  oc-wait-pipeline --project <id-or-path> --sha <commit> [--ref <branch>] [...]
+
+After a push, prefer --sha "$(git rev-parse HEAD)": it waits for the pipeline
+of that exact commit, including while GitLab is still creating it.
+
+Token resolution order: --token-file, then env GITLAB_TOKEN, then the first
+existing of ~/.openclaw/secrets/gitlab-pipeline-watch.token,
+~/.openclaw/secrets/gitlab-main.token. The token is never printed.
+
+Exit codes: 0 success, 1 failed/canceled, 124 timeout, 2 API/auth/usage error.
+"""
+import argparse
+import json
+import os
+import re
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+
+TERMINAL_STATES = {"success", "failed", "canceled", "skipped", "manual"}
+ANSI_RE = re.compile(r"\x1b\[[0-9;]*[a-zA-Z]")
+
+
+def parse_duration(spec):
+    spec = str(spec).strip()
+    m = re.fullmatch(r"(\d+(?:\.\d+)?)(s|m|h)?", spec)
+    if not m:
+        raise ValueError(f"invalid duration: {spec!r}")
+    n = float(m.group(1))
+    unit = m.group(2)
+    if unit == "m":
+        return n * 60
+    if unit == "h":
+        return n * 3600
+    return n
+
+
+def resolve_token(token_file):
+    if token_file:
+        try:
+            with open(token_file, "r") as f:
+                return f.read().strip()
+        except OSError as e:
+            print(f"oc-wait-pipeline: cannot read token file: {e.strerror}", file=sys.stderr)
+            sys.exit(2)
+    env_tok = os.environ.get("GITLAB_TOKEN")
+    if env_tok:
+        return env_tok.strip()
+    for candidate in (
+        os.path.expanduser("~/.openclaw/secrets/gitlab-pipeline-watch.token"),
+        os.path.expanduser("~/.openclaw/secrets/gitlab-main.token"),
+    ):
+        if os.path.exists(candidate):
+            try:
+                with open(candidate, "r") as f:
+                    return f.read().strip()
+            except OSError:
+                continue
+    return None
+
+
+def project_path_component(project):
+    if re.fullmatch(r"\d+", project):
+        return project
+    return urllib.parse.quote(project, safe="")
+
+
+class ApiError(Exception):
+    def __init__(self, status, message):
+        super().__init__(message)
+        self.status = status
+
+
+def api_get(host, path, token, params=None, max_retries=6):
+    url = f"{host.rstrip('/')}/api/v4{path}"
+    if params:
+        url += "?" + urllib.parse.urlencode(params, doseq=True)
+    req = urllib.request.Request(url, method="GET")
+    if token:
+        req.add_header("PRIVATE-TOKEN", token)
+    backoff = 1.0
+    for attempt in range(max_retries):
+        try:
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                body = resp.read()
+                return json.loads(body) if body else None
+        except urllib.error.HTTPError as e:
+            if e.code in (429, 500, 502, 503, 504) and attempt < max_retries - 1:
+                time.sleep(backoff)
+                backoff = min(backoff * 2, 30)
+                continue
+            if e.code in (401, 403):
+                raise ApiError(e.code, "authentication failed (check token/permissions)")
+            raise ApiError(e.code, f"HTTP {e.code} from GitLab API")
+        except urllib.error.URLError as e:
+            if attempt < max_retries - 1:
+                time.sleep(backoff)
+                backoff = min(backoff * 2, 30)
+                continue
+            raise ApiError(0, f"network error: {e.reason}")
+    raise ApiError(0, "exhausted retries")
+
+
+def get_trace(host, project, job_id, token):
+    url = f"{host.rstrip('/')}/api/v4/projects/{project_path_component(project)}/jobs/{job_id}/trace"
+    req = urllib.request.Request(url, method="GET")
+    if token:
+        req.add_header("PRIVATE-TOKEN", token)
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            return resp.read().decode("utf-8", errors="replace")
+    except Exception:
+        return ""
+
+
+def strip_ansi(text):
+    return ANSI_RE.sub("", text)
+
+
+def find_pipeline_id(host, project, token, args):
+    """Return the pipeline id to watch, or None if a --sha pipeline does not exist yet."""
+    if args.pipeline:
+        return args.pipeline
+    if args.sha:
+        params = {"sha": args.sha, "order_by": "id", "sort": "desc", "per_page": 1}
+        if args.ref:
+            params["ref"] = args.ref
+        pipelines = api_get(host, f"/projects/{project_path_component(project)}/pipelines", token, params=params)
+        return pipelines[0]["id"] if pipelines else None
+    if args.ref:
+        pipelines = api_get(
+            host, f"/projects/{project_path_component(project)}/pipelines", token,
+            params={"ref": args.ref, "order_by": "id", "sort": "desc", "per_page": 1},
+        )
+        if not pipelines:
+            raise ApiError(2, f"no pipelines found for ref {args.ref!r}")
+        return pipelines[0]["id"]
+    if args.mr:
+        mr_pipelines = api_get(
+            host, f"/projects/{project_path_component(project)}/merge_requests/{args.mr}/pipelines", token,
+        )
+        if not mr_pipelines:
+            raise ApiError(2, f"no pipelines found for MR !{args.mr}")
+        return mr_pipelines[0]["id"]
+    raise ApiError(2, "specify exactly one of --pipeline, --ref, --mr")
+
+
+def main(argv):
+    parser = argparse.ArgumentParser(prog="oc-wait-pipeline")
+    parser.add_argument("--project", required=True)
+    parser.add_argument("--pipeline", type=int)
+    parser.add_argument("--ref")
+    parser.add_argument("--mr", type=int)
+    parser.add_argument("--sha", help="commit SHA; waits for its pipeline to appear (combine with --ref to narrow)")
+    parser.add_argument("--host", default=os.environ.get("GITLAB_HOST", "https://gitlab.com"))
+    parser.add_argument("--every", default="30")
+    parser.add_argument("--timeout", default="3h")
+    parser.add_argument("--json", action="store_true")
+    parser.add_argument("--token-file")
+    try:
+        args = parser.parse_args(argv)
+    except SystemExit:
+        return 2
+
+    modes = sum(1 for x in (args.pipeline, args.ref if not args.sha else None, args.mr, args.sha) if x)
+    if modes != 1:
+        print("oc-wait-pipeline: specify exactly one of --pipeline, --ref, --mr, --sha (--ref may accompany --sha)", file=sys.stderr)
+        return 2
+
+    try:
+        every = parse_duration(args.every)
+        timeout = parse_duration(args.timeout)
+    except ValueError as e:
+        print(f"oc-wait-pipeline: {e}", file=sys.stderr)
+        return 2
+
+    token = resolve_token(args.token_file)
+    host = args.host
+    project = args.project
+
+    start = time.monotonic()
+    pipeline_id = None
+    pipeline = None
+    while True:
+        elapsed = time.monotonic() - start
+        try:
+            if pipeline_id is None:
+                pipeline_id = find_pipeline_id(host, project, token, args)
+            if pipeline_id is not None:
+                pipeline = api_get(host, f"/projects/{project_path_component(project)}/pipelines/{pipeline_id}", token)
+        except ApiError as e:
+            print(f"oc-wait-pipeline: {e}", file=sys.stderr)
+            return 2
+
+        if pipeline is not None and pipeline.get("status") in TERMINAL_STATES:
+            break
+
+        if elapsed >= timeout:
+            result = {"status": "timeout", "pipeline_id": pipeline_id, "elapsed_s": round(elapsed, 1)}
+            what = f"pipeline {pipeline_id}" if pipeline_id is not None else f"a pipeline for commit {args.sha}"
+            if args.json:
+                print(json.dumps(result))
+            else:
+                print(f"oc-wait-pipeline: timed out after {elapsed:.1f}s waiting on {what}")
+            return 124
+
+        time.sleep(min(every, max(timeout - elapsed, 0.1)))
+
+    status = pipeline.get("status")
+    summary = {
+        "status": status,
+        "id": pipeline.get("id"),
+        "ref": pipeline.get("ref"),
+        "sha": (pipeline.get("sha") or "")[:8],
+        "duration": pipeline.get("duration"),
+        "web_url": pipeline.get("web_url"),
+    }
+
+    failed_jobs_out = []
+    if status == "failed":
+        try:
+            jobs = api_get(
+                host, f"/projects/{project_path_component(project)}/pipelines/{pipeline_id}/jobs", token,
+                params={"per_page": 100},
+            ) or []
+        except ApiError:
+            jobs = []
+        failed_jobs = [j for j in jobs if j.get("status") == "failed"][:3]
+        for job in failed_jobs:
+            trace = strip_ansi(get_trace(host, project, job["id"], token))
+            trace_tail = "\n".join(trace.splitlines()[-30:])
+            failed_jobs_out.append(
+                {
+                    "name": job.get("name"),
+                    "stage": job.get("stage"),
+                    "web_url": job.get("web_url"),
+                    "trace_tail": trace_tail,
+                }
+            )
+
+    if args.json:
+        out = dict(summary)
+        if failed_jobs_out:
+            out["failed_jobs"] = failed_jobs_out
+        print(json.dumps(out))
+    else:
+        print(f"oc-wait-pipeline: pipeline {summary['id']} status={summary['status']}")
+        print(f"  ref: {summary['ref']}  sha: {summary['sha']}  duration: {summary['duration']}s")
+        print(f"  url: {summary['web_url']}")
+        for job in failed_jobs_out:
+            print(f"  -- failed job: {job['name']} (stage {job['stage']}) {job['web_url']}")
+            print(f"     last 30 lines:\n{job['trace_tail']}")
+
+    if status == "success":
+        return 0
+    if status in ("failed", "canceled"):
+        return 1
+    # skipped / manual: terminal without failure (manual = waiting for a person to start a job)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

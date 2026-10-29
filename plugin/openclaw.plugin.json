@@ -1,0 +1,45 @@
+{
+  "id": "token-guard",
+  "name": "Token Guard",
+  "description": "Blocks token-burning polling, sleep loops and runaway runs in agent tool calls; adds a task inbox for batching work.",
+  "categories": ["developer-tools"],
+  "activation": {
+    "onStartup": true
+  },
+  "contracts": {
+    "tools": ["task_inbox"]
+  },
+  "toolMetadata": {
+    "task_inbox": {
+      "optional": true,
+      "sideEffecting": true
+    }
+  },
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "enabled": { "type": "boolean" },
+      "mode": { "type": "string", "enum": ["enforce", "warn"] },
+      "maxPollsPerJob": { "type": "integer", "minimum": 0 },
+      "maxPollsPerRun": { "type": "integer", "minimum": 0 },
+      "subagentMaxPollsPerRun": { "type": "integer", "minimum": 0 },
+      "maxForegroundSleepSeconds": { "type": "number", "minimum": 0 },
+      "maxBackgroundSleepSeconds": { "type": "number", "minimum": 0 },
+      "minLoopSleepSeconds": { "type": "number", "minimum": 0 },
+      "maxRepeatCommand": { "type": "integer", "minimum": 2 },
+      "maxRepeatMessage": { "type": "integer", "minimum": 2 },
+      "checkpointEvery": { "type": "integer", "minimum": 0 },
+      "maxToolCallsPerRun": { "type": "integer", "minimum": 1 },
+      "maxStatusChecksPerRun": { "type": "integer", "minimum": 0 },
+      "statusExemptSessionPatterns": { "type": "array", "items": { "type": "string" } },
+      "briefMinChars": { "type": "integer", "minimum": 0 },
+      "requireBriefFields": { "type": "array", "items": { "type": "string" } },
+      "briefCheckAgents": { "type": "array", "items": { "type": "string" } },
+      "exemptSessionPatterns": { "type": "array", "items": { "type": "string" } },
+      "runIdleResetMs": { "type": "integer", "minimum": 0 },
+      "ttlMs": { "type": "integer", "minimum": 60000 },
+      "maxTrackedRuns": { "type": "integer", "minimum": 10 }
+    }
+  }
+}
