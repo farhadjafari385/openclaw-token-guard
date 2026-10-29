@@ -1,0 +1,148 @@
+#!/usr/bin/env python3
+"""oc-wait: wait for a command to succeed, a pid to exit, or a file to appear.
+
+Usage:
+  oc-wait [--every 30] [--timeout 2h] [--quiet] -- <shell command>
+  oc-wait --pid PID [--every 30] [--timeout 2h] [--quiet]
+  oc-wait --file PATH [--match REGEX] [--every 30] [--timeout 2h] [--quiet]
+
+Prints nothing while waiting. At the end prints one status line plus the
+last 20 lines of the final output (command mode only).
+
+Exit codes: 0 condition met, 124 timeout, 2 usage error.
+"""
+import argparse
+import os
+import re
+import signal
+import subprocess
+import sys
+import time
+
+DEFAULT_EVERY = 30
+DEFAULT_TIMEOUT = "2h"
+
+
+def parse_duration(spec):
+    """Parse '90', '90s', '15m', '2h' into seconds (float)."""
+    spec = str(spec).strip()
+    m = re.fullmatch(r"(\d+(?:\.\d+)?)(s|m|h)?", spec)
+    if not m:
+        raise ValueError(f"invalid duration: {spec!r}")
+    n = float(m.group(1))
+    unit = m.group(2)
+    if unit == "m":
+        return n * 60
+    if unit == "h":
+        return n * 3600
+    return n
+
+
+def pid_alive(pid):
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return False
+    return True
+
+
+def tail_lines(text, n=20):
+    lines = text.splitlines()
+    return "\n".join(lines[-n:])
+
+
+def main(argv):
+    parser = argparse.ArgumentParser(prog="oc-wait", add_help=True)
+    parser.add_argument("--every", default=str(DEFAULT_EVERY))
+    parser.add_argument("--timeout", default=DEFAULT_TIMEOUT)
+    parser.add_argument("--quiet", action="store_true")
+    parser.add_argument("--pid", type=int)
+    parser.add_argument("--file")
+    parser.add_argument("--match")
+    parser.add_argument("command", nargs=argparse.REMAINDER)
+    try:
+        args = parser.parse_args(argv)
+    except SystemExit:
+        return 2
+
+    try:
+        every = parse_duration(args.every)
+        timeout = parse_duration(args.timeout)
+    except ValueError as e:
+        print(f"oc-wait: {e}", file=sys.stderr)
+        return 2
+
+    modes = sum(1 for x in (args.pid, args.file, args.command and args.command != ["--"] and len(args.command) > 1) if x)
+    cmd = None
+    if args.command:
+        cmd = args.command
+        if cmd and cmd[0] == "--":
+            cmd = cmd[1:]
+
+    if args.pid and args.file:
+        print("oc-wait: specify only one of --pid, --file, or a command", file=sys.stderr)
+        return 2
+    if args.pid and cmd:
+        print("oc-wait: specify only one of --pid, --file, or a command", file=sys.stderr)
+        return 2
+    if args.file and cmd:
+        print("oc-wait: specify only one of --pid, --file, or a command", file=sys.stderr)
+        return 2
+    if not args.pid and not args.file and not cmd:
+        print("oc-wait: nothing to wait for; pass --pid, --file, or -- <command>", file=sys.stderr)
+        return 2
+
+    start = time.monotonic()
+    last_output = ""
+    last_returncode = None
+
+    while True:
+        elapsed = time.monotonic() - start
+
+        if args.pid:
+            if not pid_alive(args.pid):
+                print(f"oc-wait: pid {args.pid} exited after {elapsed:.1f}s")
+                return 0
+        elif args.file:
+            if os.path.exists(args.file):
+                if args.match:
+                    try:
+                        with open(args.file, "r", errors="replace") as f:
+                            content = f.read()
+                    except OSError:
+                        content = ""
+                    if re.search(args.match, content):
+                        print(f"oc-wait: file {args.file} matched pattern after {elapsed:.1f}s")
+                        return 0
+                else:
+                    print(f"oc-wait: file {args.file} appeared after {elapsed:.1f}s")
+                    return 0
+        else:
+            shell_cmd = cmd[0] if len(cmd) == 1 else " ".join(cmd)
+            proc = subprocess.run(
+                shell_cmd,
+                shell=True,
+                capture_output=True,
+                text=True,
+            )
+            last_output = (proc.stdout or "") + (proc.stderr or "")
+            last_returncode = proc.returncode
+            if proc.returncode == 0:
+                print(f"oc-wait: command succeeded after {elapsed:.1f}s (exit 0)")
+                if last_output.strip():
+                    print(tail_lines(last_output, 20))
+                return 0
+
+        if elapsed >= timeout:
+            print(f"oc-wait: timed out after {elapsed:.1f}s (limit {timeout:.1f}s)")
+            if cmd and last_output.strip():
+                print(tail_lines(last_output, 20))
+                print(f"oc-wait: last exit code was {last_returncode}")
+            return 124
+
+        remaining = timeout - elapsed
+        time.sleep(min(every, max(remaining, 0.1)))
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

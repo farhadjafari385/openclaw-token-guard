@@ -1,0 +1,291 @@
+#!/usr/bin/env python3
+"""oc-inbox: file-based task inbox backed by an append-only JSONL event log.
+
+Store: $OC_INBOX_FILE or ~/.openclaw/inbox/inbox.jsonl.
+Current state is derived by folding events (by id) in file order.
+
+Commands: add, list, plan, set, show. See --help on each subcommand.
+"""
+import argparse
+import datetime
+import fcntl
+import json
+import os
+import re
+import sys
+import uuid
+
+PRIORITIES = ["low", "normal", "high", "urgent"]
+TYPES = ["bug", "task", "feature", "question"]
+STATUSES = ["open", "planned", "dispatched", "done", "blocked", "dropped"]
+
+
+def inbox_path():
+    return os.environ.get("OC_INBOX_FILE") or os.path.expanduser("~/.openclaw/inbox/inbox.jsonl")
+
+
+def ensure_parent(path):
+    d = os.path.dirname(path)
+    if d and not os.path.isdir(d):
+        os.makedirs(d, exist_ok=True)
+
+
+def append_event(path, event):
+    ensure_parent(path)
+    event = dict(event)
+    event.setdefault("ts", datetime.datetime.now(datetime.timezone.utc).isoformat())
+    with open(path, "a+") as f:
+        fcntl.flock(f, fcntl.LOCK_EX)
+        try:
+            f.write(json.dumps(event, sort_keys=True) + "\n")
+            f.flush()
+            os.fsync(f.fileno())
+        finally:
+            fcntl.flock(f, fcntl.LOCK_UN)
+
+
+def read_events(path):
+    if not os.path.exists(path):
+        return []
+    events = []
+    with open(path, "r") as f:
+        fcntl.flock(f, fcntl.LOCK_SH)
+        try:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    events.append(json.loads(line))
+                except json.JSONDecodeError:
+                    continue
+        finally:
+            fcntl.flock(f, fcntl.LOCK_UN)
+    return events
+
+
+def fold_state(events):
+    items = {}
+    for ev in events:
+        item_id = ev.get("id")
+        if not item_id:
+            continue
+        kind = ev.get("kind")
+        if kind == "add":
+            items[item_id] = {
+                "id": item_id,
+                "project": ev.get("project"),
+                "title": ev.get("title"),
+                "type": ev.get("type", "task"),
+                "priority": ev.get("priority", "normal"),
+                "details": ev.get("details"),
+                "done_when": ev.get("done_when"),
+                "source": ev.get("source"),
+                "status": "open",
+                "batch": None,
+                "note": None,
+                "created_ts": ev.get("ts"),
+                "updated_ts": ev.get("ts"),
+            }
+        elif kind == "set":
+            if item_id not in items:
+                continue
+            it = items[item_id]
+            if ev.get("status"):
+                it["status"] = ev["status"]
+            if "batch" in ev:
+                it["batch"] = ev["batch"]
+            if "note" in ev:
+                it["note"] = ev["note"]
+            it["updated_ts"] = ev.get("ts")
+    return items
+
+
+def gen_id():
+    return uuid.uuid4().hex[:8]
+
+
+def normalize_title(title):
+    t = re.sub(r"[^a-z0-9\s]", "", title.lower())
+    return re.sub(r"\s+", " ", t).strip()
+
+
+def title_similarity(a, b):
+    na, nb = normalize_title(a), normalize_title(b)
+    if not na or not nb:
+        return 0.0
+    sa, sb = set(na.split()), set(nb.split())
+    if not sa or not sb:
+        return 0.0
+    overlap = len(sa & sb)
+    union = len(sa | sb)
+    return overlap / union if union else 0.0
+
+
+def cmd_add(args):
+    path = inbox_path()
+    events = read_events(path)
+    state = fold_state(events)
+
+    if args.priority not in PRIORITIES:
+        print(f"oc-inbox: invalid --priority {args.priority!r}", file=sys.stderr)
+        return 2
+    if args.type not in TYPES:
+        print(f"oc-inbox: invalid --type {args.type!r}", file=sys.stderr)
+        return 2
+
+    # duplicate detection: same project + similar title among open items
+    for it in state.values():
+        if it["status"] in ("done", "dropped"):
+            continue
+        if it.get("project") != args.project:
+            continue
+        sim = title_similarity(it["title"] or "", args.title)
+        if sim >= 0.6:
+            print(
+                f"oc-inbox: warning: likely duplicate of {it['id']} ({it['title']!r}, similarity={sim:.2f})",
+                file=sys.stderr,
+            )
+
+    new_id = gen_id()
+    event = {
+        "kind": "add",
+        "id": new_id,
+        "project": args.project,
+        "title": args.title,
+        "type": args.type,
+        "priority": args.priority,
+        "details": args.details,
+        "done_when": args.done_when,
+        "source": args.source,
+    }
+    append_event(path, event)
+    print(new_id)
+    return 0
+
+
+def cmd_list(args):
+    path = inbox_path()
+    state = fold_state(read_events(path))
+    items = list(state.values())
+    if args.status:
+        items = [i for i in items if i["status"] == args.status]
+    if args.project:
+        items = [i for i in items if i.get("project") == args.project]
+    items.sort(key=lambda i: (i.get("created_ts") or ""))
+
+    if args.json:
+        print(json.dumps(items, sort_keys=True))
+        return 0
+
+    for it in items:
+        print(f"{it['id']}  [{it['status']:10}] ({it['priority']:6}) {it.get('project') or '-':15} {it['title']}")
+    return 0
+
+
+def cmd_plan(args):
+    path = inbox_path()
+    state = fold_state(read_events(path))
+    open_items = [i for i in state.values() if i["status"] == "open"]
+
+    prio_rank = {p: i for i, p in enumerate(PRIORITIES)}
+    by_project = {}
+    for it in open_items:
+        proj = it.get("project") or "(no project)"
+        by_project.setdefault(proj, []).append(it)
+
+    batches = []
+    for proj, items in sorted(by_project.items()):
+        items.sort(key=lambda i: -prio_rank.get(i["priority"], 1))
+        flagged = []
+        for it in items:
+            needs_info = not it.get("project") or not it.get("done_when")
+            flagged.append({**it, "needs_info": needs_info})
+        batches.append({"project": proj, "items": flagged})
+
+    if args.json:
+        print(json.dumps(batches, sort_keys=True))
+        return 0
+
+    for batch in batches:
+        print(f"== {batch['project']} ==")
+        for it in batch["items"]:
+            tag = " [NEEDS INFO]" if it["needs_info"] else ""
+            print(f"  {it['id']}  ({it['priority']}) {it['title']}{tag}")
+    return 0
+
+
+def cmd_set(args):
+    path = inbox_path()
+    state = fold_state(read_events(path))
+    if args.id not in state:
+        print(f"oc-inbox: unknown id {args.id!r}", file=sys.stderr)
+        return 2
+    if args.status and args.status not in STATUSES:
+        print(f"oc-inbox: invalid --status {args.status!r}", file=sys.stderr)
+        return 2
+
+    event = {"kind": "set", "id": args.id}
+    if args.status:
+        event["status"] = args.status
+    if args.batch is not None:
+        event["batch"] = args.batch
+    if args.note is not None:
+        event["note"] = args.note
+    append_event(path, event)
+    print(args.id)
+    return 0
+
+
+def cmd_show(args):
+    path = inbox_path()
+    state = fold_state(read_events(path))
+    it = state.get(args.id)
+    if not it:
+        print(f"oc-inbox: unknown id {args.id!r}", file=sys.stderr)
+        return 2
+    print(json.dumps(it, indent=2, sort_keys=True))
+    return 0
+
+
+def main(argv):
+    parser = argparse.ArgumentParser(prog="oc-inbox")
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    p_add = sub.add_parser("add")
+    p_add.add_argument("--project", required=True)
+    p_add.add_argument("--title", required=True)
+    p_add.add_argument("--type", default="task", choices=TYPES)
+    p_add.add_argument("--priority", default="normal", choices=PRIORITIES)
+    p_add.add_argument("--details")
+    p_add.add_argument("--done-when")
+    p_add.add_argument("--source")
+    p_add.set_defaults(func=cmd_add)
+
+    p_list = sub.add_parser("list")
+    p_list.add_argument("--status", choices=STATUSES)
+    p_list.add_argument("--project")
+    p_list.add_argument("--json", action="store_true")
+    p_list.set_defaults(func=cmd_list)
+
+    p_plan = sub.add_parser("plan")
+    p_plan.add_argument("--json", action="store_true")
+    p_plan.set_defaults(func=cmd_plan)
+
+    p_set = sub.add_parser("set")
+    p_set.add_argument("id")
+    p_set.add_argument("--status", choices=STATUSES)
+    p_set.add_argument("--batch")
+    p_set.add_argument("--note")
+    p_set.set_defaults(func=cmd_set)
+
+    p_show = sub.add_parser("show")
+    p_show.add_argument("id")
+    p_show.set_defaults(func=cmd_show)
+
+    args = parser.parse_args(argv)
+    return args.func(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
