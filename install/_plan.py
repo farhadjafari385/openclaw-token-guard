@@ -147,6 +147,12 @@ def plan(config, args):
         op("tools.loopDetection.enabled", True, "OpenClaw's own repeated-call detector as a second net")
 
     defaults = (config.get("agents") or {}).get("defaults") or {}
+    timeout = (defaults.get("compaction") or {}).get("timeoutSeconds")
+    if not isinstance(timeout, (int, float)) or timeout < args.compaction_timeout:
+        op("agents.defaults.compaction.timeoutSeconds", args.compaction_timeout,
+           f"compaction gets {args.compaction_timeout}s instead of the 180s default; a compaction killed "
+           "at the limit has already paid for reading the whole session")
+
     max_file, max_total = bootstrap_needs(config, args.coordinator, args.rules_dir)
     file_limit = defaults.get("bootstrapMaxChars") or DEFAULT_FILE_MAX
     total_limit = defaults.get("bootstrapTotalMaxChars") or DEFAULT_TOTAL_MAX
@@ -190,6 +196,7 @@ def main(argv):
     ap.add_argument("config")
     ap.add_argument("--coordinator", default="coordinator")
     ap.add_argument("--context-tokens", type=int, default=200000)
+    ap.add_argument("--compaction-timeout", type=int, default=900)
     ap.add_argument("--daily-reset-hour", type=int)
     ap.add_argument("--group-idle-minutes", type=int)
     ap.add_argument("--rules-dir", default=os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "rules"))

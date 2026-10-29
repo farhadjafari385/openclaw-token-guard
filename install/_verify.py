@@ -21,6 +21,7 @@ def main(argv):
     ap.add_argument("--coordinator", default="coordinator")
     ap.add_argument("--inspect", help="file with `openclaw plugins inspect token-guard --runtime --json` output")
     ap.add_argument("--context-tokens", type=int, default=200000)
+    ap.add_argument("--compaction-timeout", type=int, default=900)
     args = ap.parse_args(argv)
 
     fails = 0
@@ -37,6 +38,9 @@ def main(argv):
     for model_id, _ in _plan.MODELS:
         tokens = (by_id.get(model_id) or {}).get("contextTokens")
         check(isinstance(tokens, int) and tokens <= args.context_tokens, f"{model_id}: contextTokens {tokens}")
+    timeout = ((((cfg.get("agents") or {}).get("defaults") or {}).get("compaction") or {}).get("timeoutSeconds"))
+    check(isinstance(timeout, (int, float)) and timeout >= args.compaction_timeout,
+          f"agents.defaults.compaction.timeoutSeconds {timeout} (OpenClaw default 180 when unset)")
     check(((cfg.get("tools") or {}).get("loopDetection") or {}).get("enabled") is True, "tools.loopDetection.enabled true")
     entry = ((cfg.get("plugins") or {}).get("entries") or {}).get("token-guard") or {}
     check(entry.get("enabled", True) is not False, f"plugins.entries.token-guard enabled ({entry.get('enabled', 'default')})")
