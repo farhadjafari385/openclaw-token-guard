@@ -8,6 +8,7 @@
 #   --oc-home=PATH           OpenClaw home (default ~/.openclaw, or $OC_HOME)
 #   --coordinator=ID         coordinator agent id (default: coordinator)
 #   --context-tokens=N       Claude Code compaction window (default 200000)
+#   --compaction-timeout=S   seconds a compaction may run (default 900; OpenClaw's own is 180)
 #   --daily-reset-hour=H     reset group sessions daily at H (gateway local time)
 #   --group-idle-minutes=M   also reset group sessions after M idle minutes
 #   --patch-legacy           replace known legacy "keep polling" rules in AGENTS.md
@@ -35,6 +36,7 @@ for arg in "$@"; do
     --oc-home=*) OC_HOME="${arg#*=}" ;;
     --coordinator=*) COORDINATOR_ID="${arg#*=}" ;;
     --context-tokens=*) PLAN_ARGS+=(--context-tokens "${arg#*=}") ;;
+    --compaction-timeout=*) PLAN_ARGS+=(--compaction-timeout "${arg#*=}") ;;
     --daily-reset-hour=*) PLAN_ARGS+=(--daily-reset-hour "${arg#*=}") ;;
     --group-idle-minutes=*) PLAN_ARGS+=(--group-idle-minutes "${arg#*=}") ;;
     --patch-legacy) PATCH_LEGACY=1 ;;

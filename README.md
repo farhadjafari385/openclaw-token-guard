@@ -25,8 +25,15 @@ them in code, inside the OpenClaw gateway.
 | `tools/oversized-sessions.py` | Finds sessions that already outgrew their context window and, with `--reset`, backs up and resets them. `verify.sh` fails while any session is past its window. |
 
 The installer also sets a 200k compaction window for Claude Code sessions,
-turns on OpenClaw's loop detection, and can reset group sessions daily, so no
-session grows until compaction itself no longer fits.
+gives compaction 15 minutes instead of OpenClaw's 180-second default, turns on
+OpenClaw's loop detection, and can reset group sessions daily, so no session
+grows until compaction itself no longer fits.
+
+Why the compaction timeout matters: for a Claude CLI session, OpenClaw compacts
+by running `claude --resume <session> /compact` with the session's own model and
+thinking level. On a large session with high thinking that can take longer than
+180 seconds; OpenClaw then kills it ("CLI exceeded timeout (180s)") after Claude
+has already read the whole session, and every retry pays for it again.
 
 ## Requirements
 
@@ -53,7 +60,7 @@ install/remote.sh myserver --patch-legacy   # copy, test, apply, verify over SSH
 ```
 
 Useful options for `apply.sh`: `--coordinator=ID` (your orchestrator agent id),
-`--context-tokens=N`, `--daily-reset-hour=H`, `--install-skills`,
+`--context-tokens=N`, `--compaction-timeout=S`, `--daily-reset-hour=H`, `--install-skills`,
 `--skip-plugin`, `--skip-config`. The script never restarts the gateway; if the
 plugin does not load, restart it once yourself.
 

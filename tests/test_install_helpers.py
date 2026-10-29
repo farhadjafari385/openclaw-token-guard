@@ -27,6 +27,7 @@ class Args:
     def __init__(self, **kw):
         self.coordinator = "coordinator"
         self.context_tokens = 200000
+        self.compaction_timeout = 900
         self.daily_reset_hour = None
         self.group_idle_minutes = None
         self.rules_dir = os.path.join(REPO, "rules")
@@ -72,6 +73,18 @@ class TestPlan(unittest.TestCase):
         cfg = self.config()
         cfg["models"] = {"providers": {"anthropic": {"models": plan_mod.merged_models(cfg, 200000)}}}
         self.assertNotIn("models.providers.anthropic.models", self.ops(cfg))
+
+    def test_compaction_timeout_raised_from_default(self):
+        op = self.ops(self.config())["agents.defaults.compaction.timeoutSeconds"]
+        self.assertEqual(op["value"], 900)
+        cfg = self.config()
+        cfg["agents"]["defaults"] = {"compaction": {"mode": "safeguard", "timeoutSeconds": 120}}
+        self.assertEqual(self.ops(cfg)["agents.defaults.compaction.timeoutSeconds"]["value"], 900)
+
+    def test_longer_compaction_timeout_is_kept(self):
+        cfg = self.config()
+        cfg["agents"]["defaults"] = {"compaction": {"timeoutSeconds": 1800}}
+        self.assertNotIn("agents.defaults.compaction.timeoutSeconds", self.ops(cfg))
 
     def test_bootstrap_limit_raised_when_rules_would_be_cut(self):
         op = self.ops(self.config())["agents.defaults.bootstrapMaxChars"]
