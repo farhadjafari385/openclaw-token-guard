@@ -1,18 +1,20 @@
 #!/usr/bin/env python3
 """oversized-sessions: find OpenClaw sessions that outgrew their context window, and reset them.
 
-A session past its window cannot compact: compaction has to send the whole
-session to the model, and every "compact" or "fix yourself" message is another
-full-size run that fails. Only a reset gets it back. This tool lists such
-sessions and, with --reset, backs up every affected agent database and resets
-them through the running gateway (sub-agent sessions are archived instead,
-since a reset keeps their Claude CLI binding).
+A session past its window rarely recovers on its own: compacting it means
+sending the whole oversized session to the model, which is slow, costly and can
+time out, and every "compact" or "fix yourself" message is another full-size
+run. A reset gets it back. This tool lists such sessions and, with --reset,
+backs up every affected agent database and resets them through the running
+gateway (sub-agent sessions are archived instead, since a reset keeps their
+Claude CLI binding).
 
   oversized-sessions.py                    report sessions at >= 80% of their window
   oversized-sessions.py --threshold 1.0    only sessions past their window
   oversized-sessions.py --reset            back up, then reset/archive them
 
-Exit code: 0 when nothing matched (or every reset succeeded), 1 otherwise.
+Exit code: 0 when nothing matched (or every reset succeeded), 1 when sessions
+matched (or a reset failed), 2 when the sessions could not be listed.
 """
 import argparse
 import glob
@@ -22,6 +24,7 @@ import sqlite3
 import subprocess
 import sys
 import time
+from contextlib import closing
 
 DEFAULT_WINDOW = 200000
 
@@ -72,7 +75,9 @@ def backup_agents(oc_home, agents, dest):
         src = os.path.join(oc_home, "agents", agent, "agent", "openclaw-agent.sqlite")
         if not os.path.isfile(src):
             raise FileNotFoundError(src)
-        with sqlite3.connect(f"file:{src}?mode=ro", uri=True) as s, sqlite3.connect(os.path.join(dest, f"{agent}.sqlite")) as d:
+        # sqlite3's own context manager only ends the transaction; closing() closes the file.
+        with closing(sqlite3.connect(f"file:{src}?mode=ro", uri=True)) as s, \
+                closing(sqlite3.connect(os.path.join(dest, f"{agent}.sqlite"))) as d:
             s.backup(d)
 
 

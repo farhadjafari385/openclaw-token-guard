@@ -69,12 +69,13 @@ python3 "$REPO_ROOT/install/_verify.py" --config "$CONFIG" --coordinator "$COORD
 FAILS=$((FAILS + $?))
 
 if [ "${#OPENCLAW_CMD[@]}" -gt 0 ]; then
-  if over="$(python3 "$REPO_ROOT/tools/oversized-sessions.py" --oc-home="$OC_HOME" --threshold 1.0 --quiet 2>&1)"; then
-    pass "no session past its context window"
-  else
-    fail "sessions past their context window (fix: tools/oversized-sessions.py --threshold 1.0 --reset):"
-    printf '        %s\n' "$over"
-  fi
+  over="$(python3 "$REPO_ROOT/tools/oversized-sessions.py" --oc-home="$OC_HOME" --threshold 1.0 --quiet 2>&1)"
+  case $? in
+    0) pass "no session past its context window" ;;
+    1) fail "sessions past their context window (fix: tools/oversized-sessions.py --threshold 1.0 --reset):"
+       printf '%s\n' "$over" | sed 's/^/        /' ;;
+    *) fail "could not list sessions: $over" ;;
+  esac
 fi
 rm -rf "$tmp"
 
