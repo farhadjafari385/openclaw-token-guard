@@ -37,7 +37,7 @@ session grows until compaction itself no longer fits.
 ## Install
 
 ```bash
-git clone https://github.com/<you>/openclaw-token-guard.git
+git clone https://github.com/farhadjafari385/openclaw-token-guard.git
 cd openclaw-token-guard
 
 tests/run-all.sh                         # unit tests: plugin + scripts
