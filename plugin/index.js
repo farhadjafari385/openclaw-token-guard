@@ -1,6 +1,6 @@
 import { definePluginEntry } from "openclaw/plugin-sdk/plugin-entry";
 import { Type } from "typebox";
-import { createState, decide, endRun } from "./guard.js";
+import { createState, decide } from "./guard.js";
 import { inboxArgs, runInbox } from "./inbox.js";
 
 // No top-level await: OpenClaw loads plugin entries through require(), which
@@ -37,17 +37,10 @@ export default definePluginEntry({
       { priority: 50 },
     );
 
-    try {
-      api.on("agent_end", (event, ctx) => {
-        try {
-          endRun(state, event, ctx);
-        } catch {
-          // best effort; TTL cleanup covers misses
-        }
-      });
-    } catch (error) {
-      log("warn", "token-guard: agent_end hook unavailable; using TTL cleanup", { error: String(error && error.message) });
-    }
+    // No agent_end hook: OpenClaw only gives it to non-bundled plugins granted
+    // hooks.allowConversationAccess, which a counter does not need. Each run is
+    // keyed by its runId, and the TTL, size cap and idle reset in guard.js prune
+    // finished runs.
 
     const text = (description) => Type.Optional(Type.String({ description }));
     api.registerTool({

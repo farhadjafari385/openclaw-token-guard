@@ -31,8 +31,8 @@ session grows until compaction itself no longer fits.
 ## Requirements
 
 - OpenClaw **2026.10.5** or newer (gateway running)
-- Python 3.9+, Node (the one bundled under `~/.openclaw/tools/` is used automatically)
-- Linux or macOS
+- Python 3, and Node 20+ on `PATH` for the plugin tests (`install/` finds OpenClaw's bundled Node by itself)
+- Linux (tested on Ubuntu). The scripts use GNU tools; macOS is untested.
 
 ## Install
 
@@ -77,8 +77,9 @@ what would be blocked before enforcing.
 
 ## If a session is already over its window
 
-When a session is past its context window, compaction cannot run (it has to send
-the whole session to the model) and every "compact" or "fix yourself" message
+When a session is past its context window, it rarely recovers on its own:
+compacting it means sending the whole oversized session to the model, which is
+slow, costly and can time out, and every "compact" or "fix yourself" message
 burns another full-size run. Do not ask the agent to fix it. Send `/new` in that
 chat, or reset every such session at once (agent databases are backed up first,
 old transcripts are kept):
@@ -89,8 +90,12 @@ tools/oversized-sessions.py --threshold 1.0 --reset # back up, then reset the on
 ```
 
 Lowering `contextTokens` only applies to new runs: a session that already grew
-past the new cap under the old 1M window stays oversized until it is reset. Run
+past the new cap under the old 1M window stays oversized. Run
 `oversized-sessions.py` right after installing.
+
+A reset keeps the session id and the old transcript, and appends a reset
+marker: the next turn starts a fresh Claude CLI session with no earlier
+history, so the context starts near zero.
 
 ## License
 

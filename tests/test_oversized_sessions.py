@@ -4,9 +4,11 @@ import io
 import json
 import os
 import sqlite3
+import subprocess
 import tempfile
 import unittest
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
+from unittest import mock
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 spec = importlib.util.spec_from_file_location("oversized", os.path.join(REPO, "tools", "oversized-sessions.py"))
@@ -69,6 +71,11 @@ class TestMain(unittest.TestCase):
     def test_clean_exit_zero(self):
         code, _ = self.run_main("--threshold", "5")
         self.assertEqual(code, 0)
+
+    def test_listing_failure_exit_two(self):
+        failed = subprocess.CompletedProcess(args=[], returncode=1, stdout="", stderr="gateway down")
+        with mock.patch.object(oversized.subprocess, "run", return_value=failed), redirect_stderr(io.StringIO()):
+            self.assertEqual(oversized.main(["--oc-home", self.tmp.name]), 2)
 
     def test_backup_copies_agent_db(self):
         src_dir = os.path.join(self.tmp.name, "agents", "devops", "agent")
