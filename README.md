@@ -22,6 +22,7 @@ them in code, inside the OpenClaw gateway.
 | `skills/` | `token-guard` (how to wait) and `task-intake` (how to batch) skills. |
 | `install/` | One installer for any host: dry run, backup, apply, verify, rollback, and a remote deploy over SSH. |
 | `tools/token-audit.py` | Finds where your tokens went: per-session usage and polling patterns from Claude Code transcripts. |
+| `tools/oversized-sessions.py` | Finds sessions that already outgrew their context window and, with `--reset`, backs up and resets them. `verify.sh` fails while any session is past its window. |
 
 The installer also sets a 200k compaction window for Claude Code sessions,
 turns on OpenClaw's loop detection, and can reset group sessions daily, so no
@@ -79,7 +80,17 @@ what would be blocked before enforcing.
 When a session is past its context window, compaction cannot run (it has to send
 the whole session to the model) and every "compact" or "fix yourself" message
 burns another full-size run. Do not ask the agent to fix it. Send `/new` in that
-chat to start a fresh session; the old transcript is kept.
+chat, or reset every such session at once (agent databases are backed up first,
+old transcripts are kept):
+
+```bash
+tools/oversized-sessions.py                         # report sessions at >= 80% of their window
+tools/oversized-sessions.py --threshold 1.0 --reset # back up, then reset the ones past it
+```
+
+Lowering `contextTokens` only applies to new runs: a session that already grew
+past the new cap under the old 1M window stays oversized until it is reset. Run
+`oversized-sessions.py` right after installing.
 
 ## License
 
