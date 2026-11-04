@@ -10,7 +10,11 @@ import {
   createJobStore, mergeJobsConfig, recordSpawn, recordActivity, recordUsage, recordResultText,
   recordEnd, setClaudeLimited, scanJobs, lastAssistantText,
 } from "./jobs.js";
-import { createMirror, topicFor, formatDispatch, formatResult } from "./mirror.js";
+import { createMirror, topicFor, messageIdOf } from "./mirror.js";
+import {
+  dispatchText, ackText, resultText, guardText, limitText, budgetText, approvalAskText, approvalReplyText,
+  auditText, movedText, mdToHtml, handleOf,
+} from "./voice.js";
 import { inboxArgs, loadInboxItems, runInbox } from "./inbox.js";
 
 // No top-level await: OpenClaw loads plugin entries through require(), which
@@ -52,12 +56,16 @@ export default definePluginEntry({
 
     const store = createJobStore(jobsCfg.stateFile);
     store.load();
-    const mirror = createMirror({ cfg: Object.assign({ orchestratorAgent: orchestrator }, cfg.mirror), log });
-    const post = (agentId, topic, text) => { mirror.post({ agentId, topic, text }).catch(() => {}); };
+    const ownerId = String(cfg.ownerId || "");
+    const boardCfg = Object.assign({ enabled: true, agent: "product", auditEveryMinutes: 180, view: true }, cfg.board || {});
+    const pm = boardCfg.agent || "product";
+    const mirror = createMirror({ cfg: Object.assign({ orchestratorAgent: orchestrator, ownerId, pmAgent: pm }, cfg.mirror), log });
+    const voice = mirror.cfg; // names, @handles and the owner's handle for the team's messages
+    // Post as one agent's bot. say() resolves to the new message id (or null); post() fires and forgets.
+    const say = (agentId, topic, text, opts = {}) => mirror.post(Object.assign({ agentId, topic, text }, opts)).catch(() => null);
+    const post = (agentId, topic, text, opts) => { say(agentId, topic, text, opts); };
     const projects = cfg.projects || {};
     const topicsCfg = cfg.topics || {};
-    const boardCfg = Object.assign({ enabled: true, agent: "product", auditEveryMinutes: 180, view: true }, cfg.board || {});
-    const ownerId = String(cfg.ownerId || "");
     const teamTopic = Number(topicsCfg.teamTopic || (cfg.mirror && cfg.mirror.systemTopic) || 160);
     const chatId = String(topicsCfg.chatId || (cfg.mirror && cfg.mirror.chatId) || "");
 
@@ -87,7 +95,7 @@ export default definePluginEntry({
     const upsertBoardMessage = (key, topic, text) => {
       store.data.boardMessages = store.data.boardMessages || {};
       const prev = store.data.boardMessages[key];
-      const hash = crypto.createHash("sha1").update(text.replace(/· \d\d:\d\d UTC/, "")).digest("hex").slice(0, 12);
+      const hash = crypto.createHash("sha1").update(text.replace(/\d\d:\d\d UTC/, "")).digest("hex").slice(0, 12);
       if (prev && prev.hash === hash) return;
       const create = () => mirror.post({ agentId: orchestrator, topic, text }).then((id) => {
         if (typeof id === "number") {
@@ -112,11 +120,94 @@ export default definePluginEntry({
 
     // Rate-limited notes to the System topic (one per key per 30 minutes).
     const noted = new Map();
-    const systemNote = (key, text) => {
+    const systemNote = (key, text, opts) => {
       const now = Date.now();
       if (now - (noted.get(key) || 0) < 30 * 60000) return;
       noted.set(key, now);
-      post(orchestrator, "system", text);
+      post(orchestrator, "system", text, opts);
+    };
+
+    // ---- the conversation thread of each task: owner's request -> dispatch -> "on it" -> result -> orchestrator ----
+    const threads = new Map(); // job key -> promise that settles when the dispatch (and ack) are posted
+    const setJob = (key, fields) => {
+      const j = store.data.jobs[key];
+      if (!j) return;
+      Object.assign(j, fields);
+      store.touch();
+      store.save();
+    };
+    const topicOfSession = (sessionKey) => {
+      const m = /:topic:(\d+)/.exec(String(sessionKey || ""));
+      return m ? Number(m[1]) : null;
+    };
+    const lastOwnerMessage = (topic, maxAgeMs) => {
+      const last = (store.data.ownerMsgs || {})[String(topic)];
+      return last && last.id && Date.now() - last.at < maxAgeMs ? last.id : null;
+    };
+    // The owner's message a dispatch answers: the item's recorded source, else the owner's latest message in that topic.
+    const requestMessageFor = (topic, itemIds, board) => {
+      for (const id of itemIds) {
+        const m = /\btg:(\d+):(\d+)\b/.exec(String((board.get(id) || {}).source || ""));
+        if (m && Number(m[1]) === Number(topic)) return Number(m[2]);
+      }
+      return lastOwnerMessage(topic, 60 * 60000);
+    };
+    // The newest worker result in a topic that the orchestrator has not answered yet (claimed once).
+    const takePendingResult = (topic) => {
+      const now = Date.now();
+      let best = null;
+      for (const j of Object.values(store.data.jobs)) {
+        if (!j.resultMsgId || j.answeredAt || Number(j.topic) !== Number(topic) || now - (j.endedAt || 0) > 3 * 3600000) continue;
+        if (!best || (j.endedAt || 0) > (best.endedAt || 0)) best = j;
+      }
+      if (best) { best.answeredAt = now; store.touch(); }
+      return best;
+    };
+    const withMention = (text, agentId) => {
+      const h = handleOf(voice, agentId);
+      const t = String(text === undefined || text === null ? "" : text);
+      if (!h.startsWith("@") || !t.trim() || t.includes(h)) return t;
+      return `${h} ${t}`;
+    };
+    // An orchestrator post in a project topic answers the newest unanswered result there, and mentions its worker.
+    const threadOrchestratorPost = (p) => {
+      if (!p || p.replyTo || String(p.action || "send") !== "send") return null;
+      const chat = String(p.target || p.to || p.chatId || "");
+      if (!chatId || !chat.includes(chatId)) return null;
+      const topic = Number(p.threadId || p.messageThreadId || 0);
+      if (!topic || topic <= 1) return null;
+      const pending = takePendingResult(topic);
+      if (!pending) return null;
+      const field = p.message !== undefined ? "message" : p.content !== undefined ? "content" : p.text !== undefined ? "text" : "message";
+      return Object.assign({}, p, { replyTo: String(pending.resultMsgId), [field]: withMention(p[field], pending.agentId) });
+    };
+    // Board items the orchestrator records from a topic remember the owner's message they came from.
+    const withSource = (p, sessionKey) => {
+      const topic = topicOfSession(sessionKey);
+      const id = topic ? lastOwnerMessage(topic, 2 * 3600000) : null;
+      if (!id || /\btg:\d+:\d+\b/.test(String(p.source || ""))) return null;
+      return Object.assign({}, p, { source: `${p.source ? `${p.source} ` : ""}tg:${topic}:${id}`.trim() });
+    };
+    // After the orchestrator approves checked work, ask the owner once (archiving needs both approvals).
+    const askOwnerToApprove = (ids) => {
+      const board = loadInboxItems();
+      store.data.askedApproval = store.data.askedApproval || {};
+      const byTopic = new Map();
+      for (const id of ids) {
+        const it = board.get(id);
+        if (!it || !["done", "dropped"].includes(normStatus(it.status)) || !it.orc_approved_ts || it.owner_approved_ts) continue;
+        if ((store.data.askedApproval[id] || 0) >= (Date.parse(it.orc_approved_ts) || 0)) continue;
+        store.data.askedApproval[id] = Date.now();
+        const project = projectFor(it);
+        const topic = Number((projects[project] && projects[project].topic) || teamTopic);
+        if (!byTopic.has(topic)) byTopic.set(topic, []);
+        byTopic.get(topic).push(it);
+      }
+      store.touch();
+      for (const [topic, items] of byTopic) {
+        const src = items.length === 1 ? /\btg:(\d+):(\d+)\b/.exec(String(items[0].source || "")) : null;
+        post(orchestrator, topic, approvalAskText(voice, items), { html: true, replyTo: src && Number(src[1]) === topic ? Number(src[2]) : null });
+      }
     };
 
     const runningItemIds = () => {
@@ -134,7 +225,7 @@ export default definePluginEntry({
       },
       onBlock: (rule, info) => {
         if (["protectedFile", "protectedConfig", "backChannel", "spawnByWorker", "sendByWorker", "orchestratorOnly", "modelPin"].includes(rule)) {
-          systemNote(`${rule}:${info.agentId}`, `🛡 Guard blocked ${info.agentId}: ${rule} (${info.tool}).`);
+          systemNote(`${rule}:${info.agentId}`, guardText(voice, rule, info), { html: true });
         }
       },
       onNote: (text) => systemNote("spawn-note", `🔀 ${text}`),
@@ -146,8 +237,8 @@ export default definePluginEntry({
       if (setClaudeLimited(store.data, until, text)) {
         store.touch();
         store.save();
-        post(orchestrator, "system",
-          `⚠️ Claude limit hit (${source}): "${String(text).slice(0, 120)}". New tasks go to Codex until ${new Date(until).toISOString().slice(11, 16)} UTC.`);
+        log("info", "token-guard: Claude limit", { source, text: String(text).slice(0, 160) });
+        post(orchestrator, "system", limitText(voice, until, cfg.spawn && cfg.spawn.codexModel), { html: true });
       }
     };
 
@@ -193,7 +284,20 @@ export default definePluginEntry({
       store.touch();
       store.save();
       if (job) {
-        post(orchestrator, job.topic, formatDispatch(cfg.mirror, job));
+        const key = childSessionKey;
+        const replyTo = requestMessageFor(job.topic, items, board);
+        if (replyTo) setJob(key, { requestMsgId: replyTo });
+        const thread = say(orchestrator, job.topic, dispatchText(voice, store.data.jobs[key] || job), { html: true, replyTo })
+          .then((id) => {
+            if (typeof id !== "number") return null;
+            setJob(key, { dispatchMsgId: id });
+            if (voice.acks === false) return id;
+            return say(agentId, job.topic, ackText(voice, job), { html: true, replyTo: id }).then((ackId) => {
+              if (typeof ackId === "number") setJob(key, { ackMsgId: ackId });
+              return id;
+            });
+          });
+        threads.set(key, thread);
         const moves = items.filter((id) => ["backlog", "todo", "blocked"].includes(normStatus(board.get(id).status)))
           .map((id) => systemMove(id, "in_progress", `dispatched to ${agentId} [job ${job.short}]`));
         Promise.all(moves).then(() => refreshItems(items));
@@ -213,8 +317,13 @@ export default definePluginEntry({
           const rewritten = pol && pol.params ? Object.assign({}, event, { params: pol.params }) : event;
           const res = decide(rewritten, ctx, state, cfg, log, now);
           if (res && res.block) return res;
-          const params = (res && res.params) || (pol && pol.params);
+          let params = (res && res.params) || (pol && pol.params);
           if (event.toolName === "sessions_spawn" && ctx && ctx.agentId === orchestrator) rememberSpawn(params || event.params || {}, ctx);
+          const bare = String(event.toolName || "").split("__").pop();
+          if (ctx && ctx.agentId === orchestrator && bare === "message") params = threadOrchestratorPost(params || event.params || {}) || params;
+          if (ctx && (ctx.agentId === orchestrator || ctx.agentId === pm) && bare === "task_inbox" && String((params || event.params || {}).action || "") === "add") {
+            params = withSource(params || event.params || {}, ctx.sessionKey) || params;
+          }
           return params ? { params } : undefined;
         } catch (error) {
           // before_tool_call fails closed on a thrown error; fail open instead so a
@@ -236,6 +345,7 @@ export default definePluginEntry({
           const ids = String((event.params && event.params.id) || "").match(/\b[0-9a-f]{8}\b/g) || [];
           const out = JSON.stringify(event.result || "").match(/\b[0-9a-f]{8}\b/g) || [];
           refreshItems([...ids, ...out]);
+          if (action === "approve" && ctx && ctx.agentId === orchestrator) askOwnerToApprove(ids);
         }
         return;
       }
@@ -278,15 +388,21 @@ export default definePluginEntry({
       store.touch();
       const finish = () => {
         store.save();
-        post(job.agentId, job.topic, formatResult(cfg.mirror, job));
-        const verdict = resultVerdict(job.resultText, job.outcome);
+        const cur = store.data.jobs[key] || job;
+        const verdict = resultVerdict(cur.resultText, cur.outcome);
         const board = loadInboxItems();
-        const moves = (job.items || []).filter((id) => board.has(id)).map((id) => {
+        const plan = (cur.items || []).filter((id) => board.has(id)).map((id) => {
           const before = normStatus(board.get(id).status);
-          const next = nextAfterJob(before, job.agentId, verdict);
-          return next !== before ? systemMove(id, next, `${job.agentId} task ended: ${verdict} [job ${job.short}]`) : null;
-        });
-        Promise.all(moves).then(() => refreshItems(job.items || []));
+          return { id, before, to: nextAfterJob(before, cur.agentId, verdict) };
+        }).filter((m) => m.to !== m.before);
+        // The worker answers its dispatch, from its own bot, once the dispatch is posted.
+        Promise.resolve(threads.get(key)).catch(() => null).then(() => {
+          threads.delete(key);
+          const j = store.data.jobs[key] || cur;
+          return say(j.agentId, j.topic, resultText(voice, j, verdict, plan), { html: true, replyTo: j.dispatchMsgId || null });
+        }).then((id) => { if (typeof id === "number") setJob(key, { resultMsgId: id }); });
+        Promise.all(plan.map((m) => systemMove(m.id, m.to, `${cur.agentId} task ended: ${verdict} [job ${cur.short}]`)))
+          .then(() => refreshItems(cur.items || []));
       };
       if (job.resultText || !api.runtime || !api.runtime.subagent || typeof api.runtime.subagent.getSessionMessages !== "function") return finish();
       api.runtime.subagent.getSessionMessages({ sessionKey: key, limit: 8 })
@@ -303,15 +419,29 @@ export default definePluginEntry({
       const right = correctTopic({ threadId: event.threadId, text: event.content, projects, teamTopic });
       const current = isGeneral(event.threadId) ? null : Number(event.threadId);
       if (!right.topic || right.topic === current) return undefined;
-      mirror.post({ accountId: ctx.accountId, topic: right.topic, text: event.content }).catch(() => null);
+      mirror.post({ accountId: ctx.accountId, topic: right.topic, text: mdToHtml(event.content, 3500), html: true }).catch(() => null);
       const pointerKey = `${ctx.runId || ctx.sessionKey || ""}:${current}`;
       if (!pointed.has(pointerKey)) {
         pointed.add(pointerKey);
         if (pointed.size > 500) pointed.clear();
-        mirror.post({ accountId: ctx.accountId, topic: current || 1, text: `↪️ Continued in the ${right.project || "team"} topic.` }).catch(() => null);
+        mirror.post({ accountId: ctx.accountId, topic: current || 1, text: movedText(voice, right.project), html: true }).catch(() => null);
       }
       log("info", "token-guard moved a reply to its topic", { from: current, to: right.topic, accountId: ctx.accountId });
       return { cancel: true, cancelReason: `token-guard: belongs in topic ${right.topic}; reposted there` };
+    }));
+
+    // ---- the orchestrator's own replies in a project topic answer the worker's result they follow ----
+    api.on("reply_payload_sending", safe("reply_payload_sending", (event, ctx) => {
+      const sessionKey = String((event && event.sessionKey) || (ctx && ctx.sessionKey) || "");
+      if (!chatId || !sessionKey.startsWith(`agent:${orchestrator}:`) || !sessionKey.includes(chatId)) return undefined;
+      if (event.channel && event.channel !== "telegram") return undefined;
+      if (event.kind && !["final", "block"].includes(event.kind)) return undefined;
+      const payload = (event && event.payload) || {};
+      if (payload.replyToId || !String(payload.text || "").trim()) return undefined; // already answers the owner's message
+      const topic = topicOfSession(sessionKey);
+      const pending = topic && topic > 1 ? takePendingResult(topic) : null;
+      if (!pending) return undefined;
+      return { payload: Object.assign({}, payload, { replyToId: String(pending.resultMsgId), text: withMention(payload.text, pending.agentId) }) };
     }));
 
     // ---- owner messages: approvals to archive, and requests the board must capture ----
@@ -326,6 +456,12 @@ export default definePluginEntry({
       if (!ownerId || String(event.senderId || "") !== ownerId) return;
       if (ctx && ctx.channelId && ctx.channelId !== "telegram") return;
       const topic = isGeneral(event.threadId) ? 1 : Number(event.threadId);
+      const msgId = messageIdOf(event.messageId || (ctx && ctx.messageId));
+      if (msgId && topic) {
+        store.data.ownerMsgs = store.data.ownerMsgs || {};
+        store.data.ownerMsgs[String(topic)] = { id: msgId, at: Date.now() };
+        store.touch();
+      }
       const approval = parseApproval(event.content);
       if (approval) {
         const board = loadInboxItems();
@@ -334,8 +470,17 @@ export default definePluginEntry({
           ? [...board.values()].filter((it) => ["done", "dropped"].includes(normStatus(it.status)) && (!project || project === "team" || projectFor(it) === project)).map((it) => it.id)
           : approval.ids.filter((id) => board.has(id));
         if (ids.length) {
-          runInbox(["approve", ...ids, "--by", "owner"]).then((r) => {
-            post(orchestrator, topic > 1 ? topic : teamTopic, `🗄 Your approval: ${String((r && r.text) || "").split("\n").slice(0, 12).join("; ")}`);
+          runInbox(["approve", ...ids, "--by", "owner"]).then(() => {
+            const after = loadInboxItems();
+            const archived = [], waiting = [], notDone = [];
+            for (const id of ids) {
+              const it = after.get(id) || { id };
+              const st = normStatus(it.status);
+              if (st === "archived") archived.push(it);
+              else if (["done", "dropped"].includes(st) && it.owner_approved_ts) waiting.push(it);
+              else notDone.push(it);
+            }
+            post(orchestrator, topic > 1 ? topic : teamTopic, approvalReplyText(voice, archived, waiting, notDone), { html: true, replyTo: topic > 1 ? msgId : null });
             refreshItems(ids);
           });
         }
@@ -357,7 +502,7 @@ export default definePluginEntry({
       const over = recordUsage(store.data, key, event && event.usage, jobsCfg);
       if (over) {
         store.touch();
-        post(orchestrator, over.topic || "system", `💸 ${over.agentId} · ${over.label} reached its task budget (${Math.round(over.usedTokens / 1e6)}M tokens) and is being made to finish. [job ${over.short}]`);
+        post(pm, over.topic || "system", budgetText(voice, over, Math.round(over.usedTokens / 1e6)), { html: true, replyTo: over.dispatchMsgId || null });
       }
     }));
 
@@ -378,6 +523,8 @@ export default definePluginEntry({
         orchestratorAgent: orchestrator,
         inboxItems,
         idleWakeSession: jobsCfg.idleWakeSession,
+        voice,
+        pmAgent: pm,
       });
       if (boardCfg.enabled) {
         try { await auditTick(inboxItems); } catch (error) { log("warn", "token-guard board audit failed", { error: String(error && error.message) }); }
@@ -385,7 +532,7 @@ export default definePluginEntry({
       store.touch();
       store.save();
       for (const action of actions) {
-        if (action.kind === "post") post(action.agentId, action.topic, action.text);
+        if (action.kind === "post") post(action.agentId, action.topic, action.text, { html: Boolean(action.html), replyTo: action.replyTo || null });
         if (action.kind === "wake") {
           try {
             if (!api.runtime || !api.runtime.subagent || typeof api.runtime.subagent.run !== "function") throw new Error("runtime.subagent.run unavailable");
@@ -419,7 +566,6 @@ export default definePluginEntry({
       if (!serious.length || !due || !api.runtime || !api.runtime.subagent || typeof api.runtime.subagent.run !== "function") return;
       store.data.pmAudit.lastAt = now;
       store.touch();
-      const pm = boardCfg.agent || "product";
       const sessionKey = `agent:${pm}:subagent:board-audit-${now.toString(36)}`;
       const snapshot = inboxItems.filter((it) => normStatus(it.status) !== "archived")
         .map((it) => `${it.id} [${normStatus(it.status)}] ${it.project || "?"}: ${it.title || ""} (owner ${it.owner || "?"})`).join("\n");
@@ -438,7 +584,7 @@ export default definePluginEntry({
           const got = await api.runtime.subagent.getSessionMessages({ sessionKey, limit: 8 });
           text = lastAssistantText(got && got.messages);
         }
-        post(pm, teamTopic, `🧾 Board audit (${res && res.status ? res.status : "done"})\n${String(text || "(no report)").slice(0, 1800)}`);
+        post(pm, teamTopic, auditText(voice, res && res.status, text), { html: true });
         for (const ask of store.data.ownerAsks) ask.captured = true; // the PM has seen them
         if (typeof api.runtime.subagent.deleteSession === "function") await api.runtime.subagent.deleteSession({ sessionKey }).catch(() => null);
         const board = loadInboxItems();

@@ -1,4 +1,5 @@
 import fs from "node:fs";
+import { stallText, interruptedText, unactedText, wakeCapText, teamStuckText } from "./voice.js";
 import os from "node:os";
 import path from "node:path";
 import crypto from "node:crypto";
@@ -47,8 +48,13 @@ function emptyState() {
     idle: { lastCheckAt: 0, streak: 0, sig: "", escalatedSig: "" },
     wakesByDay: {},
     notes: {},
+    ownerMsgs: {}, // { "<topic>": { id, at } }: the owner's latest message per topic, for reply threading
+    askedApproval: {}, // { "<item id>": ts }: the owner was asked to approve it
   };
 }
+
+// Telegram message ids of a job's thread; kept from either copy when two copies merge.
+const THREAD_FIELDS = ["requestMsgId", "dispatchMsgId", "ackMsgId", "resultMsgId", "answeredAt"];
 
 function shortId(key) {
   return crypto.createHash("sha1").update(String(key)).digest("hex").slice(0, 6);
@@ -59,9 +65,15 @@ function newerJob(a, b) {
   if (!a) return b;
   if (!b) return a;
   const rank = (j) => (j.status === "running" ? 0 : 1);
-  if (rank(a) !== rank(b)) return rank(a) > rank(b) ? a : b;
   const t = (j) => Math.max(j.endedAt || 0, j.lastActivityAt || 0, j.lastWakeAt || 0, j.spawnedAt || 0);
-  return t(a) >= t(b) ? a : b;
+  let win = t(a) >= t(b) ? a : b;
+  if (rank(a) !== rank(b)) win = rank(a) > rank(b) ? a : b;
+  const other = win === a ? b : a;
+  const missing = THREAD_FIELDS.filter((f) => !win[f] && other[f]);
+  if (!missing.length) return win;
+  const out = Object.assign({}, win);
+  for (const f of missing) out[f] = other[f];
+  return out;
 }
 
 // Merge two states (two plugin generations, or memory and disk) without losing either's work.
@@ -81,6 +93,9 @@ function mergeStates(a, b) {
   out.boardMessages = Object.assign({}, b.boardMessages, a.boardMessages);
   out.pmAudit = ((a.pmAudit || {}).lastAt || 0) >= ((b.pmAudit || {}).lastAt || 0) ? a.pmAudit : b.pmAudit;
   out.notes = Object.assign({}, b.notes, a.notes);
+  out.ownerMsgs = Object.assign({}, b.ownerMsgs);
+  for (const [k, v] of Object.entries(a.ownerMsgs || {})) if (!out.ownerMsgs[k] || (v && v.at) >= out.ownerMsgs[k].at) out.ownerMsgs[k] = v;
+  out.askedApproval = Object.assign({}, b.askedApproval, a.askedApproval);
   const asks = new Map();
   for (const ask of [...(b.ownerAsks || []), ...(a.ownerAsks || [])]) asks.set(`${ask.at}:${ask.topic}`, Object.assign({}, asks.get(`${ask.at}:${ask.topic}`), ask, { captured: Boolean(ask.captured || (asks.get(`${ask.at}:${ask.topic}`) || {}).captured) }));
   out.ownerAsks = [...asks.values()].sort((x, y) => x.at - y.at).slice(-50);
@@ -242,19 +257,23 @@ const ACT_NOW =
   "Act in this turn. If the result meets its Done when with evidence: accept it, update task_inbox, and dispatch the next gate " +
   "(review, QA, release) if one is due. If it does not: send it back with sessions_spawn and the exact gaps. " +
   "Only stop for something that needs the owner's approval, and then ask once with your recommendation. " +
-  "Post your one-line outcome in the project's Telegram topic with the message tool; this run's own reply is not delivered.";
+  "Then answer in the project's Telegram topic with the message tool, like a teammate: your message is threaded under the worker's " +
+  "result automatically. Mention the worker, say in plain words what you checked and what happens next, and mention whoever is next. " +
+  "This run's own reply is not delivered.";
 
 function scanJobs(data, rawCfg, now, env) {
   const cfg = mergeJobsConfig(rawCfg);
   const actions = [];
   const orchestrator = env.orchestratorAgent || "coordinator";
+  const voice = Object.assign({ orchestratorAgent: orchestrator }, env.voice || {});
+  const pm = env.pmAgent || voice.pmAgent || "product"; // the PM keeps the board moving, so it chases
   const wake = (sessionKey, message, reason) => {
     if (!sessionKey) return false;
     if (!canWake(data, cfg, now)) {
       const day = dayKey(now);
       if (data.notes.wakeCap !== day) {
         data.notes.wakeCap = day;
-        actions.push({ kind: "post", agentId: orchestrator, topic: "system", text: `⚠️ Job tracker: the daily limit of ${cfg.maxWakesPerDay} automatic follow-ups is used up. Open work now needs you to nudge the orchestrator.` });
+        actions.push({ kind: "post", agentId: pm, topic: "system", html: true, text: wakeCapText(voice, cfg.maxWakesPerDay) });
       }
       return false;
     }
@@ -269,7 +288,7 @@ function scanJobs(data, rawCfg, now, env) {
       if (now - env.bootStartedAt >= cfg.restartGraceMinutes * 60000) {
         job.status = "interrupted";
         job.endedAt = now;
-        actions.push({ kind: "post", agentId: orchestrator, topic: job.topic || "system", text: `🔁 ${describe(job)} was cut off by a gateway restart. The orchestrator is re-dispatching it. [job ${job.short}]` });
+        actions.push({ kind: "post", agentId: pm, topic: job.topic || "system", html: true, replyTo: job.dispatchMsgId || null, text: interruptedText(voice, job) });
         wake(job.requesterSessionKey,
           `[job-tracker] Task ${describe(job)} was cut off by a gateway restart and did not finish. ` +
           `Re-dispatch it now with sessions_spawn (agentId "${job.agentId}", same label), using this brief:\n---\n${job.brief || "(brief not recorded: rebuild it from task_inbox)"}\n---`,
@@ -281,7 +300,7 @@ function scanJobs(data, rawCfg, now, env) {
       const quiet = now - (job.lastActivityAt || job.spawnedAt);
       if (quiet >= cfg.stallMinutes * 60000 && !job.stallNotifiedAt) {
         job.stallNotifiedAt = now;
-        actions.push({ kind: "post", agentId: orchestrator, topic: job.topic || "system", text: `⏸ ${describe(job)} shows no activity for ${minutes(quiet)} min. The orchestrator is checking it. [job ${job.short}]` });
+        actions.push({ kind: "post", agentId: pm, topic: job.topic || "system", html: true, replyTo: job.ackMsgId || job.dispatchMsgId || null, text: stallText(voice, job, minutes(quiet)) });
         wake(job.requesterSessionKey,
           `[job-tracker] Task ${describe(job)} has had no tool activity for ${minutes(quiet)} min (job ${job.short}, child ${job.key}). ` +
           "Check it once with sessions_history. If it is stuck, stop it and re-dispatch it with sessions_spawn (same brief, say what happened); " +
@@ -304,7 +323,7 @@ function scanJobs(data, rawCfg, now, env) {
             "ended");
         } else if (job.wakes >= cfg.maxWakesPerJob && !job.escalated && due) {
           job.escalated = true;
-          actions.push({ kind: "post", agentId: orchestrator, topic: job.topic || "system", text: `🚩 The orchestrator has not acted on the result of ${describe(job)} for ${minutes(now - job.endedAt)} min after ${job.wakes} reminders. Please check. [job ${job.short}]` });
+          actions.push({ kind: "post", agentId: pm, topic: job.topic || "system", html: true, replyTo: job.resultMsgId || null, text: unactedText(voice, job, minutes(now - job.endedAt), job.wakes) });
         }
       }
     }
@@ -332,12 +351,13 @@ function scanJobs(data, rawCfg, now, env) {
         wake(env.idleWakeSession || cfg.idleWakeSession,
           `[job-tracker] There is open work and no task is running:\n${list}${open.length > 12 ? `\n(+${open.length - 12} more)` : ""}\n` +
           "Continue now: run task_inbox plan and dispatch the next batch with sessions_spawn (one task per item or small same-area batch, " +
-          "brief lines Project, Scope, Items, Done when, Stop if), or set an item to blocked with the exact reason (and ask the owner once " +
-          "if it needs him). Post what you dispatched in each project's Telegram topic with the message tool; this run's own reply is not delivered.",
+          "brief lines Project, Scope, Items, Done when, Stop if), or set an item to blocked with the exact reason. Dispatches are posted to " +
+          "the project topics automatically, so do not repeat them. If an item needs the owner, ask once in its project topic with the message " +
+          "tool and mention the owner. This run's own reply is not delivered.",
           "idle");
       } else if (data.idle.escalatedSig !== sig) {
         data.idle.escalatedSig = sig;
-        actions.push({ kind: "post", agentId: orchestrator, topic: "system", text: `🚩 The team is stalled: these items have not moved after ${cfg.maxIdleWakesWithoutChange} reminders to the orchestrator:\n${list}` });
+        actions.push({ kind: "post", agentId: pm, topic: "system", html: true, text: teamStuckText(voice, open, cfg.maxIdleWakesWithoutChange) });
       }
     } else if (open.length === 0) {
       data.idle.streak = 0;

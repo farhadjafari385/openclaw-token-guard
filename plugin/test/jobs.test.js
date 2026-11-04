@@ -45,7 +45,8 @@ test("a finished task the orchestrator has not acted on is followed up, twice, t
   assert.deepEqual(kinds(scanJobs(d, CFG, 36 * MIN, env())), ["wake:ended"]);
   a = scanJobs(d, CFG, 60 * MIN, env());
   assert.deepEqual(kinds(a), ["post:151"]);
-  assert.match(a[0].text, /has not acted/);
+  assert.match(a[0].text, /has not picked it up after 2 reminders/);
+  assert.equal(a[0].agentId, "product"); // the PM chases
   assert.deepEqual(scanJobs(d, CFG, 90 * MIN, env()), []);
 });
 
@@ -93,7 +94,7 @@ test("open inbox work with nothing running wakes the orchestrator; no change aft
   }
   const a = scanJobs(d, CFG, t, e);
   assert.deepEqual(kinds(a), ["post:system"]);
-  assert.match(a[0].text, /stalled/);
+  assert.match(a[0].text, /the team is stuck/);
   assert.deepEqual(scanJobs(d, CFG, t + 31 * MIN, e), []);
 });
 
@@ -115,7 +116,7 @@ test("daily wake cap", () => {
   recordEnd(d, "agent:qa:subagent:2", "ok", "", 0);
   const a = scanJobs(d, cfg, 10 * MIN, env());
   assert.equal(a.filter((x) => x.kind === "wake").length, 1);
-  assert.equal(a.filter((x) => x.kind === "post" && /daily limit/.test(x.text)).length, 1);
+  assert.equal(a.filter((x) => x.kind === "post" && /automatic reminders/.test(x.text)).length, 1);
 });
 
 test("task budget and Claude limit state", () => {
@@ -143,8 +144,11 @@ test("mirror: topics, formatting, and posting through the right bot", async () =
   assert.equal(topicFor(cfg, "unknown", 777), 777);
   assert.equal(topicFor(cfg, "unknown", null), 160);
   const job = { agentId: "devops", label: "demo: fix CI", short: "abc123", model: "anthropic/claude-sonnet-5", thinking: "low", doneWhen: "pipeline green", outcome: "ok", spawnedAt: 0, endedAt: 5 * MIN, resultText: "RESULT: done" };
-  assert.match(formatDispatch(cfg, job), /▶️ devops ← demo: fix CI\nclaude-sonnet-5 · effort low\nDone when: pipeline green/);
-  assert.match(formatResult(cfg, job), /✅ demo: fix CI — ok · 5 min\nRESULT: done/);
+  const voiceCfg = Object.assign({}, cfg, { agentHandles: { devops: "devops_bot", coordinator: "orc_bot" } });
+  assert.equal(formatDispatch(voiceCfg, Object.assign({ key: "k", items: ["ab12cd34"] }, job)).split("\n").slice(1).join("\n"),
+    "<b>Fix CI</b>\nDone when: pipeline green\n<i>ab12cd34 · Sonnet 5 · low effort</i>");
+  assert.match(formatDispatch(voiceCfg, job), /^@devops_bot /);
+  assert.match(formatResult(voiceCfg, job, "done", [{ id: "ab12cd34", to: "review" }]), /^@orc_bot ✅ Done \(5 min\)\.[\s\S]*<i>Board: ab12cd34 → Review<\/i>$/);
   const calls = [];
   const fetchImpl = async (url, opts) => { calls.push({ url, body: JSON.parse(opts.body) }); return { ok: true }; };
   const m = createMirror({ cfg, fetchImpl, readFile: (p) => (p === "/t/dev" ? "DEVTOKEN\n" : "ORCTOKEN") });

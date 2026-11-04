@@ -59,47 +59,52 @@ function nextAfterJob(before, role, verdict) {
   return "review";
 }
 
+const SHORT = {
+  backlog: "in backlog", todo: "to do", in_progress: "in progress", review: "in review", qa: "in QA",
+  blocked: "blocked", done: "done", dropped: "dropped",
+};
+
 function itemLine(it) {
-  const owner = it.owner ? ` (${it.owner})` : "";
-  const title = String(it.title || "").slice(0, 60);
+  const title = String(it.title || "(untitled)").slice(0, 70);
+  const who = it.owner ? ` — ${it.owner}` : "";
   let extra = "";
   if (it.status === "done" || it.status === "dropped") {
-    extra = ` [orchestrator ${it.orc_approved_ts ? "✓" : "…"} · you ${it.owner_approved_ts ? "✓" : "…"}]`;
+    extra = ` (orchestrator ${it.orc_approved_ts ? "✓" : "…"}, you ${it.owner_approved_ts ? "✓" : "…"})`;
   } else if (it.status === "blocked" && it.note) {
-    extra = ` — ${String(it.note).slice(0, 60)}`;
+    extra = `\n     ↳ ${String(it.note).slice(0, 90)}`;
   }
-  return `${it.id} ${title}${owner}${extra}`;
+  return `${title}${who} · ${it.id}${extra}`;
 }
 
 function renderBoard(projectName, items, now = Date.now(), maxPerColumn = 8) {
   const list = [...items].filter((it) => normStatus(it.status) !== "archived");
-  const lines = [`📋 ${projectName} board · ${new Date(now).toISOString().slice(11, 16)} UTC`];
+  const lines = [`📋 ${projectName} board · updated ${new Date(now).toISOString().slice(11, 16)} UTC`];
   for (const col of COLUMNS) {
     if (col === "archived") continue;
     const inCol = list.filter((it) => normStatus(it.status) === col);
     if (inCol.length === 0) continue;
-    lines.push(`${ICONS[col]} ${LABELS[col]} (${inCol.length})`);
+    lines.push("", `${ICONS[col]} ${LABELS[col]} (${inCol.length})`);
     for (const it of inCol.slice(0, maxPerColumn)) lines.push(`  • ${itemLine(Object.assign({}, it, { status: col }))}`);
-    if (inCol.length > maxPerColumn) lines.push(`  • +${inCol.length - maxPerColumn} more`);
+    if (inCol.length > maxPerColumn) lines.push(`  • …and ${inCol.length - maxPerColumn} more`);
   }
-  if (lines.length === 1) lines.push("(empty)");
+  if (lines.length === 1) lines.push("", "Nothing open right now.");
   const waiting = list.filter((it) => ["done", "dropped"].includes(normStatus(it.status)) && !it.owner_approved_ts);
-  if (waiting.length) lines.push(`To archive, reply here: approve ${waiting.slice(0, 4).map((it) => it.id).join(" ")}${waiting.length > 4 ? " …" : ""}  (or: approve all)`);
+  if (waiting.length) lines.push("", `To archive, reply here: approve ${waiting.slice(0, 4).map((it) => it.id).join(" ")}${waiting.length > 4 ? " …" : ""} (or: approve all)`);
   return lines.join("\n").slice(0, 3900);
 }
 
 function renderOverview(byProject, now = Date.now()) {
-  const lines = [`📋 Team board · ${new Date(now).toISOString().slice(11, 16)} UTC`];
+  const lines = [`📋 Team board · updated ${new Date(now).toISOString().slice(11, 16)} UTC`, ""];
   for (const [project, items] of Object.entries(byProject)) {
     const counts = {};
     for (const it of items) {
       const s = normStatus(it.status);
       if (s !== "archived") counts[s] = (counts[s] || 0) + 1;
     }
-    const parts = COLUMNS.filter((c) => counts[c]).map((c) => `${ICONS[c]}${counts[c]}`);
-    if (parts.length) lines.push(`${project}: ${parts.join(" ")}`);
+    const parts = COLUMNS.filter((c) => counts[c]).map((c) => `${ICONS[c]} ${counts[c]} ${SHORT[c]}`);
+    if (parts.length) lines.push(`• ${project}: ${parts.join(", ")}`);
   }
-  if (lines.length === 1) lines.push("(no open work)");
+  if (lines.length === 2) lines.push("No open work.");
   return lines.join("\n");
 }
 
