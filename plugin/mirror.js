@@ -1,9 +1,11 @@
 import fs from "node:fs";
 import os from "node:os";
+import { dispatchText, resultText, htmlToPlain, clip } from "./voice.js";
 
 // Mirrors team activity into the Telegram group with the Bot API: dispatches,
-// results and system events. No model runs, so it costs no tokens, and agents
-// cannot skip it. Results are posted by the worker's own bot.
+// acknowledgements, results and process notes, written as a threaded team
+// conversation (voice.js). No model runs, so it costs no tokens, and agents
+// cannot skip it. Each message is posted by the bot of the agent speaking.
 
 const DEFAULT_MIRROR = {
   enabled: true,
@@ -13,9 +15,13 @@ const DEFAULT_MIRROR = {
   projectTopics: {}, // { "<project>": <topic id>, ... } (lowercase keys)
   botTokenFiles: {}, // { "<agentId>": "/path/to/bot.token" }
   accountTokenFiles: {}, // { "<telegram account id>": "/path/to/bot.token" }
-  maxResultChars: 1800,
   minIntervalMs: 1100,
-  agentNames: {}, // { "<agentId>": "DevSecOps" }
+  agentNames: {}, // { "<agentId>": "DevSecOps Engineer" }
+  agentHandles: {}, // { "<agentId>": "devops_bot" }
+  ownerHandle: "",
+  ownerName: "",
+  pmAgent: "product",
+  acks: true, // the worker's bot replies "On it" to its dispatch
 };
 
 function expandHome(p) {
@@ -41,37 +47,19 @@ function topicFor(cfg, projectLine, fallback) {
   return Number(m.defaultTopic) || null;
 }
 
-function clip(text, n) {
-  const s = String(text || "").trim();
-  return s.length > n ? `${s.slice(0, n - 1)}…` : s;
-}
-
-function nameOf(cfg, agentId) {
-  const names = (cfg && cfg.agentNames) || {};
-  return names[agentId] || agentId;
-}
-
+// Kept for callers and tests: the dispatch and result posts (Telegram HTML).
 function formatDispatch(cfg, job) {
-  const model = job.model ? job.model.split("/").pop() : "default model";
-  return [
-    `▶️ ${nameOf(cfg, job.agentId)} ← ${clip(job.label, 120)}`,
-    `${model} · effort ${job.thinking || "default"}`,
-    job.doneWhen ? `Done when: ${clip(job.doneWhen, 400)}` : "",
-    `[job ${job.short}]`,
-  ].filter(Boolean).join("\n");
+  return dispatchText(mergeMirrorConfig(cfg), job);
 }
 
-const OUTCOME_ICON = { ok: "✅", error: "❌", timeout: "⌛", killed: "🛑", reset: "↩️", deleted: "🗑", unknown: "❔" };
+function formatResult(cfg, job, verdict, moves) {
+  return resultText(mergeMirrorConfig(cfg), job, verdict, moves);
+}
 
-function formatResult(cfg, job) {
-  const m = mergeMirrorConfig(cfg);
-  const mins = Number.isFinite(job.endedAt) && Number.isFinite(job.spawnedAt) ? Math.max(1, Math.round((job.endedAt - job.spawnedAt) / 60000)) : null;
-  return [
-    `${OUTCOME_ICON[job.outcome] || "❔"} ${clip(job.label, 120)} — ${job.outcome}${mins ? ` · ${mins} min` : ""}`,
-    job.error ? `Error: ${clip(job.error, 300)}` : "",
-    job.resultText ? clip(job.resultText, m.maxResultChars) : "(no final answer captured)",
-    `[job ${job.short}]`,
-  ].filter(Boolean).join("\n");
+// Telegram message id from a hook field ("1234", or "...:1234"), else null.
+function messageIdOf(value) {
+  const m = /(?:^|:)(\d{1,12})$/.exec(String(value === undefined || value === null ? "" : value).trim());
+  return m ? Number(m[1]) : null;
 }
 
 function createMirror({ cfg, log, fetchImpl = globalThis.fetch, readFile = (p) => fs.readFileSync(p, "utf8"), retryDelayMs = 5000 }) {
@@ -99,33 +87,49 @@ function createMirror({ cfg, log, fetchImpl = globalThis.fetch, readFile = (p) =
   }
 
   // One Bot API call through the serial, rate-limited queue. Resolves to the parsed result or null.
+  // A 400 on formatted text is retried once as plain text, and a 400 on a reply as a normal message.
   function call(who, method, body) {
     if (!m.enabled || !m.chatId || typeof fetchImpl !== "function") return Promise.resolve(null);
     const next = chain.then(async () => {
-      const wait = last + m.minIntervalMs - Date.now();
-      if (wait > 0) await new Promise((r) => setTimeout(r, wait));
-      last = Date.now();
       const tok = token(who) || token(m.orchestratorAgent || "coordinator");
       if (!tok) return null;
-      for (let attempt = 0; attempt < 3; attempt++) {
+      let payload = Object.assign({ chat_id: m.chatId }, body);
+      for (let attempt = 0, fallbacks = 0; attempt < 3;) {
+        const wait = last + m.minIntervalMs - Date.now();
+        if (wait > 0) await new Promise((r) => setTimeout(r, wait));
+        last = Date.now();
         try {
           const res = await fetchImpl(`https://api.telegram.org/bot${tok}/${method}`, {
             method: "POST",
             headers: { "content-type": "application/json" },
-            body: JSON.stringify(Object.assign({ chat_id: m.chatId }, body)),
+            body: JSON.stringify(payload),
             signal: AbortSignal.timeout(15000),
           });
           let data = null;
           try { data = typeof res.json === "function" ? await res.json() : null; } catch { data = null; }
           if (res.status === 429 || res.status >= 500) throw new Error(`http ${res.status}`);
-          if (!res.ok && typeof log === "function") log("warn", `token-guard mirror: telegram ${method} failed`, { status: res.status });
+          if (!res.ok && res.status === 400 && fallbacks < 2 && (payload.parse_mode || payload.reply_parameters)) {
+            fallbacks += 1;
+            const desc = String((data && data.description) || "");
+            payload = Object.assign({}, payload);
+            if (payload.parse_mode && (!payload.reply_parameters || /entit|pars|tag/i.test(desc))) {
+              delete payload.parse_mode;
+              if (payload.text) payload.text = htmlToPlain(payload.text);
+            } else {
+              delete payload.reply_parameters;
+            }
+            if (typeof log === "function") log("info", `token-guard mirror: telegram ${method} retry without ${payload.parse_mode ? "reply" : "formatting"}`, { description: desc.slice(0, 120) });
+            continue;
+          }
+          if (!res.ok && typeof log === "function") log("warn", `token-guard mirror: telegram ${method} failed`, { status: res.status, description: String((data && data.description) || "").slice(0, 160) });
           return res.ok ? (data && data.result !== undefined ? data.result : true) : null;
         } catch (error) {
-          if (attempt === 2) {
+          attempt += 1;
+          if (attempt >= 3) {
             if (typeof log === "function") log("warn", `token-guard mirror: telegram ${method} error`, { error: String(error && error.message) });
             return null;
           }
-          await new Promise((r) => setTimeout(r, retryDelayMs * (attempt + 1)));
+          await new Promise((r) => setTimeout(r, retryDelayMs * attempt));
         }
       }
       return null;
@@ -135,11 +139,15 @@ function createMirror({ cfg, log, fetchImpl = globalThis.fetch, readFile = (p) =
   }
 
   // Post a message; resolves to its message id (or true when the API gave none), null on failure.
-  function post({ agentId, accountId, topic, text }) {
+  // html: the text is Telegram HTML. replyTo: the message id this one answers (same topic).
+  function post({ agentId, accountId, topic, text, html = false, replyTo = null }) {
     if (!text) return Promise.resolve(null);
     const body = { text: clip(text, 4000), disable_web_page_preview: true };
+    if (html) body.parse_mode = "HTML";
     const thread = resolveTopic(topic);
     if (thread && thread > 1) body.message_thread_id = thread;
+    const reply = messageIdOf(replyTo);
+    if (reply) body.reply_parameters = { message_id: reply, allow_sending_without_reply: true };
     return call(accountId ? `account:${accountId}` : agentId || "coordinator", "sendMessage", body)
       .then((r) => (r && typeof r === "object" ? r.message_id : r));
   }
@@ -155,4 +163,4 @@ function createMirror({ cfg, log, fetchImpl = globalThis.fetch, readFile = (p) =
   return { post, edit, pin, cfg: m };
 }
 
-export { DEFAULT_MIRROR, mergeMirrorConfig, projectKey, topicFor, formatDispatch, formatResult, createMirror };
+export { DEFAULT_MIRROR, mergeMirrorConfig, projectKey, topicFor, formatDispatch, formatResult, messageIdOf, createMirror };

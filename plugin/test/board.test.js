@@ -42,13 +42,13 @@ test("board view and overview", () => {
     { id: "1a1a1a1a", title: "DNS", status: "blocked", note: "needs Cloudflare scope" },
   ];
   const text = renderBoard("demo", items, Date.UTC(2026, 10, 4, 12, 0));
-  assert.match(text, /📋 demo board · 12:00 UTC/);
-  assert.match(text, /🔄 In progress \(1\)\n  • a1b2c3d4 Fix CI \(devops\)/);
-  assert.match(text, /✅ Done, awaiting approval \(1\)\n  • e5f6a7b8 Banner \(writer\) \[orchestrator ✓ · you …\]/);
-  assert.match(text, /⛔ Blocked \(1\)\n  • 1a1a1a1a DNS — needs Cloudflare scope/);
+  assert.match(text, /📋 demo board · updated 12:00 UTC/);
+  assert.match(text, /🔄 In progress \(1\)\n  • Fix CI — devops · a1b2c3d4/);
+  assert.match(text, /✅ Done, awaiting approval \(1\)\n  • Banner — writer · e5f6a7b8 \(orchestrator ✓, you …\)/);
+  assert.match(text, /⛔ Blocked \(1\)\n  • DNS · 1a1a1a1a\n     ↳ needs Cloudflare scope/);
   assert.match(text, /reply here: approve e5f6a7b8/);
   assert.doesNotMatch(text, /0f0f0f0f/);
-  assert.match(renderOverview({ demo: items }), /demo: 🔄1 ⛔1 ✅1/);
+  assert.match(renderOverview({ demo: items }), /• demo: 🔄 1 in progress, ⛔ 1 blocked, ✅ 1 done/);
 });
 
 test("board audit finds lost, waiting, incomplete and missed work", () => {
