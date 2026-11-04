@@ -1,13 +1,17 @@
 {
   "id": "token-guard",
   "name": "Token Guard",
-  "description": "Blocks token-burning polling, sleep loops and runaway runs in agent tool calls; adds a task inbox for batching work.",
-  "categories": ["developer-tools"],
+  "description": "Enforces the team's rules on every tool call (protected rules/config, no back channels, orchestrator-only, spawn policy, budgets), follows every task to the end (anti-stall), mirrors team work into Telegram, and adds a task inbox.",
+  "categories": [
+    "developer-tools"
+  ],
   "activation": {
     "onStartup": true
   },
   "contracts": {
-    "tools": ["task_inbox"]
+    "tools": [
+      "task_inbox"
+    ]
   },
   "toolMetadata": {
     "task_inbox": {
@@ -19,27 +23,180 @@
     "type": "object",
     "additionalProperties": false,
     "properties": {
-      "enabled": { "type": "boolean" },
-      "mode": { "type": "string", "enum": ["enforce", "warn"] },
-      "maxPollsPerJob": { "type": "integer", "minimum": 0 },
-      "maxPollsPerRun": { "type": "integer", "minimum": 0 },
-      "subagentMaxPollsPerRun": { "type": "integer", "minimum": 0 },
-      "maxForegroundSleepSeconds": { "type": "number", "minimum": 0 },
-      "maxBackgroundSleepSeconds": { "type": "number", "minimum": 0 },
-      "minLoopSleepSeconds": { "type": "number", "minimum": 0 },
-      "maxRepeatCommand": { "type": "integer", "minimum": 2 },
-      "maxRepeatMessage": { "type": "integer", "minimum": 2 },
-      "checkpointEvery": { "type": "integer", "minimum": 0 },
-      "maxToolCallsPerRun": { "type": "integer", "minimum": 1 },
-      "maxStatusChecksPerRun": { "type": "integer", "minimum": 0 },
-      "statusExemptSessionPatterns": { "type": "array", "items": { "type": "string" } },
-      "briefMinChars": { "type": "integer", "minimum": 0 },
-      "requireBriefFields": { "type": "array", "items": { "type": "string" } },
-      "briefCheckAgents": { "type": "array", "items": { "type": "string" } },
-      "exemptSessionPatterns": { "type": "array", "items": { "type": "string" } },
-      "runIdleResetMs": { "type": "integer", "minimum": 0 },
-      "ttlMs": { "type": "integer", "minimum": 60000 },
-      "maxTrackedRuns": { "type": "integer", "minimum": 10 }
+      "enabled": {
+        "type": "boolean"
+      },
+      "dedupeWindowMs": {
+        "type": "integer",
+        "minimum": 0
+      },
+      "mode": {
+        "type": "string",
+        "enum": [
+          "enforce",
+          "warn"
+        ]
+      },
+      "maxPollsPerJob": {
+        "type": "integer",
+        "minimum": 0
+      },
+      "maxPollsPerRun": {
+        "type": "integer",
+        "minimum": 0
+      },
+      "subagentMaxPollsPerRun": {
+        "type": "integer",
+        "minimum": 0
+      },
+      "maxForegroundSleepSeconds": {
+        "type": "number",
+        "minimum": 0
+      },
+      "maxBackgroundSleepSeconds": {
+        "type": "number",
+        "minimum": 0
+      },
+      "minLoopSleepSeconds": {
+        "type": "number",
+        "minimum": 0
+      },
+      "maxRepeatCommand": {
+        "type": "integer",
+        "minimum": 2
+      },
+      "maxRepeatMessage": {
+        "type": "integer",
+        "minimum": 2
+      },
+      "checkpointEvery": {
+        "type": "integer",
+        "minimum": 0
+      },
+      "maxToolCallsPerRun": {
+        "type": "integer",
+        "minimum": 1
+      },
+      "maxStatusChecksPerRun": {
+        "type": "integer",
+        "minimum": 0
+      },
+      "statusExemptSessionPatterns": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        }
+      },
+      "briefMinChars": {
+        "type": "integer",
+        "minimum": 0
+      },
+      "requireBriefFields": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        }
+      },
+      "briefCheckAgents": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        }
+      },
+      "exemptSessionPatterns": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        }
+      },
+      "runIdleResetMs": {
+        "type": "integer",
+        "minimum": 0
+      },
+      "ttlMs": {
+        "type": "integer",
+        "minimum": 60000
+      },
+      "maxTrackedRuns": {
+        "type": "integer",
+        "minimum": 10
+      },
+      "protect": {
+        "type": "object",
+        "additionalProperties": true
+      },
+      "backChannels": {
+        "type": "object",
+        "additionalProperties": true
+      },
+      "orchestratorOnly": {
+        "type": "object",
+        "additionalProperties": true
+      },
+      "pins": {
+        "type": "object",
+        "additionalProperties": true
+      },
+      "spawn": {
+        "type": "object",
+        "additionalProperties": true
+      },
+      "mirror": {
+        "type": "object",
+        "additionalProperties": true
+      },
+      "jobs": {
+        "type": "object",
+        "additionalProperties": true
+      },
+      "orchestratorAgent": {
+        "type": "string"
+      },
+      "workspaceRoot": {
+        "type": "string"
+      },
+      "forbiddenModelPatterns": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        }
+      },
+      "forbiddenThinking": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        }
+      },
+      "maxBlockedRetries": {
+        "type": "integer",
+        "minimum": 0
+      },
+      "maxItemsPerBrief": {
+        "type": "integer",
+        "minimum": 1
+      },
+      "requireSpawnForBriefs": {
+        "type": "boolean"
+      },
+      "projects": {
+        "type": "object",
+        "additionalProperties": true
+      },
+      "topics": {
+        "type": "object",
+        "additionalProperties": true
+      },
+      "board": {
+        "type": "object",
+        "additionalProperties": true
+      },
+      "taskPaths": {
+        "type": "object",
+        "additionalProperties": true
+      },
+      "ownerId": {
+        "type": "string"
+      }
     }
   }
 }

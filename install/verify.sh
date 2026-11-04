@@ -37,7 +37,7 @@ FAILS=0
 pass() { printf 'PASS  %s\n' "$*"; }
 fail() { printf 'FAIL  %s\n' "$*"; FAILS=$((FAILS + 1)); }
 
-for name in oc-wait oc-wait-pipeline oc-inbox; do
+for name in oc-wait oc-wait-pipeline oc-inbox oc-gateway-restart; do
   if [ -x "$OC_HOME/bin/$name" ]; then pass "$name installed"; else fail "$name missing at $OC_HOME/bin/$name"; fi
 done
 if timeout 20 "$OC_HOME/bin/oc-wait" --every 1 --timeout 10 -- true >/dev/null 2>&1; then

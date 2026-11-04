@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+# Restart the OpenClaw gateway safely from inside an agent.
+# An agent runs inside the gateway, so `systemctl --user restart` run directly
+# dies with the gateway it is restarting. This hands the restart to a transient
+# systemd timer outside the gateway, so it always completes, and it never stops
+# the gateway without starting it again.
+set -euo pipefail
+delay="${1:-15}"
+unit="oc-gateway-restart-$(date +%s)"
+systemd-run --user --quiet --unit="$unit" --on-active="${delay}s" \
+  /usr/bin/systemctl --user restart openclaw-gateway.service
+echo "Gateway restart scheduled in ${delay}s (unit ${unit}). End your turn now; agents are back in about 10 minutes."

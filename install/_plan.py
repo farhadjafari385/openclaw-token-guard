@@ -2,13 +2,15 @@
 """Compute the token-guard config changes for one OpenClaw host.
 
 Reads openclaw.json and the agent workspaces it names, and prints one JSON
-object per line: {"path": ..., "value": ..., "mode": "set"|"replace", "why": ...}.
+object per line: {"path": ..., "value": ..., "mode": "set"|"replace"|"patch", "why": ...}.
 apply.sh turns each line into `openclaw config set <path> <value> --strict-json`
-(plus `--replace` when mode is "replace"). Every value is the complete new
-value with existing entries preserved. Nothing is written here.
+(plus `--replace` when mode is "replace"); "patch" lines are merged into one
+`openclaw config patch` so many agents change in one config reload. Every value
+is the complete new value with existing entries preserved. Nothing is written here.
 
 Usage: _plan.py CONFIG [--coordinator ID] [--context-tokens N]
                 [--daily-reset-hour H] [--group-idle-minutes M]
+                [--fallback-model PROVIDER/MODEL ...]
                 [--rules-dir DIR] [--workspaces]
 --workspaces prints "<agentId>\\t<workspace>" lines instead of the plan.
 """
@@ -129,6 +131,38 @@ def agent_tools(config, agent_id):
     return {}, f"agents.entries.{agent_id}.tools"
 
 
+def with_fallbacks(model, fallbacks):
+    """`model` (a "provider/model" string or {primary, fallbacks}) with `fallbacks`
+    appended; None when nothing changes or there is no primary to keep."""
+    if isinstance(model, str):
+        primary, current = model, []
+    elif isinstance(model, dict) and model.get("primary"):
+        primary, current = model["primary"], list(model.get("fallbacks") or [])
+    else:
+        return None
+    wanted = current + [f for f in fallbacks if f not in current and f != primary]
+    if wanted == current:
+        return None
+    return dict(model, primary=primary, fallbacks=wanted) if isinstance(model, dict) else {"primary": primary, "fallbacks": wanted}
+
+
+def model_paths(config):
+    """(config path, current model) for the default, sub-agent and per-agent models."""
+    agents = config.get("agents") or {}
+    defaults = agents.get("defaults") or {}
+    found = [("agents.defaults.model", defaults.get("model")),
+             ("agents.defaults.subagents.model", (defaults.get("subagents") or {}).get("model"))]
+    entries = agents.get("entries")
+    if isinstance(entries, dict):
+        for agent_id, entry in entries.items():
+            if isinstance(entry, dict):
+                found.append((f"agents.entries.{agent_id}.model", entry.get("model")))
+    for index, entry in enumerate(agents.get("list") or []):
+        if isinstance(entry, dict):
+            found.append((f"agents.list[{index}].model", entry.get("model")))
+    return [(path, model) for path, model in found if model]
+
+
 def plan(config, args):
     ops = []
 
@@ -186,6 +220,14 @@ def plan(config, args):
             op("session.resetByType.group", group,
                "group sessions (team topics) start fresh every day" + (f" and after {idle} idle minutes" if idle else ""))
 
+    for path, model in model_paths(config) if getattr(args, "fallback_model", None) else []:
+        value = with_fallbacks(model, args.fallback_model)
+        if value is not None:
+            # An agent's own primary without fallbacks is strict in OpenClaw: the
+            # default chain never applies to it, so every model gets the list.
+            op(path, value, f"when {value['primary']} hits a limit, fall back to {', '.join(value['fallbacks'])}",
+               mode="set" if "[" in path else "patch")
+
     if args.coordinator != "coordinator":
         op("plugins.entries.token-guard.config.briefCheckAgents", [args.coordinator], "brief check applies to this coordinator id")
     return ops
@@ -199,6 +241,8 @@ def main(argv):
     ap.add_argument("--compaction-timeout", type=int, default=900)
     ap.add_argument("--daily-reset-hour", type=int)
     ap.add_argument("--group-idle-minutes", type=int)
+    ap.add_argument("--fallback-model", action="append", default=[],
+                    help="provider/model to fall back to when the primary hits a limit (repeatable)")
     ap.add_argument("--rules-dir", default=os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "rules"))
     ap.add_argument("--workspaces", action="store_true")
     args = ap.parse_args(argv)

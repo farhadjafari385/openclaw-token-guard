@@ -1,3 +1,5 @@
+import os from "node:os";
+
 // Pure, unit-testable decision logic for token-guard. No OpenClaw imports here.
 //
 // decide(event, ctx, state, config, log) is called from a before_tool_call hook
@@ -14,13 +16,19 @@ const DEFAULT_CONFIG = {
   minLoopSleepSeconds: 5,
   maxRepeatCommand: 4,
   maxRepeatMessage: 3,
+  maxBlockedRetries: 0, // identical retries of a call already blocked in this run that are tolerated; 0 = refuse the first retry
+  forbiddenModelPatterns: ["fable"], // sessions_spawn model overrides matching any of these are blocked
+  forbiddenThinking: ["xhigh", "max"], // sessions_spawn thinking levels that are blocked
   checkpointEvery: 120, // 0 disables; never applies to subagents
   maxToolCallsPerRun: 400,
   maxStatusChecksPerRun: 12,
   statusExemptSessionPatterns: [":cron:"],
   briefMinChars: 600,
-  requireBriefFields: ["Project:", "Items:", "Done when:"],
+  requireBriefFields: ["Project:", "Scope:", "Items:", "Done when:", "Stop if:"],
   briefCheckAgents: ["coordinator"], // [] = every agent
+  requireSpawnForBriefs: true, // a new brief starts a fresh session (sessions_spawn), never an existing chat
+  dedupeWindowMs: 6 * 60 * 60 * 1000, // identical brief to the same target inside this window is blocked
+  maxItemsPerBrief: 4, // inbox items per session; only small items may share one
   exemptSessionPatterns: [],
   runIdleResetMs: 120000, // runs without a runId: start a fresh count after this gap
   ttlMs: 6 * 60 * 60 * 1000,
@@ -28,6 +36,7 @@ const DEFAULT_CONFIG = {
 };
 
 const STATUS_TOOLS = new Set(["sessions_history", "sessions_list", "session_status"]);
+const INBOX_ID = /\b[0-9a-f]{8}\b/g;
 const NON_PROGRESS_TOOLS = new Set(["exec", "process", "message", ...STATUS_TOOLS]);
 const WAITERS = new Set(["oc-wait", "oc-wait-pipeline"]);
 const WRAPPERS = new Set(["nohup", "exec", "env", "command", "builtin", "nice", "setsid", "stdbuf"]);
@@ -50,6 +59,29 @@ function isSubagentSession(sessionKey) {
   return typeof sessionKey === "string" && sessionKey.includes(":subagent:");
 }
 
+// Commands that stop, restart or kill the gateway. An agent runs inside the
+// gateway, so doing this cuts off its own run and every other agent's, and a
+// bare `stop` leaves the gateway down with nobody left to start it.
+// ~/.openclaw/bin/oc-gateway-restart is the one allowed way: it schedules the
+// restart outside the gateway, so it always completes.
+const GATEWAY_CONTROL = [
+  /\bsystemctl\b[^;&|\n]*\b(stop|restart|kill|try-restart|reload-or-restart|disable|mask)\b[^;&|\n]*\bopenclaw-gateway/,
+  /\bopenclaw\s+gateway\s+(stop|restart|start|run|install|uninstall)\b/,
+  /\b(pkill|killall)\b[^;&|\n]*\b(openclaw|node|entry\.js|MainThread)\b/,
+  /\bkill\b[^;&|\n]*\$\(\s*(pgrep|pidof)\b[^)]*\b(openclaw|node|entry)/,
+];
+const GATEWAY_CONTROL_REASON =
+  "token-guard: blocked a command that stops, restarts or kills the OpenClaw gateway. You run inside the gateway: " +
+  "this cuts off your own run and every agent's session, and a stop leaves it down. If a restart is really needed " +
+  "(e.g. to load a changed plugin), run `~/.openclaw/bin/oc-gateway-restart` once, as your LAST action, and end your turn; " +
+  "it restarts the gateway safely from outside in 15 seconds. Agents come back after about 10 minutes.";
+
+function controlsGateway(command) {
+  if (typeof command !== "string" || !command) return false;
+  const shell = executableParts(command).shell;
+  return GATEWAY_CONTROL.some((re) => re.test(shell));
+}
+
 // ---- command analysis ----
 
 function parseDurationSeconds(tok) {
@@ -63,6 +95,7 @@ function parseDurationSeconds(tok) {
   return n;
 }
 
+const MAX_PARSE_CHARS = 16 * 1024;
 const SHELL_HEADS = /^(bash|sh|zsh|dash|ssh)$/;
 const PYTHON_HEADS = /^python[0-9.]*$/;
 
@@ -94,7 +127,15 @@ function quotedCode(text) {
 // store or print them (cat > file, tee) are data and are dropped; bodies fed
 // to an interpreter stay, as shell or python. Quoted strings are blanked, but
 // code quoted for an interpreter (bash -c, ssh, python -c) is kept.
+let lastParts = null; // one-entry memo: decide() analyses the same command several times
 function executableParts(command) {
+  if (lastParts && lastParts.command === command) return lastParts.result;
+  const result = computeExecutableParts(command);
+  lastParts = { command, result };
+  return result;
+}
+
+function computeExecutableParts(command) {
   const shellLines = [];
   const python = [];
   const extraShell = [];
@@ -115,7 +156,9 @@ function executableParts(command) {
     else if (SHELL_HEADS.test(head)) extraShell.push(body.join("\n"));
   }
   const outer = shellLines.join("\n");
-  const quoted = quotedCode(outer);
+  // quotedCode's regex backtracks badly on huge input (80KB took 2.6s), so quoted interpreter code is not
+  // extracted past MAX_PARSE_CHARS; decide() blocks such commands when they call an interpreter (oversizeCommand).
+  const quoted = outer.length > MAX_PARSE_CHARS ? { shell: [], python: [] } : quotedCode(outer);
   const shell = [stripQuoted(outer), ...extraShell, ...quoted.shell.map(stripQuoted)].join("\n");
   return { shell, python: [...python, ...quoted.python].join("\n") };
 }
@@ -126,11 +169,30 @@ function rawSegments(shellText) {
 
 // Simple commands: split on ; && || | & and newlines, dropping leading shell
 // keywords (do, then, else) so `do sleep 5` yields `sleep 5`.
+let lastSegments = null; // one-entry memo, same reason as executableParts
 function segments(shellText) {
+  if (lastSegments && lastSegments.text === shellText) return lastSegments.result;
+  const result = computeSegments(shellText);
+  lastSegments = { text: shellText, result };
+  return result;
+}
+
+const headWordsCache = new Map(); // cleared whenever a new command is analysed
+function computeSegments(shellText) {
+  headWordsCache.clear();
   return rawSegments(shellText).map((s) => s.trim().replace(/^(?:(?:do|then|else|elif|time|!)\s+)+/, ""));
 }
 
 function headWords(segment) {
+  let hit = headWordsCache.get(segment);
+  if (hit === undefined) {
+    hit = computeHeadWords(segment);
+    headWordsCache.set(segment, hit);
+  }
+  return hit;
+}
+
+function computeHeadWords(segment) {
   const words = String(segment).trim().split(/\s+/).filter(Boolean).map((w) => w.replace(/^[({]+/, ""));
   let i = 0;
   while (i < words.length) {
@@ -197,6 +259,32 @@ function commandHeads(command) {
 
 function invokesWaiter(command) {
   return commandHeads(command).some((h) => WAITERS.has(h));
+}
+
+const WAITER_PATH_PREFIXES = ["~/.openclaw/bin/", "$HOME/.openclaw/bin/", `${os.homedir()}/.openclaw/bin/`];
+
+// True only when the command is exactly one simple command whose program is
+// the real waiter at ~/.openclaw/bin/oc-wait or ~/.openclaw/bin/oc-wait-pipeline.
+// Chains (`oc-wait ...; sleep 600`), lookalike paths and any substitution
+// ($( ` <( >( ) are not exempt. The path may be quoted ("$HOME/.openclaw/bin/oc-wait").
+function isSoleWaiter(command) {
+  if (typeof command !== "string" || command.length > MAX_PARSE_CHARS) return false;
+  if (/\$\(|`|<\(|>\(/.test(command)) return false;
+  const parts = segments(executableParts(command).shell).filter(Boolean);
+  if (parts.length !== 1) return false;
+  const m = /^\s*(?:"([^"]*)"|'([^']*)'|(\S+))/.exec(command);
+  if (!m) return false;
+  const quoted = m[1] !== undefined || m[2] !== undefined;
+  const first = m[1] ?? m[2] ?? m[3];
+  if (quoted && first.startsWith("~")) return false; // ~ does not expand inside quotes
+  if (m[2] !== undefined && first.startsWith("$")) return false; // $HOME does not expand in single quotes
+  return WAITER_PATH_PREFIXES.some((p) => first.startsWith(p) && WAITERS.has(first.slice(p.length)));
+}
+
+// Over MAX_PARSE_CHARS the quoted code of an interpreter is not extracted, so a
+// padded `bash -c 'sleep 600'` would hide its sleep. Such commands are blocked.
+function callsInterpreter(command) {
+  return commandHeads(command).some((h) => SHELL_HEADS.test(h) || PYTHON_HEADS.test(h));
 }
 
 // A waiting loop the command runs: shell while/until ... sleep ... done, a
@@ -280,6 +368,7 @@ function newRunState(now) {
     pollByJob: new Map(),
     commandCounts: new Map(),
     messageCounts: new Map(),
+    blockedSigs: new Map(),
   };
 }
 
@@ -316,6 +405,33 @@ function endRun(state, event, ctx) {
   state.runs.delete(runKeyFor(event, ctx).key);
 }
 
+// ---- briefs ----
+
+function briefLines(text) {
+  return String(text).split("\n").map((line) => line.replace(/^[\s>*#_\-]+/, "").toLowerCase());
+}
+
+function missingBriefFields(text, cfg) {
+  const lines = briefLines(text);
+  return cfg.requireBriefFields.filter((field) => !lines.some((line) => line.startsWith(String(field).toLowerCase())));
+}
+
+// A brief is a new piece of work: long, or shaped like one (Project: and Done when: lines).
+function isBrief(text, cfg) {
+  if (text.length >= cfg.briefMinChars) return true;
+  const lines = briefLines(text);
+  return lines.some((line) => line.startsWith("project:")) && lines.some((line) => line.startsWith("done when:"));
+}
+
+// Inbox items a brief names, as far as the inbox knows them.
+function briefItems(text, state) {
+  if (!state || typeof state.lookupInbox !== "function") return [];
+  const ids = [...new Set(String(text).match(INBOX_ID) || [])];
+  if (ids.length === 0) return [];
+  const inbox = state.lookupInbox();
+  return ids.map((id) => inbox.get(id)).filter(Boolean);
+}
+
 // ---- decision ----
 
 function decide(event, ctx, state, rawConfig, log, now = Date.now()) {
@@ -333,7 +449,10 @@ function decide(event, ctx, state, rawConfig, log, now = Date.now()) {
   const subagent = isSubagentSession(sessionKey);
   const enforce = cfg.mode !== "warn";
 
+  let callSig = "";
+  try { callSig = `${toolName}|${JSON.stringify(params)}`; } catch { callSig = ""; }
   const block = (rule, reason) => {
+    if (callSig && rule !== "retryBlocked") run.blockedSigs.set(callSig, 0);
     state.blocks.set(rule, (state.blocks.get(rule) || 0) + 1);
     if (typeof log === "function") {
       log(enforce ? "warn" : "info", `token-guard ${enforce ? "blocked" : "would block"} ${toolName} (${rule})`, {
@@ -342,6 +461,17 @@ function decide(event, ctx, state, rawConfig, log, now = Date.now()) {
     }
     return enforce ? { block: true, blockReason: reason } : undefined;
   };
+
+  // An identical call that was already blocked in this run is refused again without re-evaluating it.
+  if (callSig && run.blockedSigs.has(callSig)) {
+    const tries = run.blockedSigs.get(callSig) + 1;
+    run.blockedSigs.set(callSig, tries);
+    if (tries > cfg.maxBlockedRetries) {
+      return block("retryBlocked",
+        `token-guard: this exact ${toolName} call was already blocked in this run and was sent again unchanged. ` +
+        "Do not retry it: change the approach (use the remedy in the earlier block message), or end your turn and report the blocker.");
+    }
+  }
 
   // Per-run budget. `message` stays available so the agent can always report.
   run.toolCalls += 1;
@@ -364,7 +494,8 @@ function decide(event, ctx, state, rawConfig, log, now = Date.now()) {
   }
 
   // Status checks of other sessions.
-  if (STATUS_TOOLS.has(toolName) && !matchesAny(sessionKey, cfg.statusExemptSessionPatterns)) {
+  const statusCheck = STATUS_TOOLS.has(toolName) || (toolName === "subagents" && (params.action || "list") === "list");
+  if (statusCheck && !matchesAny(sessionKey, cfg.statusExemptSessionPatterns)) {
     run.statusChecks += 1;
     if (run.statusChecks > cfg.maxStatusChecksPerRun) {
       return block("maxStatusChecksPerRun",
@@ -390,12 +521,18 @@ function decide(event, ctx, state, rawConfig, log, now = Date.now()) {
     return undefined;
   }
 
+  if (toolName === "gateway") {
+    const action = String(params.action || params.method || params.command || "").toLowerCase();
+    if (/restart|stop|shutdown|update|reload/.test(action)) return block("gatewayControl", GATEWAY_CONTROL_REASON);
+  }
+
   if (toolName === "exec") {
     const command = typeof params.command === "string" ? params.command : "";
+    if (controlsGateway(command)) return block("gatewayControl", GATEWAY_CONTROL_REASON);
     const background = params.background === true;
     const awaitResults = params.awaitResults === true;
 
-    if (invokesWaiter(command)) {
+    if (isSoleWaiter(command)) {
       if (!subagent && !background && !awaitResults && enforce) {
         if (typeof log === "function") log("info", "token-guard moved a waiter to the background", { agentId, sessionKey });
         return { params: Object.assign({}, params, { background: true }) };
@@ -403,8 +540,14 @@ function decide(event, ctx, state, rawConfig, log, now = Date.now()) {
       return undefined;
     }
 
+    if (command.length > MAX_PARSE_CHARS && callsInterpreter(command)) {
+      return block("oversizeCommand",
+        `token-guard: blocked a ${command.length}-character command that runs bash/sh/zsh/dash/ssh/python: ` +
+        `it is too large to check for sleeps. Write the script to a file in a separate step (cat > file <<'EOF'), then run the file.`);
+    }
     const sleepSeconds = totalSleepSeconds(command);
-    if (!background && !awaitResults) {
+    if (!background) {
+      // awaitResults still waits in the foreground, so sleeps stay checked.
       if (sleepSeconds >= cfg.maxForegroundSleepSeconds) {
         return block("foregroundSleep", waitRemedy(`a foreground sleep of ${sleepSeconds}s`, subagent));
       }
@@ -449,17 +592,70 @@ function decide(event, ctx, state, rawConfig, log, now = Date.now()) {
     run.commandCounts.clear();
   }
 
-  if (toolName === "sessions_send") {
-    const agents = Array.isArray(cfg.briefCheckAgents) ? cfg.briefCheckAgents : [];
-    const checked = agents.length === 0 || agents.includes(agentId);
-    const message = typeof params.message === "string" ? params.message : "";
-    if (checked && message.length >= cfg.briefMinChars) {
-      const lines = message.split("\n").map((line) => line.replace(/^[\s>*#_\-]+/, "").toLowerCase());
-      const missing = cfg.requireBriefFields.filter((field) => !lines.some((line) => line.startsWith(String(field).toLowerCase())));
+  if (toolName === "sessions_spawn") {
+    const model = String(params.model || "").toLowerCase();
+    if (model && (cfg.forbiddenModelPatterns || []).some((p) => model.includes(String(p).toLowerCase()))) {
+      return block("forbiddenModel", `token-guard: model "${params.model}" is not allowed for spawned sessions. Use Sonnet (default) or Haiku; Opus only for hard reasoning with the reason stated in the brief.`);
+    }
+    const thinking = String(params.thinking || "").toLowerCase();
+    if (thinking && (cfg.forbiddenThinking || []).includes(thinking)) {
+      return block("forbiddenThinking", `token-guard: thinking level "${params.thinking}" is not allowed. Use off, low or medium.`);
+    }
+  }
+
+  const briefAgents = Array.isArray(cfg.briefCheckAgents) ? cfg.briefCheckAgents : [];
+  const briefChecked = briefAgents.length === 0 || briefAgents.includes(agentId);
+  if (briefChecked && (toolName === "sessions_send" || toolName === "sessions_spawn")) {
+    const spawn = toolName === "sessions_spawn";
+    const text = String((spawn ? params.task : params.message) || "");
+    if (spawn && params.context === "fork") {
+      return block("forkSpawn",
+        "token-guard: context \"fork\" copies your whole session into the child, so every call of that task re-reads it. " +
+        "Spawn with context \"isolated\" and put what the child needs in the brief.");
+    }
+    const brief = isBrief(text, cfg);
+    if (brief) {
+      state.sentBriefs = state.sentBriefs || new Map();
+      const key = `${spawn ? "spawn:" + (params.agentId || "") : params.sessionKey || ""}|${text.replace(/\s+/g, " ").trim().toLowerCase()}`;
+      const prev = state.sentBriefs.get(key);
+      if (prev !== undefined && now - prev < cfg.dedupeWindowMs) {
+        return block("duplicateBrief", "token-guard: this exact brief was already sent to this target; not sending it again.");
+      }
+      state.sentBriefs.set(key, now);
+      for (const [k, t] of state.sentBriefs) if (now - t >= cfg.dedupeWindowMs) state.sentBriefs.delete(k);
+    }
+    const target = String(params.sessionKey || "");
+    if (!spawn && brief && cfg.requireSpawnForBriefs && !isSubagentSession(target)) {
+      const owner = target.startsWith("agent:") ? target.split(":")[1] : String(params.agentId || params.label || "the owner");
+      return block("briefToExistingChat",
+        `token-guard: a new task starts in a fresh session, not in ${target || owner}'s existing chat, which every call would re-read in full. ` +
+        `Use sessions_spawn with agentId "${owner}", context "isolated", label "<project>: <short title>", and this brief as task ` +
+        "(runTimeoutSeconds 3600 if it builds, deploys or waits on CI). sessions_send is only for short follow-ups " +
+        `(under ${cfg.briefMinChars} characters) to a task's own child session (its childSessionKey).`);
+    }
+    if (text.length >= cfg.briefMinChars) {
+      const missing = missingBriefFields(text, cfg);
       if (missing.length > 0) {
         return block("briefFields",
           `token-guard: this brief is missing ${missing.join(", ")}. Every brief of ${cfg.briefMinChars}+ characters needs ` +
           `one line each for ${cfg.requireBriefFields.join(", ")} (Items: the task_inbox ids). Add them and resend.`);
+      }
+    }
+    const items = briefItems(text, state);
+    if (items.length > cfg.maxItemsPerBrief) {
+      return block("tooManyItems",
+        `token-guard: ${items.length} inbox items in one brief; one session takes at most ${cfg.maxItemsPerBrief} small items. ` +
+        "Split it: run task_inbox plan and start one session per batch.");
+    }
+    if (items.length > 1) {
+      const big = items.filter((it) => it.size !== "small");
+      const mixed = new Set(items.map((it) => `${it.project || ""}|${it.owner || ""}`)).size > 1;
+      if (big.length > 0 || mixed) {
+        return block("mixedBatch",
+          (big.length > 0
+            ? `token-guard: ${big.map((it) => `${it.id} (${it.size})`).join(", ")} must each get a fresh session of its own. `
+            : "token-guard: these items belong to different projects or owners. ") +
+          "Only small items of the same project, owner and area share one session. Run task_inbox plan and start one session per batch.");
       }
     }
   }
@@ -475,9 +671,12 @@ export {
   totalSleepSeconds,
   commandHeads,
   invokesWaiter,
+  isSoleWaiter,
+  callsInterpreter,
   hasSleepLoop,
   normaliseCommand,
   isProgressTool,
+  isBrief,
   createState,
   cleanupState,
   endRun,

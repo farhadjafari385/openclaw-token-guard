@@ -11,6 +11,8 @@
 #   --compaction-timeout=S   seconds a compaction may run (default 900; OpenClaw's own is 180)
 #   --daily-reset-hour=H     reset group sessions daily at H (gateway local time)
 #   --group-idle-minutes=M   also reset group sessions after M idle minutes
+#   --fallback-model=P/M     model to fall back to when the primary hits a limit, for
+#                            the default and every agent (repeatable; e.g. openai/gpt-6-astra)
 #   --patch-legacy           replace known legacy "keep polling" rules in AGENTS.md
 #   --install-skills         copy skills/* into every agent workspace
 #   --skip-plugin            skip the plugin install
@@ -39,11 +41,12 @@ for arg in "$@"; do
     --compaction-timeout=*) PLAN_ARGS+=(--compaction-timeout "${arg#*=}") ;;
     --daily-reset-hour=*) PLAN_ARGS+=(--daily-reset-hour "${arg#*=}") ;;
     --group-idle-minutes=*) PLAN_ARGS+=(--group-idle-minutes "${arg#*=}") ;;
+    --fallback-model=*) PLAN_ARGS+=(--fallback-model "${arg#*=}") ;;
     --patch-legacy) PATCH_LEGACY=1 ;;
     --install-skills) INSTALL_SKILLS=1 ;;
     --skip-plugin) SKIP_PLUGIN=1 ;;
     --skip-config) SKIP_CONFIG=1 ;;
-    -h|--help) sed -n '2,21p' "${BASH_SOURCE[0]}"; exit 0 ;;
+    -h|--help) sed -n '2,23p' "${BASH_SOURCE[0]}"; exit 0 ;;
     *) echo "apply.sh: unknown argument: $arg" >&2; exit 2 ;;
   esac
 done
@@ -118,7 +121,7 @@ done <<< "$WORKSPACES"
 
 step "Waiters and inbox (oc-wait, oc-wait-pipeline, oc-inbox)"
 run mkdir -p "$OC_HOME/bin"
-for name in oc-wait oc-wait-pipeline oc-inbox; do
+for name in oc-wait oc-wait-pipeline oc-inbox oc-gateway-restart; do
   run install -m 0755 "$REPO_ROOT/bin/$name" "$OC_HOME/bin/$name"
 done
 
@@ -189,6 +192,7 @@ if [ "$SKIP_CONFIG" = 0 ]; then
   step "Config"
   # Plan after the rule blocks are in, so bootstrap limits include them.
   PLAN="$("$PY" "$REPO_ROOT/install/_plan.py" "$CONFIG" "${PLAN_ARGS[@]}")" || { fail_step "config plan"; PLAN=""; }
+  PATCH_LINES=""
   while IFS= read -r line; do
     [ -n "$line" ] || continue
     path="$("$PY" -c 'import json,sys; print(json.loads(sys.argv[1])["path"])' "$line")"
@@ -196,6 +200,11 @@ if [ "$SKIP_CONFIG" = 0 ]; then
     mode="$("$PY" -c 'import json,sys; print(json.loads(sys.argv[1])["mode"])' "$line")"
     why="$("$PY" -c 'import json,sys; print(json.loads(sys.argv[1])["why"])' "$line")"
     log "# $why"
+    if [ "$mode" = "patch" ]; then
+      PATCH_LINES+="$line"$'\n'
+      log "[patch] $path = $value"
+      continue
+    fi
     extra=()
     [ "$mode" = "replace" ] && extra=(--replace)
     if [ "$DRY_RUN" = 1 ]; then
@@ -205,6 +214,28 @@ if [ "$SKIP_CONFIG" = 0 ]; then
       oc config set "$path" "$value" --strict-json "${extra[@]}" || fail_step "config set $path"
     fi
   done <<< "$PLAN"
+  if [ -n "$PATCH_LINES" ]; then
+    # One merge patch for all "patch" lines: one config reload instead of one per agent.
+    PATCH_FILE="$(mktemp "${TMPDIR:-/tmp}/token-guard-patch.XXXXXX.json")"
+    printf '%s' "$PATCH_LINES" | "$PY" -c '
+import json, sys
+patch = {}
+for line in sys.stdin:
+    if line.strip():
+        op = json.loads(line)
+        node = patch
+        *parents, leaf = op["path"].split(".")
+        for key in parents:
+            node = node.setdefault(key, {})
+        node[leaf] = op["value"]
+print(json.dumps(patch, indent=1))' > "$PATCH_FILE"
+    if [ "$DRY_RUN" = 1 ]; then
+      log "[dry-run] openclaw config patch --file $PATCH_FILE"
+    else
+      log "[apply] openclaw config patch --file $PATCH_FILE"
+      oc config patch --file "$PATCH_FILE" || fail_step "config patch"
+    fi
+  fi
   if [ "$DRY_RUN" = 0 ]; then
     oc config validate || fail_step "config validate"
   fi
