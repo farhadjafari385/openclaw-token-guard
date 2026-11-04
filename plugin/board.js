@@ -44,7 +44,7 @@ function resultVerdict(text, outcome) {
   if (/^(done|approved|pass|passed|merged|released|shipped|complete|completed)\b/.test(v)) return "done";
   if (/^blocked\b/.test(v)) return "blocked";
   if (/^(changes requested|fail|failed|partly|partially|partial|not done)\b/.test(v)) return "failed";
-  return text ? "unknown" : "failed";
+  return "unknown"; // no clear verdict (or no text captured): the orchestrator checks it in Review
 }
 
 // Where an item goes when a task working on it ends.

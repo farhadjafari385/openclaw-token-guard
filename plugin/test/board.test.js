@@ -22,6 +22,8 @@ test("the worker's RESULT line decides where its items go", () => {
   assert.equal(resultVerdict("RESULT: changes requested", "ok"), "failed");
   assert.equal(resultVerdict("RESULT: done", "timeout"), "failed");
   assert.equal(resultVerdict("all good", "ok"), "unknown");
+  assert.equal(resultVerdict("", "ok"), "unknown"); // nothing captured: Review, never back to To do
+  assert.equal(nextAfterJob("in_progress", "devops", resultVerdict("", "ok")), "review");
   assert.equal(nextAfterJob("in_progress", "writer", "done"), "review");
   assert.equal(nextAfterJob("review", "reviewer", "done"), "qa");
   assert.equal(nextAfterJob("qa", "qa", "done"), "done");

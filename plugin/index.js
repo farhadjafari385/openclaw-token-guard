@@ -263,6 +263,10 @@ export default definePluginEntry({
       if (job) {
         const text = lastAssistantText(event && event.messages);
         if (recordResultText(store.data, key, text, jobsCfg)) store.touch();
+        else if (!job.resultText) {
+          const last = Array.isArray(event && event.messages) ? event.messages[event.messages.length - 1] : undefined;
+          log("info", "token-guard: no final text in agent_end", { messages: Array.isArray(event && event.messages) ? event.messages.length : -1, lastKeys: last && typeof last === "object" ? Object.keys(last).slice(0, 8) : typeof last });
+        }
       }
     }));
 
@@ -346,6 +350,10 @@ export default definePluginEntry({
 
     api.on("llm_output", safe("llm_output", (event, ctx) => {
       const key = ctx && ctx.sessionKey;
+      // The worker's latest text, so the result is known even if agent_end carries none.
+      const job = key && store.data.jobs[key];
+      const texts = event && Array.isArray(event.assistantTexts) ? event.assistantTexts.filter((t) => typeof t === "string" && t.trim()) : [];
+      if (job && texts.length && recordResultText(store.data, key, texts.join("\n"), jobsCfg)) store.touch();
       const over = recordUsage(store.data, key, event && event.usage, jobsCfg);
       if (over) {
         store.touch();
