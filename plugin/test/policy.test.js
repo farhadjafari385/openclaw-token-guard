@@ -85,7 +85,7 @@ test("model pins on sessions are refused; thinking changes are allowed", () => {
 
 test("the orchestrator cannot do specialist work; read-only checks are fine", () => {
   for (const cmd of [
-    "git -C /srv/projects/demo push origin main", "docker compose up -d", "sudo systemctl restart nginx",
+    "git -C /srv/projects/demo push origin agent/x", "docker compose up -d", "sudo systemctl restart nginx",
     "curl -X POST https://api.cloudflare.com/client/v4/zones/x/dns_records -d '{}'", "ssh deploy@host ls",
     "echo hi > /srv/projects/demo/README.md", "./scripts/deploy.sh --prod", "npm run build", "rm -rf /srv/projects/demo/dist",
   ]) assert.equal(rule(policyDecide(exec(cmd), COORD, {}, {})), "orchestratorOnly", cmd);
