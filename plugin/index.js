@@ -16,6 +16,7 @@ import {
   auditText, movedText, mdToHtml, handleOf,
 } from "./voice.js";
 import { inboxArgs, loadInboxItems, runInbox } from "./inbox.js";
+import { processBoot } from "./boot.js";
 
 // No top-level await: OpenClaw loads plugin entries through require(), which
 // rejects ESM graphs that use it.
@@ -23,8 +24,10 @@ import { inboxArgs, loadInboxItems, runInbox } from "./inbox.js";
 const state = createState();
 state.lookupInbox = () => loadInboxItems();
 
-const BOOT_ID = crypto.randomUUID();
-const BOOT_STARTED_AT = Date.now();
+// Shared by every copy of the plugin in this process (see boot.js).
+const BOOT = processBoot();
+const BOOT_ID = BOOT.id;
+const BOOT_STARTED_AT = BOOT.startedAt;
 // OpenClaw may load the plugin in several generations and not always stop the old ones.
 // Only the newest generation runs the follow-up loop.
 const GEN_KEY = Symbol.for("token-guard.activeGeneration");
@@ -56,6 +59,16 @@ export default definePluginEntry({
 
     const store = createJobStore(jobsCfg.stateFile);
     store.load();
+    // Another copy of the plugin may have written newer state (message ids, owner messages): read it first.
+    let freshAt = 0;
+    const fresh = () => {
+      if (Date.now() - freshAt > 2000) {
+        freshAt = Date.now();
+        try { store.refresh(); } catch { /* best effort */ }
+      }
+      return store.data;
+    };
+    log("info", "token-guard registered", { boot: BOOT_ID, copy: crypto.randomUUID().slice(0, 8) });
     const ownerId = String(cfg.ownerId || "");
     const boardCfg = Object.assign({ enabled: true, agent: "product", auditEveryMinutes: 180, view: true }, cfg.board || {});
     const pm = boardCfg.agent || "product";
@@ -141,7 +154,7 @@ export default definePluginEntry({
       return m ? Number(m[1]) : null;
     };
     const lastOwnerMessage = (topic, maxAgeMs) => {
-      const last = (store.data.ownerMsgs || {})[String(topic)];
+      const last = (fresh().ownerMsgs || {})[String(topic)];
       return last && last.id && Date.now() - last.at < maxAgeMs ? last.id : null;
     };
     // The owner's message a dispatch answers: the item's recorded source, else the owner's latest message in that topic.
@@ -156,11 +169,11 @@ export default definePluginEntry({
     const takePendingResult = (topic) => {
       const now = Date.now();
       let best = null;
-      for (const j of Object.values(store.data.jobs)) {
+      for (const j of Object.values(fresh().jobs)) {
         if (!j.resultMsgId || j.answeredAt || Number(j.topic) !== Number(topic) || now - (j.endedAt || 0) > 3 * 3600000) continue;
         if (!best || (j.endedAt || 0) > (best.endedAt || 0)) best = j;
       }
-      if (best) { best.answeredAt = now; store.touch(); }
+      if (best) { best.answeredAt = now; store.touch(); store.save(); }
       return best;
     };
     const withMention = (text, agentId) => {
@@ -191,6 +204,7 @@ export default definePluginEntry({
     // After the orchestrator approves checked work, ask the owner once (archiving needs both approvals).
     const askOwnerToApprove = (ids) => {
       const board = loadInboxItems();
+      fresh();
       store.data.askedApproval = store.data.askedApproval || {};
       const byTopic = new Map();
       for (const id of ids) {
@@ -398,7 +412,7 @@ export default definePluginEntry({
         // The worker answers its dispatch, from its own bot, once the dispatch is posted.
         Promise.resolve(threads.get(key)).catch(() => null).then(() => {
           threads.delete(key);
-          const j = store.data.jobs[key] || cur;
+          const j = fresh().jobs[key] || cur;
           return say(j.agentId, j.topic, resultText(voice, j, verdict, plan), { html: true, replyTo: j.dispatchMsgId || null });
         }).then((id) => { if (typeof id === "number") setJob(key, { resultMsgId: id }); });
         Promise.all(plan.map((m) => systemMove(m.id, m.to, `${cur.agentId} task ended: ${verdict} [job ${cur.short}]`)))
@@ -461,6 +475,7 @@ export default definePluginEntry({
         store.data.ownerMsgs = store.data.ownerMsgs || {};
         store.data.ownerMsgs[String(topic)] = { id: msgId, at: Date.now() };
         store.touch();
+        store.save();
       }
       const approval = parseApproval(event.content);
       if (approval) {
