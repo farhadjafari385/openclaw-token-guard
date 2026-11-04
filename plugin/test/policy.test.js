@@ -136,3 +136,13 @@ test("helpers", () => {
   assert.equal(writesProtected(P, "ls -la", "devops"), false);
   assert.equal(orchestratorMutation(P, "curl -s https://x/y", "coordinator"), null);
 });
+
+test("git safety: no hook bypass, no direct pushes to protected branches (every agent)", () => {
+  for (const cmd of ["git push --no-verify origin agent/1", "git push origin main", "git push origin HEAD:main", "git push origin +master",
+    "git -C /srv/x push origin main", "git config core.hooksPath /dev/null", "git -c core.hooksPath=/tmp push origin agent/2", "git push --mirror origin"]) {
+    assert.equal(rule(policyDecide(exec(cmd), DEVOPS, {}, {})), "gitSafety", cmd);
+  }
+  for (const cmd of ["git push origin agent/123-main-fix", "git push -u origin agent/abc", "git config --get core.hooksPath", "git log main..HEAD"]) {
+    assert.equal(policyDecide(exec(cmd), DEVOPS, {}, {}), undefined, cmd);
+  }
+});

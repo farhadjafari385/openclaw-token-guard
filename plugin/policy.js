@@ -240,6 +240,23 @@ const MUTATING_OPENCLAW = new RegExp(
     "update\\b",
   ].join("|") + ")", "i");
 
+// ---- git safety (every agent) ----
+
+const PROTECTED_BRANCH = "(?:refs\\/heads\\/)?(?:main|master|prod|production)";
+const GIT_RULES = [
+  { re: /\bgit\b[^;&|\n]*\bpush\b[^;&|\n]*\s--no-verify\b/, why: "git push --no-verify skips the hooks that protect main and block secrets" },
+  { re: new RegExp(`\\bgit\\b[^;&|\\n]*\\bpush\\b[^;&|\\n]*(?:\\s|:|\\+)${PROTECTED_BRANCH}(?=\\s|$|;|&|\\|)`), why: "pushing to main, master or production directly; push an agent/<task-id> branch and open a merge request" },
+  { re: /\bgit\b[^;&|\n]*\bpush\b[^;&|\n]*\s(?:--mirror|--all)\b/, why: "git push --mirror/--all also pushes protected branches" },
+  { re: /\bgit\b(?:\s+-C\s+\S+)?\s+config\b[^;&|\n]*\bcore\.hookspath\s+\S/i, why: "changing core.hooksPath switches off the protective hooks" },
+  { re: /\bgit\b[^;&|\n]*\s-c\s+core\.hookspath=/i, why: "overriding core.hooksPath switches off the protective hooks" },
+];
+
+function gitViolation(command) {
+  const text = String(command || "").replace(/'[^']*'|"(?:[^"\\]|\\.)*"/g, '""');
+  for (const rule of GIT_RULES) if (rule.re.test(text)) return rule.why;
+  return null;
+}
+
 // ---- orchestrator-only ----
 
 const ORC_MUTATIONS = [
@@ -371,6 +388,8 @@ function policyDecide(event, ctx, pstate, rawConfig, log, now = Date.now()) {
     }
     if (tool === "exec") {
       const command = typeof params.command === "string" ? params.command : "";
+      const git = gitViolation(command);
+      if (git) return block("gitSafety", `token-guard: blocked: ${git}. Merges to main happen only through a reviewed merge request (the Team Lead merges when the pipeline is green).`);
       if (MUTATING_OPENCLAW.test(command)) return block("protectedConfig", `token-guard: changing OpenClaw config, plugins, crons, secrets, agents or models is not allowed for agents. ${RULES_MESSAGE}`);
       if (/(?:^|[\s;&|])chattr\s/.test(command)) return block("protectedFile", `token-guard: chattr is not allowed. ${RULES_MESSAGE}`);
       if (writesProtected(policy, command, agentId, params.workdir || params.cwd)) return block("protectedFile", `token-guard: this command would change a protected file. ${RULES_MESSAGE}`);
@@ -533,6 +552,7 @@ export {
   mentionsProtected,
   writesProtected,
   orchestratorMutation,
+  gitViolation,
   toolWritePaths,
   spawnRewrite,
   firstLine,
