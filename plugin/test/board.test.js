@@ -32,6 +32,10 @@ test("the worker's RESULT line decides where its items go", () => {
   assert.equal(nextAfterJob("in_progress", "writer", "failed"), "todo");
   assert.equal(nextAfterJob("review", "reviewer", "blocked"), "blocked");
   assert.equal(nextAfterJob("in_progress", "writer", "unknown"), "review");
+  // A late or duplicate result never undoes a later decision.
+  for (const st of ["done", "dropped", "archived", "blocked", "todo", "backlog"]) {
+    for (const v of ["failed", "done", "blocked", "unknown"]) assert.equal(nextAfterJob(st, "devops", v), st, `${st}/${v}`);
+  }
 });
 
 test("board view and overview", () => {

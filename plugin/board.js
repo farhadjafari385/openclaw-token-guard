@@ -47,9 +47,15 @@ function resultVerdict(text, outcome) {
   return "unknown"; // no clear verdict (or no text captured): the orchestrator checks it in Review
 }
 
-// Where an item goes when a task working on it ends.
+// Columns a task's end may move an item out of: the work it was dispatched for. An item someone
+// has moved since (Done, Blocked, To do...) is left alone, so a late or duplicate result can
+// never undo the orchestrator's decision (on 2026-11-04 late "failed" results reopened Done items).
+const AUTO_FROM = new Set(["in_progress", "review", "qa"]);
+
+// Where an item goes when a task working on it ends (unchanged when it is no longer in that work).
 function nextAfterJob(before, role, verdict) {
   const s = normStatus(before);
+  if (!AUTO_FROM.has(s)) return s;
   if (verdict === "blocked") return "blocked";
   if (verdict === "failed") return "todo";
   if (verdict !== "done") return "review"; // no clear verdict: the orchestrator checks it
@@ -148,6 +154,6 @@ function looksLikeRequest(text) {
 }
 
 export {
-  COLUMNS, LEGACY, LABELS, TRANSITIONS, DISPATCHABLE, OPEN,
+  COLUMNS, LEGACY, LABELS, TRANSITIONS, DISPATCHABLE, OPEN, AUTO_FROM,
   normStatus, canMove, resultVerdict, nextAfterJob, renderBoard, renderOverview, auditBoard, parseApproval, looksLikeRequest,
 };
