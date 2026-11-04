@@ -145,3 +145,19 @@ test("merging job copies keeps the thread's message ids", () => {
   assert.equal(m.jobs.k.resultMsgId, 202);
   assert.deepEqual(m.ownerMsgs, { 151: { id: 9, at: 20 }, 152: { id: 3, at: 5 } });
 });
+
+test("every copy of the plugin in one process shares one boot, so running tasks are never taken for cut off", async () => {
+  const a = await import("../boot.js?copy=a");
+  const b = await import("../boot.js?copy=b");
+  assert.notEqual(a, b); // two module copies, as OpenClaw's plugin generations are
+  assert.equal(a.processBoot().id, b.processBoot().id);
+  assert.ok(a.processBoot().startedAt <= Date.now() && a.processBoot().startedAt > Date.now() - process.uptime() * 1000 - 5000);
+  const { scanJobs } = await import("../jobs.js");
+  const cfg = mergeJobsConfig({});
+  const d = emptyState();
+  const boot = a.processBoot();
+  recordSpawn(d, { childSessionKey: "agent:qa:subagent:9", agentId: "qa", label: "x", requesterSessionKey: "agent:coordinator:main" }, boot.id, Date.now(), cfg);
+  const env = { bootId: b.processBoot().id, bootStartedAt: Date.now() - 60 * 60000, orchestratorAgent: "coordinator", inboxItems: [] };
+  assert.deepEqual(scanJobs(d, cfg, Date.now(), env).filter((x) => x.reason === "interrupted"), []);
+  assert.equal(d.jobs["agent:qa:subagent:9"].status, "running");
+});
