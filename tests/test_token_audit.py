@@ -173,7 +173,9 @@ class TestTokenAudit(unittest.TestCase):
 
     def test_alert_weighted_exit_code(self):
         d = self._project_dir("agentV")
-        ts = self.now.isoformat().replace("+00:00", "Z")
+        # main() filters against the real clock, so this record must be recent in real time.
+        recent = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(hours=1)
+        ts = recent.isoformat().replace("+00:00", "Z")
         records = [
             {
                 "type": "assistant",
