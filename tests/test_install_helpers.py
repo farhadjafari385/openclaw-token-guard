@@ -30,6 +30,7 @@ class Args:
         self.compaction_timeout = 900
         self.daily_reset_hour = None
         self.group_idle_minutes = None
+        self.fallback_model = []
         self.rules_dir = os.path.join(REPO, "rules")
         self.__dict__.update(kw)
 
@@ -112,6 +113,26 @@ class TestPlan(unittest.TestCase):
         op = self.ops(cfg, daily_reset_hour=22)["session.resetByType.group"]
         self.assertEqual(op["value"], {"mode": "daily", "atHour": 22, "idleMinutes": 60})
         self.assertNotIn("session.resetByType.group", self.ops(cfg))
+
+    def test_fallback_added_to_default_and_every_agent_model(self):
+        cfg = self.config()
+        cfg["agents"]["defaults"] = {"model": "anthropic/claude-opus-5-5", "subagents": {"model": "anthropic/claude-sonnet-5"}}
+        cfg["agents"]["entries"]["devops"]["model"] = {"primary": "anthropic/claude-sonnet-5", "fallbacks": ["x/y"]}
+        ops = self.ops(cfg, fallback_model=["openai/gpt-6-astra"])
+        self.assertEqual(ops["agents.defaults.model"]["value"],
+                         {"primary": "anthropic/claude-opus-5-5", "fallbacks": ["openai/gpt-6-astra"]})
+        self.assertEqual(ops["agents.defaults.model"]["mode"], "patch")
+        self.assertEqual(ops["agents.defaults.subagents.model"]["value"]["fallbacks"], ["openai/gpt-6-astra"])
+        self.assertEqual(ops["agents.entries.devops.model"]["value"]["fallbacks"], ["x/y", "openai/gpt-6-astra"])
+        self.assertNotIn("agents.entries.coordinator.model", ops)  # no own model: uses the default
+
+    def test_fallback_is_idempotent_and_off_by_default(self):
+        cfg = self.config()
+        cfg["agents"]["defaults"] = {"model": {"primary": "a/b", "fallbacks": ["openai/gpt-6-astra"]}}
+        self.assertNotIn("agents.defaults.model", self.ops(cfg, fallback_model=["openai/gpt-6-astra"]))
+        cfg["agents"]["defaults"] = {"model": "a/b"}
+        self.assertNotIn("agents.defaults.model", self.ops(cfg))
+        self.assertIsNone(plan_mod.with_fallbacks("a/b", ["a/b"]))
 
     def test_legacy_agents_list_is_supported(self):
         cfg = {"agents": {"list": [{"id": "coordinator", "workspace": self.ws["coordinator"]}]}}

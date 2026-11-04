@@ -10,7 +10,10 @@ import {
   parseDurationSeconds,
   totalSleepSeconds,
 } from "../guard.js";
-import { inboxArgs } from "../inbox.js";
+import { inboxArgs, loadInboxItems } from "../inbox.js";
+import { mkdtempSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 const MAIN = { agentId: "devops", sessionKey: "agent:devops:telegram:group:-100", runId: "r1" };
 const SUB = { agentId: "devops", sessionKey: "agent:devops:subagent:abc", runId: "r2" };
@@ -107,13 +110,13 @@ test("process polls: subagents get a larger run budget and no per-job cap", () =
   assert.match(r[40].blockReason, /parent/);
 });
 
-test("exec: foreground sleeps and loops are blocked; background and awaitResults are not", () => {
+test("exec: foreground sleeps and loops are blocked (awaitResults waits in the foreground too); background is not", () => {
   const s = createState();
   assert.equal(blocked(decide(exec("sleep 240; curl -s x"), MAIN, s, {})), true);
   assert.equal(blocked(decide(exec("sleep 19 && curl -s x"), MAIN, s, {})), false);
   assert.equal(blocked(decide(exec("while true; do curl -s x; sleep 3; done"), MAIN, s, {})), true);
   assert.equal(blocked(decide(exec("sleep 30; curl -s x", { background: true }), MAIN, s, {})), false);
-  assert.equal(blocked(decide(exec("sleep 30; curl -s y", { awaitResults: true }), SUB, s, {})), false);
+  assert.equal(blocked(decide(exec("sleep 30; curl -s y", { awaitResults: true }), SUB, s, {})), true);
 });
 
 test("exec: long background sleeps are blocked for normal sessions only", () => {
@@ -132,7 +135,9 @@ test("exec: waiters are moved to the background, never blocked", () => {
   assert.equal(decide(exec(cmd), SUB, s, {}), undefined);
   assert.equal(decide(exec(cmd), MAIN, s, { mode: "warn" }), undefined);
   // a waiter whose check sleeps is still treated as a waiter, not a foreground sleep
-  assert.equal(decide(exec("oc-wait --every 30 --timeout 2h -- sleep 25"), MAIN, createState(), {}).params.background, true);
+  assert.equal(decide(exec("~/.openclaw/bin/oc-wait --every 30 --timeout 2h -- sleep 25"), MAIN, createState(), {}).params.background, true);
+  // a lookalike waiter outside ~/.openclaw/bin gets no waiter treatment
+  assert.equal(decide(exec("oc-wait --every 30 --timeout 2h -- sleep 25"), MAIN, createState(), {}), undefined);
 });
 
 test("exec: repeated commands are blocked on the 4th run without progress, even when alternating", () => {
@@ -188,18 +193,83 @@ test("status checks: 12 per run, cron sessions exempt", () => {
   assert.equal(run(s2, CRON, Array.from({ length: 30 }, () => ({ toolName: "session_status", params: {} }))).some(blocked), false);
 });
 
-test("briefs from the coordinator need Project, Items and Done when lines", () => {
+test("briefs from the coordinator need Project, Scope, Items, Done when and Stop if lines", () => {
   const filler = "x".repeat(700);
-  const send = (message) => ({ toolName: "sessions_send", params: { message } });
+  const spawn = (task) => ({ toolName: "sessions_spawn", params: { agentId: "devops", task } });
   const s = createState();
-  const r = decide(send(`Project: emberkin\n${filler}`), COORD, s, {});
+  const r = decide(spawn(`Project: demo\n${filler}`), COORD, s, {});
   assert.equal(blocked(r), true);
-  assert.match(r.blockReason, /missing Items:, Done when:/);
-  const good = `- **Project:** emberkin, /srv/o, topic 151\nItems: a1b2 fix login\nDone when: npm test passes\n${filler}`;
+  assert.match(r.blockReason, /missing Scope:, Items:, Done when:, Stop if:/);
+  const good = `- **Project:** demo, /srv/o, topic 151\nScope: login only\nItems: a1b2 fix login\nDone when: npm test passes\nStop if: schema change\n${filler}`;
+  assert.equal(decide(spawn(good), COORD, createState(), {}), undefined);
+  const send = (message) => ({ toolName: "sessions_send", params: { sessionKey: "agent:devops:subagent:abc", message } });
   assert.equal(decide(send(good), COORD, createState(), {}), undefined);
+  assert.equal(blocked(decide(send(`Project: x\n${filler}`), COORD, createState(), {})), true);
   assert.equal(decide(send(filler), MAIN, createState(), {}), undefined);
   assert.equal(decide(send("short note"), COORD, createState(), {}), undefined);
   assert.equal(blocked(decide(send(filler), MAIN, createState(), { briefCheckAgents: [] })), true);
+});
+
+test("a new brief goes to a fresh session: sessions_send into an existing chat is blocked", () => {
+  const brief = "Project: demo, /srv/o\nScope: login\nItems: a1b2c3d4 fix login\nDone when: npm test passes\nStop if: schema change";
+  const send = (params) => ({ toolName: "sessions_send", params: { message: brief, ...params } });
+  for (const params of [
+    { sessionKey: "agent:devops:telegram:group:-100:topic:7" },
+    { sessionKey: "agent:devops:main" },
+    { agentId: "writer" },
+    { label: "devops" },
+  ]) {
+    const r = decide(send(params), COORD, createState(), {});
+    assert.equal(blocked(r), true, JSON.stringify(params));
+    assert.match(r.blockReason, /sessions_spawn/);
+  }
+  assert.match(decide(send({ sessionKey: "agent:devops:main" }), COORD, createState(), {}).blockReason, /agentId "devops"/);
+  // follow-ups and the task's own child session are fine; other agents are not checked
+  assert.equal(decide(send({ sessionKey: "agent:devops:subagent:9f" }), COORD, createState(), {}), undefined);
+  assert.equal(decide({ toolName: "sessions_send", params: { sessionKey: "agent:devops:main", message: "Yes, use port 8080." } }, COORD, createState(), {}), undefined);
+  assert.equal(decide(send({ sessionKey: "agent:qa:main" }), MAIN, createState(), {}), undefined);
+  assert.equal(decide(send({ sessionKey: "agent:devops:main" }), COORD, createState(), { requireSpawnForBriefs: false }), undefined);
+});
+
+test("spawns: fork is blocked, isolated is fine", () => {
+  const spawn = (context) => ({ toolName: "sessions_spawn", params: { agentId: "coordinator", task: "check x", context } });
+  assert.equal(blocked(decide(spawn("fork"), COORD, createState(), {})), true);
+  assert.equal(decide(spawn("isolated"), COORD, createState(), {}), undefined);
+  assert.equal(decide(spawn(undefined), COORD, createState(), {}), undefined);
+});
+
+test("sessions per brief: only small items of one project and owner share a session, at most 4", () => {
+  const inbox = new Map([
+    ["aaaa0001", { id: "aaaa0001", project: "demo", owner: "writer", size: "small" }],
+    ["aaaa0002", { id: "aaaa0002", project: "demo", owner: "writer", size: "small" }],
+    ["aaaa0003", { id: "aaaa0003", project: "demo", owner: "writer", size: "small" }],
+    ["aaaa0004", { id: "aaaa0004", project: "demo", owner: "writer", size: "small" }],
+    ["aaaa0005", { id: "aaaa0005", project: "demo", owner: "writer", size: "small" }],
+    ["bbbb0001", { id: "bbbb0001", project: "demo", owner: "writer", size: "large" }],
+    ["cccc0001", { id: "cccc0001", project: "demosite", owner: "writer", size: "small" }],
+  ]);
+  const state = () => Object.assign(createState(), { lookupInbox: () => inbox });
+  const spawn = (ids) => ({ toolName: "sessions_spawn", params: { agentId: "writer",
+    task: `Project: demo\nItems: ${ids.join(", ")}\nDone when: tests pass\ncommit 47360ad3` } });
+  assert.equal(decide(spawn(["aaaa0001", "aaaa0002", "aaaa0003"]), COORD, state(), {}), undefined);
+  assert.equal(decide(spawn(["bbbb0001"]), COORD, state(), {}), undefined);
+  const big = decide(spawn(["aaaa0001", "bbbb0001"]), COORD, state(), {});
+  assert.equal(blocked(big), true);
+  assert.match(big.blockReason, /bbbb0001 \(large\) must each get a fresh session/);
+  assert.match(decide(spawn(["aaaa0001", "cccc0001"]), COORD, state(), {}).blockReason, /different projects or owners/);
+  assert.match(decide(spawn(["aaaa0001", "aaaa0002", "aaaa0003", "aaaa0004", "aaaa0005"]), COORD, state(), {}).blockReason, /5 inbox items/);
+  // no inbox lookup, or ids the inbox does not know: nothing to enforce
+  assert.equal(decide(spawn(["aaaa0001", "bbbb0001"]), COORD, createState(), {}), undefined);
+  assert.equal(decide(spawn(["dddd0001", "dddd0002"]), COORD, state(), {}), undefined);
+});
+
+test("subagents list calls count as status checks; wait does not", () => {
+  const s = createState();
+  const list = { toolName: "subagents", params: { action: "list" } };
+  const r = run(s, COORD, Array.from({ length: 13 }, () => list));
+  assert.equal(blocked(r[12]), true);
+  const s2 = createState();
+  assert.equal(run(s2, COORD, Array.from({ length: 20 }, () => ({ toolName: "subagents", params: { action: "wait" } }))).some(blocked), false);
 });
 
 test("the same message three times in a run is blocked", () => {
@@ -250,12 +320,36 @@ test("endRun clears a run; TTL and size caps prune old runs", () => {
 });
 
 test("task_inbox argument mapping", () => {
-  assert.deepEqual(inboxArgs({ action: "add", project: "emberkin", title: "Login 500", type: "bug", done_when: "e2e passes" }),
-    ["add", "--project", "emberkin", "--title", "Login 500", "--type", "bug", "--done-when", "e2e passes"]);
-  assert.deepEqual(inboxArgs({ action: "set", id: "a1b2", status: "done", note: "merged" }), ["set", "a1b2", "--status", "done", "--note", "merged"]);
+  assert.deepEqual(inboxArgs({ action: "add", project: "demo", title: "Login 500", type: "bug", done_when: "e2e passes" }),
+    ["add", "--project", "demo", "--title", "Login 500", "--type", "bug", "--done-when", "e2e passes", "--by", "agent"]);
+  assert.deepEqual(inboxArgs({ action: "set", id: "a1b2", status: "done", note: "merged" }), ["set", "a1b2", "--status", "done", "--note", "merged", "--by", "agent"]);
+  assert.deepEqual(inboxArgs({ action: "approve", id: "a1b2c3d4 e5f6a7b8" }), ["approve", "a1b2c3d4", "e5f6a7b8", "--by", "orchestrator"]);
+  assert.throws(() => inboxArgs({ action: "approve", id: "x" }), /approve needs id/);
+  assert.deepEqual(inboxArgs({ action: "board", project: "demo", json: true }), ["board", "--project", "demo", "--json"]);
   assert.deepEqual(inboxArgs({ action: "plan", json: true }), ["plan", "--json"]);
   assert.deepEqual(inboxArgs({ action: "list", project: "ai", title: "ignored" }), ["list", "--project", "ai"]);
   assert.throws(() => inboxArgs({ action: "rm" }), /action must be one of/);
   assert.throws(() => inboxArgs({ action: "set" }), /needs id/);
   assert.throws(() => inboxArgs({ action: "add", project: "x" }), /needs project and title/);
+  assert.deepEqual(inboxArgs({ action: "add", project: "o", title: "t", owner: "devops", size: "small", area: "CI" }),
+    ["add", "--project", "o", "--title", "t", "--owner", "devops", "--size", "small", "--area", "CI", "--by", "agent"]);
+  assert.deepEqual(inboxArgs({ action: "set", id: "a1", size: "large" }), ["set", "a1", "--size", "large", "--by", "agent"]);
+});
+
+test("loadInboxItems folds add and set events like oc-inbox", () => {
+  const file = join(mkdtempSync(join(tmpdir(), "tg-inbox-")), "inbox.jsonl");
+  writeFileSync(file, [
+    JSON.stringify({ kind: "add", id: "aaaa0001", project: "o", owner: "devops", size: "small" }),
+    "not json",
+    JSON.stringify({ kind: "add", id: "aaaa0002", project: "o" }),
+    JSON.stringify({ kind: "set", id: "aaaa0002", size: "large", status: "dispatched" }),
+    JSON.stringify({ kind: "set", id: "zzzz0000", size: "large" }),
+  ].join("\n"));
+  const items = loadInboxItems(file);
+  assert.equal(items.size, 2);
+  assert.equal(items.get("aaaa0001").size, "small");
+  assert.equal(items.get("aaaa0002").size, "large");
+  assert.equal(items.get("aaaa0002").status, "in_progress"); // legacy "dispatched" maps to the In progress column
+  assert.equal(items.get("aaaa0001").status, "backlog");
+  assert.equal(loadInboxItems(join(tmpdir(), "missing-inbox.jsonl")).size, 0);
 });

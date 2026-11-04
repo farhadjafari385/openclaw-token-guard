@@ -15,9 +15,9 @@ them in code, inside the OpenClaw gateway.
 
 | Part | What it does |
 |---|---|
-| `plugin/` (token-guard) | A gateway plugin on `before_tool_call` that **blocks** polling loops, long foreground sleeps, `while … sleep` loops, repeated identical commands and status checks, and runaway runs (checkpoint every 120 tool calls, hard stop at 400). Fails open: a guard bug never blocks every tool. |
+| `plugin/` (token-guard) | A gateway plugin on `before_tool_call` that **blocks** polling loops, long foreground sleeps, `while … sleep` loops, repeated identical commands and status checks, and runaway runs (checkpoint every 120 tool calls, hard stop at 400). It also makes the coordinator start **every task in a fresh session**: a new brief sent into a specialist's existing chat is refused (use `sessions_spawn`), a brief may hold at most 4 inbox items, only small items of one project and owner may share a session, and forking the coordinator's own history into a child is refused. Fails open: a guard bug never blocks every tool. |
 | `bin/oc-wait`, `bin/oc-wait-pipeline` | Background waiters. The agent starts one, ends its turn, and OpenClaw wakes it when the job finishes, at zero token cost while waiting. `oc-wait-pipeline` waits for the GitLab pipeline of an exact commit (`--sha`) and prints failed job logs. |
-| `bin/oc-inbox` + `task_inbox` tool | One inbox for many tasks/bugs: collect, plan one batch per project, dispatch one complete brief per batch, instead of firing each request at an agent separately. |
+| `bin/oc-inbox` + `task_inbox` tool | One inbox for many tasks/bugs. Each item has an owner, a size (small, medium, large) and an area; `plan` gives every medium or large item its own session and groups only small items of the same project, owner and area (at most 4 per session). |
 | `rules/` | Short AGENTS.md blocks for the coordinator and for specialists, replacing "keep polling until done" style rules. |
 | `skills/` | `token-guard` (how to wait) and `task-intake` (how to batch) skills. |
 | `install/` | One installer for any host: dry run, backup, apply, verify, rollback, and a remote deploy over SSH. |
@@ -34,6 +34,43 @@ by running `claude --resume <session> /compact` with the session's own model and
 thinking level. On a large session with high thinking that can take longer than
 180 seconds; OpenClaw then kills it ("CLI exceeded timeout (180s)") after Claude
 has already read the whole session, and every retry pays for it again.
+
+## One task, one fresh session
+
+Every model call re-reads the whole session, so a chat that collects task
+after task gets more expensive with every call (on one server, two devops
+chats that received 74 and 88 tasks used over 1B tokens in a week). With
+token-guard the coordinator:
+
+1. records each problem in the inbox with an owner, a size and an area,
+2. runs `task_inbox plan`, which splits the work into sessions, and
+3. starts each batch with `sessions_spawn` (`agentId`, `context: "isolated"`).
+
+Three problems in one Telegram message ("login button grey on mobile", "footer
+typo", "deploy the pricing page") become two sessions: the two small web UI
+fixes share one, the deploy gets its own. The specialist's result returns to
+the coordinator by itself, so nobody polls.
+
+## Fallback when a limit is hit
+
+An agent whose own model has no fallback list is strict in OpenClaw: when the
+Claude weekly or 5-hour limit hits, it just stops. `apply.sh
+--fallback-model=openai/gpt-6-astra` adds the fallback to the default model,
+the sub-agent model and every agent's own model in one config change.
+`verify.sh` warns about any model without one.
+
+The fallback needs a credential in OpenClaw's own auth store (a Codex CLI
+login in `~/.codex` is not used by agent-scoped Codex runs). Sign in once and
+let every agent inherit it:
+
+```bash
+openclaw config set agents.defaults.authInheritance.agentId '"coordinator"' --strict-json
+openclaw models auth login --provider openai --method device-code --profile-id openai:default --agent coordinator
+```
+
+Avoid `plugins.entries.codex.config.appServer.homeScope: "user"` on a gateway
+with many agents: on our 11-agent server it made agent runtime preparation time
+out, so no session could start.
 
 ## Requirements
 
@@ -60,8 +97,8 @@ install/remote.sh myserver --patch-legacy   # copy, test, apply, verify over SSH
 ```
 
 Useful options for `apply.sh`: `--coordinator=ID` (your orchestrator agent id),
-`--context-tokens=N`, `--compaction-timeout=S`, `--daily-reset-hour=H`, `--install-skills`,
-`--skip-plugin`, `--skip-config`. The script never restarts the gateway; if the
+`--context-tokens=N`, `--compaction-timeout=S`, `--daily-reset-hour=H`,
+`--fallback-model=P/M`, `--install-skills`, `--skip-plugin`, `--skip-config`. The script never restarts the gateway; if the
 plugin does not load, restart it once yourself.
 
 Undo everything:

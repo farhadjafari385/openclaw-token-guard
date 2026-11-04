@@ -1,10 +1,15 @@
 #!/usr/bin/env python3
-"""oc-inbox: file-based task inbox backed by an append-only JSONL event log.
+"""oc-inbox: the team's task board, backed by an append-only JSONL event log.
 
-Store: $OC_INBOX_FILE or ~/.openclaw/inbox/inbox.jsonl.
-Current state is derived by folding events (by id) in file order.
+Store: $OC_INBOX_FILE or ~/.openclaw/inbox/inbox.jsonl. Current state is
+derived by folding events (by id) in file order.
 
-Commands: add, list, plan, set, show. See --help on each subcommand.
+Columns: backlog, todo, in_progress, review, qa, blocked, done, dropped, archived.
+Only allowed moves are accepted (see TRANSITIONS); every move is kept in the
+item's history. Done and dropped items are archived only when both the
+orchestrator and the owner have approved them.
+
+Commands: add, list, plan, set, approve, show, board. See --help on each.
 """
 import argparse
 import datetime
@@ -17,7 +22,36 @@ import uuid
 
 PRIORITIES = ["low", "normal", "high", "urgent"]
 TYPES = ["bug", "task", "feature", "question"]
-STATUSES = ["open", "planned", "dispatched", "done", "blocked", "dropped"]
+COLUMNS = ["backlog", "todo", "in_progress", "review", "qa", "blocked", "done", "dropped", "archived"]
+LEGACY = {"open": "backlog", "planned": "todo", "dispatched": "in_progress"}
+STATUS_CHOICES = COLUMNS + list(LEGACY)
+TRANSITIONS = {
+    "backlog": ["todo", "blocked", "dropped"],
+    "todo": ["backlog", "in_progress", "blocked", "dropped"],
+    "in_progress": ["review", "qa", "todo", "blocked", "dropped"],
+    "review": ["qa", "done", "in_progress", "todo", "blocked", "dropped"],
+    "qa": ["done", "in_progress", "todo", "blocked", "dropped"],
+    "blocked": ["backlog", "todo", "in_progress", "review", "qa", "dropped"],
+    "done": ["in_progress", "todo"],
+    "dropped": ["backlog", "todo"],
+    "archived": [],
+}
+OPEN = {"backlog", "todo", "in_progress", "review", "qa", "blocked"}
+SIZES = ["small", "medium", "large"]
+# Small items of the same project, owner and area may share one session, up to
+# this many; every medium or large item gets a fresh session of its own.
+MAX_SMALL_PER_BATCH = 4
+HISTORY_KEEP = 20
+
+
+def norm_status(status):
+    s = (status or "backlog").strip().lower().replace("-", "_").replace(" ", "_")
+    s = LEGACY.get(s, s)
+    return s if s in COLUMNS else "backlog"
+
+
+def now_iso():
+    return datetime.datetime.now(datetime.timezone.utc).isoformat()
 
 
 def inbox_path():
@@ -33,7 +67,7 @@ def ensure_parent(path):
 def append_event(path, event):
     ensure_parent(path)
     event = dict(event)
-    event.setdefault("ts", datetime.datetime.now(datetime.timezone.utc).isoformat())
+    event.setdefault("ts", now_iso())
     with open(path, "a+") as f:
         fcntl.flock(f, fcntl.LOCK_EX)
         try:
@@ -64,6 +98,15 @@ def read_events(path):
     return events
 
 
+def _move(it, to, ev):
+    frm = it["status"]
+    if frm == to:
+        return
+    it["status"] = to
+    it["history"].append({"ts": ev.get("ts"), "from": frm, "to": to, "by": ev.get("by"), "note": ev.get("note")})
+    it["history"] = it["history"][-HISTORY_KEEP:]
+
+
 def fold_state(events):
     items = {}
     for ev in events:
@@ -81,23 +124,43 @@ def fold_state(events):
                 "details": ev.get("details"),
                 "done_when": ev.get("done_when"),
                 "source": ev.get("source"),
-                "status": "open",
+                "owner": ev.get("owner"),
+                "size": ev.get("size") or "medium",
+                "area": ev.get("area"),
+                "status": norm_status(ev.get("status") or "backlog"),
                 "batch": None,
                 "note": None,
+                "orc_approved_ts": None,
+                "owner_approved_ts": None,
+                "history": [],
                 "created_ts": ev.get("ts"),
                 "updated_ts": ev.get("ts"),
             }
+        elif item_id not in items:
+            continue
         elif kind == "set":
-            if item_id not in items:
-                continue
             it = items[item_id]
-            if ev.get("status"):
-                it["status"] = ev["status"]
+            for key in ("owner", "size", "area", "done_when", "title"):
+                if ev.get(key):
+                    it[key] = ev[key]
             if "batch" in ev:
                 it["batch"] = ev["batch"]
             if "note" in ev:
                 it["note"] = ev["note"]
+            if ev.get("status"):
+                to = norm_status(ev["status"])
+                if to not in ("done", "dropped"):
+                    it["orc_approved_ts"] = it["owner_approved_ts"] = None
+                _move(it, to, ev)
             it["updated_ts"] = ev.get("ts")
+        elif kind == "approve":
+            it = items[item_id]
+            if it["status"] in ("done", "dropped"):
+                field = "owner_approved_ts" if ev.get("by") == "owner" else "orc_approved_ts"
+                it[field] = ev.get("ts")
+                if it["orc_approved_ts"] and it["owner_approved_ts"]:
+                    _move(it, "archived", dict(ev, note="approved by the orchestrator and the owner"))
+                it["updated_ts"] = ev.get("ts")
     return items
 
 
@@ -124,28 +187,15 @@ def title_similarity(a, b):
 
 def cmd_add(args):
     path = inbox_path()
-    events = read_events(path)
-    state = fold_state(events)
-
-    if args.priority not in PRIORITIES:
-        print(f"oc-inbox: invalid --priority {args.priority!r}", file=sys.stderr)
-        return 2
-    if args.type not in TYPES:
-        print(f"oc-inbox: invalid --type {args.type!r}", file=sys.stderr)
-        return 2
+    state = fold_state(read_events(path))
 
     # duplicate detection: same project + similar title among open items
     for it in state.values():
-        if it["status"] in ("done", "dropped"):
-            continue
-        if it.get("project") != args.project:
+        if it["status"] not in OPEN or it.get("project") != args.project:
             continue
         sim = title_similarity(it["title"] or "", args.title)
         if sim >= 0.6:
-            print(
-                f"oc-inbox: warning: likely duplicate of {it['id']} ({it['title']!r}, similarity={sim:.2f})",
-                file=sys.stderr,
-            )
+            print(f"oc-inbox: warning: likely duplicate of {it['id']} ({it['title']!r}, similarity={sim:.2f})", file=sys.stderr)
 
     new_id = gen_id()
     event = {
@@ -158,6 +208,11 @@ def cmd_add(args):
         "details": args.details,
         "done_when": args.done_when,
         "source": args.source,
+        "owner": args.owner,
+        "size": args.size,
+        "area": args.area,
+        "status": "todo" if (args.owner and args.done_when) else "backlog",
+        "by": args.by,
     }
     append_event(path, event)
     print(new_id)
@@ -165,53 +220,77 @@ def cmd_add(args):
 
 
 def cmd_list(args):
-    path = inbox_path()
-    state = fold_state(read_events(path))
+    state = fold_state(read_events(inbox_path()))
     items = list(state.values())
     if args.status:
-        items = [i for i in items if i["status"] == args.status]
+        want = norm_status(args.status)
+        items = [i for i in items if i["status"] == want]
+    elif not args.all:
+        items = [i for i in items if i["status"] != "archived"]
     if args.project:
         items = [i for i in items if i.get("project") == args.project]
-    items.sort(key=lambda i: (i.get("created_ts") or ""))
-
+    items.sort(key=lambda i: (COLUMNS.index(i["status"]), i.get("created_ts") or ""))
     if args.json:
         print(json.dumps(items, sort_keys=True))
         return 0
-
     for it in items:
-        print(f"{it['id']}  [{it['status']:10}] ({it['priority']:6}) {it.get('project') or '-':15} {it['title']}")
+        print(f"{it['id']}  [{it['status']:11}] ({it['priority']:6}) {it.get('size') or 'medium':6} "
+              f"{it.get('project') or '-':15} {it.get('owner') or '-':10} {it['title']}")
     return 0
 
 
-def cmd_plan(args):
-    path = inbox_path()
-    state = fold_state(read_events(path))
-    open_items = [i for i in state.values() if i["status"] == "open"]
-
+def plan_batches(items):
+    """Group ready items into sessions: one per medium/large item, small items of
+    the same project, owner and area together (at most MAX_SMALL_PER_BATCH)."""
     prio_rank = {p: i for i, p in enumerate(PRIORITIES)}
-    by_project = {}
-    for it in open_items:
-        proj = it.get("project") or "(no project)"
-        by_project.setdefault(proj, []).append(it)
+    ordered = sorted(items, key=lambda i: (-prio_rank.get(i["priority"], 1), i.get("created_ts") or ""))
+    batches, small_groups = [], {}
+    for it in ordered:
+        missing = [k for k in ("project", "owner", "done_when") if not it.get(k)]
+        it = {**it, "needs_info": bool(missing), "missing": missing}
+        if it.get("size") != "small":
+            batches.append({"items": [it], "reason": f"{it.get('size') or 'medium'} item: own fresh session"})
+            continue
+        key = (it.get("project") or "", it.get("owner") or "", (it.get("area") or "").strip().lower())
+        group = small_groups.get(key)
+        if group is None or len(group["items"]) >= MAX_SMALL_PER_BATCH:
+            group = {"items": [], "reason": "small items, same project, owner and area: one shared session"}
+            small_groups[key] = group
+            batches.append(group)
+        group["items"].append(it)
+    for n, batch in enumerate(batches, 1):
+        first = batch["items"][0]
+        batch.update({
+            "batch": f"B{n}",
+            "project": first.get("project") or "(no project)",
+            "owner": first.get("owner") or "(no owner)",
+            "area": first.get("area") or "",
+            "priority": first["priority"],
+            "needs_info": any(i["needs_info"] for i in batch["items"]),
+        })
+        if len(batch["items"]) == 1 and first.get("size") == "small":
+            batch["reason"] = "small item: own fresh session"
+    return batches
 
-    batches = []
-    for proj, items in sorted(by_project.items()):
-        items.sort(key=lambda i: -prio_rank.get(i["priority"], 1))
-        flagged = []
-        for it in items:
-            needs_info = not it.get("project") or not it.get("done_when")
-            flagged.append({**it, "needs_info": needs_info})
-        batches.append({"project": proj, "items": flagged})
 
+def cmd_plan(args):
+    state = fold_state(read_events(inbox_path()))
+    ready = [i for i in state.values() if i["status"] in ("backlog", "todo")]
+    batches = plan_batches(ready)
     if args.json:
         print(json.dumps(batches, sort_keys=True))
         return 0
-
+    if not batches:
+        print("Nothing in Backlog or To do.")
+        return 0
     for batch in batches:
-        print(f"== {batch['project']} ==")
+        area = f" / {batch['area']}" if batch["area"] else ""
+        print(f"== {batch['batch']}: {batch['project']}{area} -> {batch['owner']} ({batch['priority']}; {batch['reason']}) ==")
         for it in batch["items"]:
-            tag = " [NEEDS INFO]" if it["needs_info"] else ""
-            print(f"  {it['id']}  ({it['priority']}) {it['title']}{tag}")
+            tag = f" [NEEDS INFO: {', '.join(it['missing'])}]" if it["needs_info"] else ""
+            print(f"  {it['id']}  ({it.get('size')}, {it['status']}) {it['title']}{tag}")
+    print("Dispatch: one sessions_spawn per batch, with the batch's ids on the Items: line. "
+          "Batches with NEEDS INFO wait for the owner's answer.")
     return 0
 
 
@@ -221,30 +300,83 @@ def cmd_set(args):
     if args.id not in state:
         print(f"oc-inbox: unknown id {args.id!r}", file=sys.stderr)
         return 2
-    if args.status and args.status not in STATUSES:
-        print(f"oc-inbox: invalid --status {args.status!r}", file=sys.stderr)
-        return 2
-
-    event = {"kind": "set", "id": args.id}
+    it = state[args.id]
+    event = {"kind": "set", "id": args.id, "by": args.by}
     if args.status:
-        event["status"] = args.status
+        to = norm_status(args.status)
+        if to == "archived":
+            print("oc-inbox: items are archived only when the orchestrator and the owner approve them (oc-inbox approve)", file=sys.stderr)
+            return 2
+        if args.by != "system" and to != it["status"] and to not in TRANSITIONS[it["status"]]:
+            allowed = ", ".join(TRANSITIONS[it["status"]]) or "none"
+            print(f"oc-inbox: cannot move {args.id} from {it['status']} to {to}; allowed: {allowed}", file=sys.stderr)
+            return 2
+        owner = args.owner or it.get("owner")
+        done_when = args.done_when or it.get("done_when")
+        if to == "todo" and not (owner and done_when):
+            print(f"oc-inbox: {args.id} needs an owner and a done_when before To do", file=sys.stderr)
+            return 2
+        if to in ("blocked", "dropped") and not (args.note or "").strip():
+            print(f"oc-inbox: moving {args.id} to {to} needs --note with the reason", file=sys.stderr)
+            return 2
+        event["status"] = to
     if args.batch is not None:
         event["batch"] = args.batch
     if args.note is not None:
         event["note"] = args.note
+    for key in ("owner", "size", "area", "done_when", "title"):
+        if getattr(args, key, None):
+            event[key] = getattr(args, key)
     append_event(path, event)
     print(args.id)
     return 0
 
 
-def cmd_show(args):
+def cmd_approve(args):
     path = inbox_path()
     state = fold_state(read_events(path))
-    it = state.get(args.id)
+    out = []
+    for item_id in args.ids:
+        it = state.get(item_id)
+        if not it:
+            out.append(f"{item_id}: unknown")
+            continue
+        if it["status"] not in ("done", "dropped"):
+            out.append(f"{item_id}: is {it['status']}, only done or dropped items can be approved")
+            continue
+        append_event(path, {"kind": "approve", "id": item_id, "by": args.by})
+        after = fold_state(read_events(path))[item_id]
+        out.append(f"{item_id}: {'archived' if after['status'] == 'archived' else 'approved by ' + args.by + ', waiting for the ' + ('owner' if args.by != 'owner' else 'orchestrator')}")
+    print("\n".join(out))
+    return 0
+
+
+def cmd_show(args):
+    it = fold_state(read_events(inbox_path())).get(args.id)
     if not it:
         print(f"oc-inbox: unknown id {args.id!r}", file=sys.stderr)
         return 2
     print(json.dumps(it, indent=2, sort_keys=True))
+    return 0
+
+
+def cmd_board(args):
+    state = fold_state(read_events(inbox_path()))
+    board = {}
+    for it in sorted(state.values(), key=lambda i: i.get("created_ts") or ""):
+        if it["status"] == "archived" and not args.all:
+            continue
+        if args.project and it.get("project") != args.project:
+            continue
+        board.setdefault(it.get("project") or "(no project)", {}).setdefault(it["status"], []).append(it)
+    if args.json:
+        print(json.dumps(board, sort_keys=True))
+        return 0
+    for project, cols in board.items():
+        print(f"== {project} ==")
+        for col in COLUMNS:
+            for it in cols.get(col, []):
+                print(f"  [{col:11}] {it['id']} {it['title']} ({it.get('owner') or '-'})")
     return 0
 
 
@@ -260,11 +392,17 @@ def main(argv):
     p_add.add_argument("--details")
     p_add.add_argument("--done-when")
     p_add.add_argument("--source")
+    p_add.add_argument("--owner", help="agent id that will do it, e.g. devops")
+    p_add.add_argument("--size", default="medium", choices=SIZES,
+                       help="small: one quick change in one place; large: several files, a feature, CI/deploy waits")
+    p_add.add_argument("--area", help="part of the project, e.g. 'login page' or 'CI'")
+    p_add.add_argument("--by", default="agent")
     p_add.set_defaults(func=cmd_add)
 
     p_list = sub.add_parser("list")
-    p_list.add_argument("--status", choices=STATUSES)
+    p_list.add_argument("--status", choices=STATUS_CHOICES)
     p_list.add_argument("--project")
+    p_list.add_argument("--all", action="store_true", help="include archived items")
     p_list.add_argument("--json", action="store_true")
     p_list.set_defaults(func=cmd_list)
 
@@ -274,14 +412,31 @@ def main(argv):
 
     p_set = sub.add_parser("set")
     p_set.add_argument("id")
-    p_set.add_argument("--status", choices=STATUSES)
+    p_set.add_argument("--status", choices=STATUS_CHOICES)
     p_set.add_argument("--batch")
     p_set.add_argument("--note")
+    p_set.add_argument("--owner")
+    p_set.add_argument("--size", choices=SIZES)
+    p_set.add_argument("--area")
+    p_set.add_argument("--done-when")
+    p_set.add_argument("--title")
+    p_set.add_argument("--by", default="agent", help="who moves it; 'system' (token-guard) may make any move except archiving")
     p_set.set_defaults(func=cmd_set)
+
+    p_approve = sub.add_parser("approve")
+    p_approve.add_argument("ids", nargs="+")
+    p_approve.add_argument("--by", required=True, choices=["orchestrator", "owner"])
+    p_approve.set_defaults(func=cmd_approve)
 
     p_show = sub.add_parser("show")
     p_show.add_argument("id")
     p_show.set_defaults(func=cmd_show)
+
+    p_board = sub.add_parser("board")
+    p_board.add_argument("--project")
+    p_board.add_argument("--all", action="store_true")
+    p_board.add_argument("--json", action="store_true")
+    p_board.set_defaults(func=cmd_board)
 
     args = parser.parse_args(argv)
     return args.func(args)

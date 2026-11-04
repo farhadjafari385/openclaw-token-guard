@@ -44,6 +44,10 @@ def main(argv):
     check(((cfg.get("tools") or {}).get("loopDetection") or {}).get("enabled") is True, "tools.loopDetection.enabled true")
     entry = ((cfg.get("plugins") or {}).get("entries") or {}).get("token-guard") or {}
     check(entry.get("enabled", True) is not False, f"plugins.entries.token-guard enabled ({entry.get('enabled', 'default')})")
+    # Not a failure (fallback is optional), but without one a limit stops the agent.
+    strict = [p for p, m in _plan.model_paths(cfg) if not (isinstance(m, dict) and m.get("fallbacks"))]
+    print(("PASS  every model has a fallback" if not strict else
+           f"WARN  no fallback model, so a limit stops these: {', '.join(strict)} (apply.sh --fallback-model=...)"))
     tools, path = _plan.agent_tools(cfg, args.coordinator)
     check("task_inbox" in (tools.get("alsoAllow") or []) + (tools.get("allow") or []), f"{path} allows task_inbox")
 
