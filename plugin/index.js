@@ -21,6 +21,9 @@ state.lookupInbox = () => loadInboxItems();
 
 const BOOT_ID = crypto.randomUUID();
 const BOOT_STARTED_AT = Date.now();
+// OpenClaw may load the plugin in several generations and not always stop the old ones.
+// Only the newest generation runs the follow-up loop.
+const GEN_KEY = Symbol.for("token-guard.activeGeneration");
 
 export default definePluginEntry({
   id: "token-guard",
@@ -352,8 +355,13 @@ export default definePluginEntry({
 
     // ---- follow-up loop: no model runs unless there is something to act on ----
     let timer;
+    const generation = crypto.randomUUID();
+    const isActive = () => globalThis[GEN_KEY] === generation;
+    const BOOT_GRACE_MS = 10 * 60000; // agents are still loading after a gateway start
     const tick = async () => {
-      if (!jobsCfg.enabled) return;
+      if (!jobsCfg.enabled || !isActive()) return;
+      if (Date.now() - BOOT_STARTED_AT < BOOT_GRACE_MS) return;
+      store.refresh();
       let inboxItems = [];
       try { inboxItems = [...loadInboxItems().values()]; } catch { inboxItems = []; }
       const actions = scanJobs(store.data, jobsCfg, Date.now(), {
@@ -373,11 +381,17 @@ export default definePluginEntry({
         if (action.kind === "wake") {
           try {
             if (!api.runtime || !api.runtime.subagent || typeof api.runtime.subagent.run !== "function") throw new Error("runtime.subagent.run unavailable");
-            await api.runtime.subagent.run({ sessionKey: action.sessionKey, message: action.message, deliver: true });
+            // deliver: false, so a wake never auto-replies in a DM; the orchestrator posts in the project topic itself.
+            await api.runtime.subagent.run({ sessionKey: action.sessionKey, message: action.message, deliver: false });
             log("info", "token-guard woke the orchestrator", { reason: action.reason, sessionKey: action.sessionKey });
           } catch (error) {
-            log("warn", "token-guard could not wake the orchestrator", { reason: action.reason, error: String(error && error.message) });
-            systemNote(`wakefail:${action.reason}`, `🚩 Job tracker could not wake the orchestrator (${action.reason}): ${String(error && error.message).slice(0, 160)}`);
+            const msg = String(error && error.message);
+            log("warn", "token-guard could not wake the orchestrator", { reason: action.reason, error: msg });
+            if (/not completed startup|still starting|unavailable/i.test(msg)) {
+              rollbackWake(action); // agents still loading: try again on a later tick, quietly
+            } else {
+              systemNote(`wakefail:${action.reason}`, `🚩 Job tracker could not wake the orchestrator (${action.reason}): ${msg.slice(0, 160)}`);
+            }
           }
         }
       }
@@ -426,16 +440,30 @@ export default definePluginEntry({
       }
     };
 
+    // A wake that could not be delivered is not counted, so it is tried again.
+    const rollbackWake = (action) => {
+      const day = new Date().toISOString().slice(0, 10);
+      if (store.data.wakesByDay[day]) store.data.wakesByDay[day] -= 1;
+      if (action.reason === "idle") store.data.idle.lastCheckAt = 0;
+      if (action.reason === "ended") for (const j of Object.values(store.data.jobs)) if (j.requesterSessionKey === action.sessionKey && j.lastWakeAt) { j.wakes = Math.max(0, (j.wakes || 1) - 1); j.lastWakeAt = 0; }
+      store.touch();
+    };
+
     if (typeof api.registerService === "function") {
       api.registerService({
         id: "token-guard-jobs",
         start() {
+          globalThis[GEN_KEY] = generation;
+          const prev = globalThis[Symbol.for("token-guard.timer")];
+          if (prev) clearInterval(prev);
           if (timer) clearInterval(timer);
           timer = setInterval(() => { tick().catch(() => {}); }, Math.max(15, Number(jobsCfg.scanEverySeconds) || 60) * 1000);
+          globalThis[Symbol.for("token-guard.timer")] = timer;
           if (timer && typeof timer.unref === "function") timer.unref();
         },
         stop() {
           if (timer) clearInterval(timer);
+          if (globalThis[Symbol.for("token-guard.timer")] === timer) globalThis[Symbol.for("token-guard.timer")] = undefined;
           timer = undefined;
           store.save(true);
         },

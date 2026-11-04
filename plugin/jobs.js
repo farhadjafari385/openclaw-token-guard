@@ -54,18 +54,59 @@ function shortId(key) {
   return crypto.createHash("sha1").update(String(key)).digest("hex").slice(0, 6);
 }
 
+// Newest copy of a job: ended beats running, then the later activity wins.
+function newerJob(a, b) {
+  if (!a) return b;
+  if (!b) return a;
+  const rank = (j) => (j.status === "running" ? 0 : 1);
+  if (rank(a) !== rank(b)) return rank(a) > rank(b) ? a : b;
+  const t = (j) => Math.max(j.endedAt || 0, j.lastActivityAt || 0, j.lastWakeAt || 0, j.spawnedAt || 0);
+  return t(a) >= t(b) ? a : b;
+}
+
+// Merge two states (two plugin generations, or memory and disk) without losing either's work.
+function mergeStates(a, b) {
+  const out = Object.assign(emptyState(), a, { jobs: {} });
+  for (const key of new Set([...Object.keys(a.jobs || {}), ...Object.keys(b.jobs || {})])) {
+    out.jobs[key] = newerJob((a.jobs || {})[key], (b.jobs || {})[key]);
+  }
+  out.claudeLimitedUntil = Math.max(a.claudeLimitedUntil || 0, b.claudeLimitedUntil || 0);
+  out.claudeLimitText = (a.claudeLimitedUntil || 0) >= (b.claudeLimitedUntil || 0) ? a.claudeLimitText : b.claudeLimitText;
+  out.orcActivity = Object.assign({}, b.orcActivity, a.orcActivity);
+  for (const [k, v] of Object.entries(b.orcActivity || {})) out.orcActivity[k] = Math.max(v, out.orcActivity[k] || 0);
+  out.wakesByDay = Object.assign({}, b.wakesByDay);
+  for (const [k, v] of Object.entries(a.wakesByDay || {})) out.wakesByDay[k] = Math.max(v, out.wakesByDay[k] || 0);
+  const ia = a.idle || {}, ib = b.idle || {};
+  out.idle = (ia.lastCheckAt || 0) >= (ib.lastCheckAt || 0) ? ia : ib;
+  out.boardMessages = Object.assign({}, b.boardMessages, a.boardMessages);
+  out.pmAudit = ((a.pmAudit || {}).lastAt || 0) >= ((b.pmAudit || {}).lastAt || 0) ? a.pmAudit : b.pmAudit;
+  out.notes = Object.assign({}, b.notes, a.notes);
+  const asks = new Map();
+  for (const ask of [...(b.ownerAsks || []), ...(a.ownerAsks || [])]) asks.set(`${ask.at}:${ask.topic}`, Object.assign({}, asks.get(`${ask.at}:${ask.topic}`), ask, { captured: Boolean(ask.captured || (asks.get(`${ask.at}:${ask.topic}`) || {}).captured) }));
+  out.ownerAsks = [...asks.values()].sort((x, y) => x.at - y.at).slice(-50);
+  return out;
+}
+
 function createJobStore(file) {
   const target = expandHome(file || DEFAULT_JOBS.stateFile);
   let data = emptyState();
   let dirty = false;
+  const readDisk = () => {
+    try { return Object.assign(emptyState(), JSON.parse(fs.readFileSync(target, "utf8")) || {}); } catch { return null; }
+  };
   return {
     get data() { return data; },
     load() {
-      try {
-        const parsed = JSON.parse(fs.readFileSync(target, "utf8"));
-        data = Object.assign(emptyState(), parsed || {});
-      } catch {
-        data = emptyState();
+      data = readDisk() || emptyState();
+      return data;
+    },
+    // Pick up what another plugin generation wrote, keeping our own newer work.
+    refresh() {
+      const disk = readDisk();
+      if (disk) {
+        const merged = mergeStates(data, disk);
+        for (const k of Object.keys(data)) delete data[k];
+        Object.assign(data, merged);
       }
       return data;
     },
@@ -74,9 +115,12 @@ function createJobStore(file) {
       if (!dirty && !force) return;
       try {
         fs.mkdirSync(path.dirname(target), { recursive: true });
-        const tmp = `${target}.tmp-${process.pid}`;
-        fs.writeFileSync(tmp, JSON.stringify(data));
+        const disk = readDisk();
+        const merged = disk ? mergeStates(data, disk) : data;
+        const tmp = `${target}.tmp-${process.pid}-${Math.random().toString(36).slice(2, 8)}`;
+        fs.writeFileSync(tmp, JSON.stringify(merged));
         fs.renameSync(tmp, target);
+        if (merged !== data) { for (const k of Object.keys(data)) delete data[k]; Object.assign(data, merged); }
         dirty = false;
       } catch {
         // state is best effort; the gateway must never fail because of it
@@ -197,7 +241,8 @@ function describe(job) {
 const ACT_NOW =
   "Act in this turn. If the result meets its Done when with evidence: accept it, update task_inbox, and dispatch the next gate " +
   "(review, QA, release) if one is due. If it does not: send it back with sessions_spawn and the exact gaps. " +
-  "Only stop for something that needs the owner's approval, and then ask once with your recommendation.";
+  "Only stop for something that needs the owner's approval, and then ask once with your recommendation. " +
+  "Post your one-line outcome in the project's Telegram topic with the message tool; this run's own reply is not delivered.";
 
 function scanJobs(data, rawCfg, now, env) {
   const cfg = mergeJobsConfig(rawCfg);
@@ -286,8 +331,9 @@ function scanJobs(data, rawCfg, now, env) {
       if (data.idle.streak <= cfg.maxIdleWakesWithoutChange) {
         wake(env.idleWakeSession || cfg.idleWakeSession,
           `[job-tracker] There is open work and no task is running:\n${list}${open.length > 12 ? `\n(+${open.length - 12} more)` : ""}\n` +
-          "Continue now: run task_inbox plan and dispatch the next batch with sessions_spawn, or set an item to blocked with the exact reason " +
-          "(and ask the owner once if it needs him). Never leave open work idle.",
+          "Continue now: run task_inbox plan and dispatch the next batch with sessions_spawn (one task per item or small same-area batch, " +
+          "brief lines Project, Scope, Items, Done when, Stop if), or set an item to blocked with the exact reason (and ask the owner once " +
+          "if it needs him). Post what you dispatched in each project's Telegram topic with the message tool; this run's own reply is not delivered.",
           "idle");
       } else if (data.idle.escalatedSig !== sig) {
         data.idle.escalatedSig = sig;
@@ -325,6 +371,7 @@ export {
   emptyState,
   shortId,
   createJobStore,
+  mergeStates,
   recordSpawn,
   recordActivity,
   recordUsage,

@@ -155,3 +155,34 @@ test("mirror: topics, formatting, and posting through the right bot", async () =
   assert.equal(calls[1].url, "https://api.telegram.org/botORCTOKEN/sendMessage");
   assert.equal(calls[1].body.message_thread_id, 160);
 });
+
+test("two plugin generations never lose each other's jobs", async () => {
+  const { mergeStates, createJobStore } = await import("../jobs.js");
+  const a = emptyState();
+  const b = emptyState();
+  recordSpawn(a, { childSessionKey: "agent:qa:subagent:1", agentId: "qa", label: "x" }, "g1", 1000, CFG);
+  recordSpawn(b, { childSessionKey: "agent:qa:subagent:2", agentId: "qa", label: "y" }, "g2", 2000, CFG);
+  recordSpawn(b, { childSessionKey: "agent:qa:subagent:1", agentId: "qa", label: "x" }, "g1", 1000, CFG);
+  recordEnd(b, "agent:qa:subagent:1", "ok", "", 5000);
+  const m = mergeStates(a, b);
+  assert.deepEqual(Object.keys(m.jobs).sort(), ["agent:qa:subagent:1", "agent:qa:subagent:2"]);
+  assert.equal(m.jobs["agent:qa:subagent:1"].status, "ended"); // the ended copy wins
+  const { mkdtempSync } = await import("node:fs");
+  const { join } = await import("node:path");
+  const { tmpdir } = await import("node:os");
+  const file = join(mkdtempSync(join(tmpdir(), "tg-jobs-")), "jobs.json");
+  const s1 = createJobStore(file); s1.load();
+  const s2 = createJobStore(file); s2.load();
+  recordSpawn(s1.data, { childSessionKey: "k1", agentId: "a" }, "g", 1, CFG); s1.touch(); s1.save();
+  recordSpawn(s2.data, { childSessionKey: "k2", agentId: "a" }, "g", 2, CFG); s2.touch(); s2.save(); // must not drop k1
+  const s3 = createJobStore(file); s3.load();
+  assert.deepEqual(Object.keys(s3.data.jobs).sort(), ["k1", "k2"]);
+});
+
+test("mirror retries a failed send", async () => {
+  let calls = 0;
+  const fetchImpl = async () => { calls += 1; if (calls < 3) throw new Error("fetch failed"); return { ok: true, status: 200, json: async () => ({ result: { message_id: 7 } }) }; };
+  const m = createMirror({ cfg: { chatId: "-1", botTokenFiles: { coordinator: "/t" }, minIntervalMs: 0 }, fetchImpl, readFile: () => "T", retryDelayMs: 1 });
+  assert.equal(await m.post({ agentId: "coordinator", topic: 5, text: "hi" }), 7);
+  assert.equal(calls, 3);
+});

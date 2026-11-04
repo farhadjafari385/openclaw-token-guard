@@ -74,7 +74,7 @@ function formatResult(cfg, job) {
   ].filter(Boolean).join("\n");
 }
 
-function createMirror({ cfg, log, fetchImpl = globalThis.fetch, readFile = (p) => fs.readFileSync(p, "utf8") }) {
+function createMirror({ cfg, log, fetchImpl = globalThis.fetch, readFile = (p) => fs.readFileSync(p, "utf8"), retryDelayMs = 5000 }) {
   const m = mergeMirrorConfig(cfg);
   const tokens = new Map();
   let chain = Promise.resolve();
@@ -107,21 +107,28 @@ function createMirror({ cfg, log, fetchImpl = globalThis.fetch, readFile = (p) =
       last = Date.now();
       const tok = token(who) || token(m.orchestratorAgent || "coordinator");
       if (!tok) return null;
-      try {
-        const res = await fetchImpl(`https://api.telegram.org/bot${tok}/${method}`, {
-          method: "POST",
-          headers: { "content-type": "application/json" },
-          body: JSON.stringify(Object.assign({ chat_id: m.chatId }, body)),
-          signal: AbortSignal.timeout(15000),
-        });
-        let data = null;
-        try { data = typeof res.json === "function" ? await res.json() : null; } catch { data = null; }
-        if (!res.ok && typeof log === "function") log("warn", `token-guard mirror: telegram ${method} failed`, { status: res.status, who: who.startsWith("account:") ? who : who });
-        return res.ok ? (data && data.result !== undefined ? data.result : true) : null;
-      } catch (error) {
-        if (typeof log === "function") log("warn", `token-guard mirror: telegram ${method} error`, { error: String(error && error.message) });
-        return null;
+      for (let attempt = 0; attempt < 3; attempt++) {
+        try {
+          const res = await fetchImpl(`https://api.telegram.org/bot${tok}/${method}`, {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify(Object.assign({ chat_id: m.chatId }, body)),
+            signal: AbortSignal.timeout(15000),
+          });
+          let data = null;
+          try { data = typeof res.json === "function" ? await res.json() : null; } catch { data = null; }
+          if (res.status === 429 || res.status >= 500) throw new Error(`http ${res.status}`);
+          if (!res.ok && typeof log === "function") log("warn", `token-guard mirror: telegram ${method} failed`, { status: res.status });
+          return res.ok ? (data && data.result !== undefined ? data.result : true) : null;
+        } catch (error) {
+          if (attempt === 2) {
+            if (typeof log === "function") log("warn", `token-guard mirror: telegram ${method} error`, { error: String(error && error.message) });
+            return null;
+          }
+          await new Promise((r) => setTimeout(r, retryDelayMs * (attempt + 1)));
+        }
       }
+      return null;
     });
     chain = next.catch(() => null);
     return next;
