@@ -143,3 +143,12 @@ test("the worker's final report is kept, not the narration before it", async () 
   assert.equal(recordResultText(d, KEY, "Let me check one more thing.", CFG), false); // a report is not overwritten by narration
   assert.equal(d.jobs[KEY].resultText, report);
 });
+
+test("the orchestrator's board move becomes its answer under the worker's result", async () => {
+  const { boardReplyText } = await import("../voice.js");
+  const cfg = { agentHandles: { devops: "devops_bot" } };
+  const job = { agentId: "devops", label: "demo: fix CI" };
+  assert.equal(boardReplyText(cfg, job, "ab12cd34", "qa", "Checked pipeline **1234** myself: green."),
+    "@devops_bot Checked pipeline <b>1234</b> myself: green.\n<i>Board: ab12cd34 → QA</i>");
+  assert.equal(boardReplyText(cfg, job, "ab12cd34", "todo", ""), "@devops_bot thanks, I've taken it from here.\n<i>Board: ab12cd34 → To do</i>");
+});
