@@ -10,6 +10,7 @@ const DEFAULT_TRIAGE = {
   everyMinutes: 10,
   model: "anthropic/claude-haiku-5-5",
   orchestratorQuietMinutes: 10, // do not interrupt an orchestrator that is working
+  maxWakesPerDay: 72, // its own budget, separate from the plain reminders
 };
 
 function mergeTriageConfig(cfg) {
