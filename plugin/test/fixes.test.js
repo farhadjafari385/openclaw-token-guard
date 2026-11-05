@@ -118,3 +118,14 @@ test("triage: no call when nothing needs a decision; a snapshot and a parsed dec
   assert.equal(parseTriage('{"wake": true, "effort": "max"}').effort, "medium");
   assert.match(triageWakeMessage({ effort: "high", why: "x", instruction: "y" }, snap), /^\[triage, effort high\] First set your effort/);
 });
+
+test("Codex limit messages: the reset time is read correctly", async () => {
+  const { isLimitError, limitResetAt } = await import("../limits.js");
+  const now = Date.UTC(2026, 10, 5, 22, 57);
+  const msg = "You've reached your Codex subscription usage limit. Next reset in 46 minutes, Nov 5 at 6:43 PM EST. Wait until the reset time, use another Codex account if available.";
+  assert.equal(isLimitError(msg), true);
+  assert.equal(new Date(limitResetAt(msg, now)).toISOString(), "2026-11-05T23:44:00.000Z"); // 46 min + 1 min margin
+  const noRel = "Codex usage limit reached. Try again Nov 5 at 6:43 PM EST.";
+  assert.equal(new Date(limitResetAt(noRel, now)).toISOString(), "2026-11-05T23:43:00.000Z");
+  assert.equal(new Date(limitResetAt("usage limit. Next reset in 4 hours", now)).toISOString(), "2026-11-06T02:58:00.000Z");
+});
