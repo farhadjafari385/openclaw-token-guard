@@ -7,7 +7,7 @@ import { isLimitBlock, normStatus, resultVerdict, nextAfterJob, renderBoard, ren
 import { correctTopic, isGeneral, projectOfTopic, projectsMentioned } from "./topics.js";
 import { isLimitError, limitResetAt } from "./limits.js";
 import {
-  createJobStore, mergeJobsConfig, recordSpawn, recordActivity, recordUsage, recordResultText,
+  createJobStore, mergeJobsConfig, recordSpawn, recordActivity, recordUsage, recordResultText, finalAnswer,
   recordEnd, recordProgress, setClaudeLimited, setCodexLimited, scanJobs, lastAssistantText,
 } from "./jobs.js";
 import { createMirror, topicFor, messageIdOf } from "./mirror.js";
@@ -584,7 +584,7 @@ export default definePluginEntry({
       const job = knowJob(key);
       if (key && recordActivity(store.data, key, ctx.agentId, orchestrator, Date.now())) store.touch(); // a model call is work too
       const texts = event && Array.isArray(event.assistantTexts) ? event.assistantTexts.filter((t) => typeof t === "string" && t.trim()) : [];
-      if (job && texts.length && recordResultText(store.data, key, texts.join("\n"), jobsCfg)) store.touch();
+      if (job && texts.length && recordResultText(store.data, key, finalAnswer(texts), jobsCfg)) store.touch();
       const over = recordUsage(store.data, key, event && event.usage, jobsCfg);
       if (over) {
         store.touch();

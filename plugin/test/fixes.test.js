@@ -129,3 +129,17 @@ test("Codex limit messages: the reset time is read correctly", async () => {
   assert.equal(new Date(limitResetAt(noRel, now)).toISOString(), "2026-11-05T23:43:00.000Z");
   assert.equal(new Date(limitResetAt("usage limit. Next reset in 4 hours", now)).toISOString(), "2026-11-06T02:58:00.000Z");
 });
+
+test("the worker's final report is kept, not the narration before it", async () => {
+  const { finalAnswer, recordResultText } = await import("../jobs.js");
+  const narration = ["I'll start by exploring the project.", "Found the live host. Let me check it.", "Now building the composites."];
+  const report = "The village home differs from the approved mockup in 6 places.\n\nRESULT: partly done\nChecks: ...";
+  assert.equal(finalAnswer([...narration, report]), report);
+  assert.equal(finalAnswer([...narration, report, "  "]), report);
+  assert.equal(finalAnswer(narration), "Now building the composites.");
+  const d = emptyState();
+  spawn(d, 0);
+  recordResultText(d, KEY, report, CFG);
+  assert.equal(recordResultText(d, KEY, "Let me check one more thing.", CFG), false); // a report is not overwritten by narration
+  assert.equal(d.jobs[KEY].resultText, report);
+});
