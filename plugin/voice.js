@@ -160,6 +160,7 @@ function resultText(cfg, job, verdict, moves = []) {
   if (job.error) out.push(`Error: <code>${esc(clip(job.error, 300))}</code>`);
   if (details) out.push(`<blockquote expandable>${mdToHtml(details, 2600, false)}</blockquote>`);
   if (!job.resultText) out.push("I left no written report; my session history has the details.");
+  if (job.missingEvidence && job.missingEvidence.length) out.push(`⚠️ Cited proof that does not exist: ${job.missingEvidence.map((f) => `<code>${esc(f)}</code>`).join(", ")}`);
   if (moves.length) out.push(`<i>Board: ${moves.map((m) => `${esc(m.id)} → ${LABELS[m.to] || esc(m.to)}`).join(", ")}</i>`);
   return out.join("\n");
 }

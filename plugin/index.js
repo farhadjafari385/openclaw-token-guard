@@ -3,7 +3,7 @@ import { definePluginEntry } from "openclaw/plugin-sdk/plugin-entry";
 import { Type } from "typebox";
 import { createState, decide } from "./guard.js";
 import { policyDecide, firstLine, itemsFromBrief } from "./policy.js";
-import { normStatus, resultVerdict, nextAfterJob, renderBoard, renderOverview, auditBoard, parseApproval, looksLikeRequest } from "./board.js";
+import { isLimitBlock, normStatus, resultVerdict, nextAfterJob, renderBoard, renderOverview, auditBoard, parseApproval, looksLikeRequest } from "./board.js";
 import { correctTopic, isGeneral, projectOfTopic, projectsMentioned } from "./topics.js";
 import { isLimitError, limitResetAt } from "./limits.js";
 import {
@@ -17,6 +17,8 @@ import {
 } from "./voice.js";
 import { inboxArgs, loadInboxItems, runInbox } from "./inbox.js";
 import { processBoot } from "./boot.js";
+import { mergeTriageConfig, triageSnapshot, TRIAGE_PROMPT, parseTriage, triageWakeMessage } from "./triage.js";
+import fs from "node:fs";
 
 // No top-level await: OpenClaw loads plugin entries through require(), which
 // rejects ESM graphs that use it.
@@ -198,8 +200,30 @@ export default definePluginEntry({
     const withSource = (p, sessionKey) => {
       const topic = topicOfSession(sessionKey);
       const id = topic ? lastOwnerMessage(topic, 2 * 3600000) : null;
-      if (!id || /\btg:\d+:\d+\b/.test(String(p.source || ""))) return null;
-      return Object.assign({}, p, { source: `${p.source ? `${p.source} ` : ""}tg:${topic}:${id}`.trim() });
+      if (!id) return null;
+      const out = Object.assign({}, p);
+      if (!/\btg:\d+:\d+\b/.test(String(p.source || ""))) out.source = `${p.source ? `${p.source} ` : ""}tg:${topic}:${id}`.trim();
+      // The owner's exact words are the spec; they travel with the item into every brief.
+      const asks = (fresh().ownerAsks || []).filter((a) => a.topic === topic && Date.now() - a.at < 2 * 3600000);
+      const words = String((asks.length ? asks[asks.length - 1].text : ((store.data.ownerMsgs || {})[String(topic)] || {}).text) || "").trim();
+      if (words && !/Owner said: «/.test(String(p.details || ""))) out.details = `Owner said: «${words}»\n${p.details || ""}`.trim();
+      return out;
+    };
+    // Every brief carries, for each of its items, the owner's exact words and what happened on it before.
+    const withOwnerWords = (p) => {
+      const ids = itemsFromBrief(String(p.task || ""));
+      if (!ids.length || /The owner's exact words/.test(String(p.task || ""))) return null;
+      const board = loadInboxItems();
+      const parts = [];
+      for (const id of ids) {
+        const it = board.get(id);
+        if (!it) continue;
+        const said = /Owner said: «([\s\S]*?)»/.exec(String(it.details || ""));
+        const past = (it.history || []).filter((h) => h.note && h.by !== "system").slice(-4).map((h) => `  - ${h.from} -> ${h.to}: ${String(h.note).slice(0, 240)}`);
+        parts.push(`- ${id} ${it.title || ""}${said ? `\n  Owner said: «${said[1].slice(0, 1200)}»` : ""}${past.length ? `\n  Earlier on this item:\n${past.join("\n")}` : ""}`);
+      }
+      if (!parts.length) return null;
+      return Object.assign({}, p, { task: `${p.task}\n\nThe owner's exact words (this is the spec: do exactly this, keep the change minimal, and do not redo work that is already right):\n${parts.join("\n")}` });
     };
     // After the orchestrator approves checked work, ask the owner once (archiving needs both approvals).
     const askOwnerToApprove = (ids) => {
@@ -344,7 +368,10 @@ export default definePluginEntry({
           const res = decide(rewritten, ctx, state, cfg, log, now);
           if (res && res.block) return res;
           let params = (res && res.params) || (pol && pol.params);
-          if (event.toolName === "sessions_spawn" && ctx && ctx.agentId === orchestrator) rememberSpawn(params || event.params || {}, ctx);
+          if (event.toolName === "sessions_spawn" && ctx && ctx.agentId === orchestrator) {
+            params = withOwnerWords(params || event.params || {}) || params;
+            rememberSpawn(params || event.params || {}, ctx);
+          }
           const bare = String(event.toolName || "").split("__").pop();
           if (ctx && ctx.agentId === orchestrator && bare === "message") params = threadOrchestratorPost(params || event.params || {}) || params;
           if (ctx && (ctx.agentId === orchestrator || ctx.agentId === pm) && bare === "task_inbox" && String((params || event.params || {}).action || "") === "add") {
@@ -425,6 +452,10 @@ export default definePluginEntry({
       const finish = () => {
         store.save();
         const cur = store.data.jobs[key] || job;
+        // Proof that is cited must exist: a PASS resting on missing screenshots is no proof.
+        const cited = [...new Set(String(cur.resultText || "").match(/(?:~|\/home|\/tmp|\/srv)\/[^\s`'")\]]+\.(?:png|jpe?g|webp|gif|webm|mp4|json|log|txt|html)/gi) || [])].slice(0, 30);
+        const missing = cited.filter((f) => { try { return !fs.existsSync(f.replace(/^~/, process.env.HOME || "")); } catch { return false; } });
+        if (missing.length) { cur.missingEvidence = missing.slice(0, 10); store.touch(); }
         const verdict = resultVerdict(cur.resultText, cur.outcome);
         const board = loadInboxItems();
         const plan = (cur.items || []).filter((id) => board.has(id)).map((id) => {
@@ -512,7 +543,7 @@ export default definePluginEntry({
       const msgId = messageIdOf(event.messageId || (ctx && ctx.messageId));
       if (msgId && topic) {
         store.data.ownerMsgs = store.data.ownerMsgs || {};
-        store.data.ownerMsgs[String(topic)] = { id: msgId, at: Date.now() };
+        store.data.ownerMsgs[String(topic)] = { id: msgId, at: Date.now(), text: String(event.content || "").slice(0, 1500) };
         store.touch();
         store.save();
       }
@@ -542,7 +573,7 @@ export default definePluginEntry({
       }
       if (looksLikeRequest(event.content)) {
         store.data.ownerAsks = (store.data.ownerAsks || []).slice(-49);
-        store.data.ownerAsks.push({ at: Date.now(), topic, text: String(event.content).slice(0, 400), captured: false });
+        store.data.ownerAsks.push({ at: Date.now(), topic, text: String(event.content).slice(0, 1500), captured: false });
         store.touch();
       }
     }));
@@ -580,10 +611,13 @@ export default definePluginEntry({
         idleWakeSession: jobsCfg.idleWakeSession,
         voice,
         pmAgent: pm,
+        triage: triageCfg.enabled && store.data.triageHealthy !== false, // the old idle wake covers a broken triage
       });
       if (boardCfg.enabled) {
         try { await auditTick(inboxItems); } catch (error) { log("warn", "token-guard board audit failed", { error: String(error && error.message) }); }
+        try { await resumeLimitBlocked(inboxItems); } catch (error) { log("warn", "token-guard resume failed", { error: String(error && error.message) }); }
       }
+      try { await triageTick(inboxItems); } catch (error) { log("warn", "token-guard triage failed", { error: String(error && error.message) }); }
       store.touch();
       store.save();
       for (const action of actions) {
@@ -647,6 +681,63 @@ export default definePluginEntry({
       } catch (error) {
         log("warn", "token-guard PM board audit failed", { error: String(error && error.message) });
       }
+    };
+
+    // Items parked in Blocked only because a usage limit stopped their task go back to To do once no
+    // limit is active (they used to stay Blocked for good: nothing ever picks Blocked work up again).
+    const resumeLimitBlocked = async (inboxItems) => {
+      const now = Date.now();
+      if ((store.data.claudeLimitedUntil || 0) > now || (store.data.codexLimitedUntil || 0) > now) return;
+      for (const it of inboxItems) {
+        if (normStatus(it.status) !== "blocked") continue;
+        if (!isLimitBlock(it.note)) continue;
+        await systemMove(it.id, "todo", "the usage limit has reset: back to To do so the work resumes");
+        refreshItems([it.id]);
+        log("info", "token-guard resumed a limit-blocked item", { id: it.id });
+      }
+    };
+
+    // Every 10 minutes, when something needs a decision: a cheap Haiku call (no tools, light context)
+    // decides whether the orchestrator must act, and at what effort; then the orchestrator is woken.
+    const triageCfg = mergeTriageConfig(cfg.triage);
+    const triageTick = async (inboxItems) => {
+      const sub = api.runtime && api.runtime.subagent;
+      if (!triageCfg.enabled || !sub || typeof sub.run !== "function") return;
+      const now = Date.now();
+      store.data.triage = store.data.triage || { lastAt: 0 };
+      if (now - (store.data.triage.lastAt || 0) < triageCfg.everyMinutes * 60000) return;
+      if ((store.data.claudeLimitedUntil || 0) > now) return; // Haiku is Claude; the plain wakes still run
+      const lastOrc = Math.max(0, ...Object.values(store.data.orcActivity || {}).map(Number));
+      if (now - lastOrc < triageCfg.orchestratorQuietMinutes * 60000) return; // it is working: do not interrupt
+      store.data.triage.lastAt = now;
+      store.touch();
+      store.save();
+      const snapshot = triageSnapshot(store.data, inboxItems, now);
+      if (!snapshot) return; // nothing to decide: no tokens spent
+      const sessionKey = `agent:${orchestrator}:subagent:triage-${now.toString(36)}`;
+      const [provider, ...rest] = String(triageCfg.model).split("/");
+      let decision = null;
+      try {
+        const { runId } = await sub.run({ sessionKey, message: TRIAGE_PROMPT + snapshot, provider, model: rest.join("/"), lightContext: true, promptMode: "minimal", disableTools: true, deliver: false });
+        if (typeof sub.waitForRun === "function") await sub.waitForRun({ runId, timeoutMs: 5 * 60000 });
+        const got = typeof sub.getSessionMessages === "function" ? await sub.getSessionMessages({ sessionKey, limit: 6 }) : null;
+        decision = parseTriage(lastAssistantText(got && got.messages));
+      } catch (error) {
+        log("warn", "token-guard triage run failed", { error: String(error && error.message) });
+      } finally {
+        if (typeof sub.deleteSession === "function") sub.deleteSession({ sessionKey }).catch(() => null);
+      }
+      store.data.triageHealthy = Boolean(decision);
+      store.data.triage.last = decision ? { at: now, wake: decision.wake, effort: decision.effort, why: decision.why } : { at: now, failed: true };
+      store.touch();
+      log("info", "token-guard triage", store.data.triage.last);
+      if (!decision || !decision.wake) return;
+      const day = new Date(now).toISOString().slice(0, 10);
+      if ((store.data.wakesByDay[day] || 0) >= jobsCfg.maxWakesPerDay) return;
+      store.data.wakesByDay[day] = (store.data.wakesByDay[day] || 0) + 1;
+      store.touch();
+      store.save();
+      await sub.run({ sessionKey: jobsCfg.idleWakeSession, message: triageWakeMessage(decision, snapshot), deliver: false });
     };
 
     // A wake that could not be delivered is not counted, so it is tried again.

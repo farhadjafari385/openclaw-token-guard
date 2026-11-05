@@ -310,7 +310,18 @@ function scanJobs(data, rawCfg, now, env) {
     return true;
   };
 
+  const lostLimit = (job) => ((job.runTimeoutSeconds || cfg.defaultRunTimeoutSeconds) * 1000) + cfg.lostAfterTimeoutMinutes * 60000;
   for (const job of Object.values(data.jobs)) {
+    // A run cannot outlive its timeout: past it (plus margin), its end event was lost. Close it
+    // quietly (before the restart check, so a restart never revives old phantoms as "cut off").
+    if (job.status === "running" && now - job.spawnedAt > lostLimit(job)) {
+      job.status = "ended";
+      job.outcome = "lost";
+      job.endedAt = now;
+      job.wakes = cfg.maxWakesPerJob; // the board audit re-queues its items; no reminder storm
+      job.escalated = true;
+      continue;
+    }
     // Cut off by a restart: the child no longer exists in this gateway process.
     if (job.status === "running" && job.bootId !== env.bootId) {
       if (now - env.bootStartedAt >= cfg.restartGraceMinutes * 60000) {
@@ -325,16 +336,6 @@ function scanJobs(data, rawCfg, now, env) {
       continue;
     }
     if (job.status === "running") {
-      // A run cannot outlive its timeout: past it (plus margin), its end event was lost.
-      const limit = ((job.runTimeoutSeconds || cfg.defaultRunTimeoutSeconds) * 1000) + cfg.lostAfterTimeoutMinutes * 60000;
-      if (now - job.spawnedAt > limit) {
-        job.status = "ended";
-        job.outcome = "lost";
-        job.endedAt = now;
-        job.wakes = cfg.maxWakesPerJob; // the board audit re-queues its items; no reminder storm
-        job.escalated = true;
-        continue;
-      }
       const quiet = now - (job.lastActivityAt || job.spawnedAt);
       // Only a task the guard has seen working can be judged silent: a worker's own CLI tools
       // are invisible to it, and judging those produced false stall alarms on most long tasks.
@@ -359,7 +360,8 @@ function scanJobs(data, rawCfg, now, env) {
           job.lastWakeAt = now;
           wake(job.requesterSessionKey,
             `[job-tracker] Task finished: ${describe(job)}, outcome ${job.outcome}${job.error ? ` (${job.error})` : ""} [job ${job.short}].\n` +
-            `Done when: ${job.doneWhen || "(see brief)"}\nResult:\n${job.resultText || "(no final text was captured; read it with sessions_history on " + job.key + ")"}\n\n${ACT_NOW}`,
+            `Done when: ${job.doneWhen || "(see brief)"}\nResult:\n${job.resultText || "(no final text was captured; read it with sessions_history on " + job.key + ")"}\n` +
+            `${job.missingEvidence && job.missingEvidence.length ? `\nWARNING: these files cited as proof do not exist: ${job.missingEvidence.join(", ")}. Treat those claims as unproven.\n` : ""}\n${ACT_NOW}`,
             "ended");
         } else if (job.wakes >= cfg.maxWakesPerJob && !job.escalated && due) {
           job.escalated = true;
@@ -374,8 +376,8 @@ function scanJobs(data, rawCfg, now, env) {
     if (job.status !== "running" && now - (job.endedAt || job.spawnedAt) > cfg.keepEndedHours * 3600000) delete data.jobs[key];
   }
 
-  // Open work that nobody is moving.
-  if (now - (data.idle.lastCheckAt || 0) >= cfg.idleCheckMinutes * 60000) {
+  // Open work that nobody is moving (the triage check decides this when it is on).
+  if (!env.triage && now - (data.idle.lastCheckAt || 0) >= cfg.idleCheckMinutes * 60000) {
     data.idle.lastCheckAt = now;
     const running = Object.values(data.jobs).filter((j) => j.status === "running");
     const covered = new Set();
