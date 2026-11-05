@@ -8,7 +8,7 @@ import { correctTopic, isGeneral, projectOfTopic, projectsMentioned } from "./to
 import { isLimitError, limitResetAt } from "./limits.js";
 import {
   createJobStore, mergeJobsConfig, recordSpawn, recordActivity, recordUsage, recordResultText,
-  recordEnd, setClaudeLimited, scanJobs, lastAssistantText,
+  recordEnd, recordProgress, setClaudeLimited, setCodexLimited, scanJobs, lastAssistantText,
 } from "./jobs.js";
 import { createMirror, topicFor, messageIdOf } from "./mirror.js";
 import {
@@ -231,6 +231,7 @@ export default definePluginEntry({
     };
     const pstate = {
       get claudeLimitedUntil() { return store.data.claudeLimitedUntil || 0; },
+      get codexLimitedUntil() { return store.data.codexLimitedUntil || 0; },
       boardItems: () => loadInboxItems(),
       runningItemIds,
       jobFor: (sessionKey) => {
@@ -245,15 +246,23 @@ export default definePluginEntry({
       onNote: (text) => systemNote("spawn-note", `🔀 ${text}`),
     };
 
+    // A usage limit belongs to the provider that reported it: Codex limits must not be taken for
+    // Claude's (that once routed every task into the exhausted Codex).
     const markLimited = (text, source) => {
-      if (!isLimitError(text)) return;
+      if (!isLimitError(text) && !/usage limit/i.test(String(text))) return;
       const until = limitResetAt(text);
-      if (setClaudeLimited(store.data, until, text)) {
+      const codex = /codex|openai|chatgpt|gpt-\d/i.test(String(text));
+      if ((codex ? setCodexLimited : setClaudeLimited)(store.data, until, text)) {
         store.touch();
         store.save();
-        log("info", "token-guard: Claude limit", { source, text: String(text).slice(0, 160) });
-        post(orchestrator, "system", limitText(voice, until, cfg.spawn && cfg.spawn.codexModel), { html: true });
+        log("info", `token-guard: ${codex ? "Codex" : "Claude"} limit`, { source, text: String(text).slice(0, 160) });
+        post(orchestrator, "system", limitText(voice, until, codex ? "codex" : "claude", cfg.spawn), { html: true });
       }
+    };
+    // This copy of the plugin may not know a task another copy started: read the shared state first.
+    const knowJob = (key) => {
+      if (key && !store.data.jobs[key] && String(key).includes(":subagent:")) fresh();
+      return key ? store.data.jobs[key] : undefined;
     };
 
     // Dispatch details from the spawn call, matched to the child when it starts.
@@ -266,6 +275,7 @@ export default definePluginEntry({
         brief: String(params.task || ""),
         model: params.model ? String(params.model) : "",
         thinking: params.thinking ? String(params.thinking) : "",
+        runTimeoutSeconds: Number(params.runTimeoutSeconds) || 0,
         requesterSessionKey: (ctx && ctx.sessionKey) || "",
       });
       while (pending.length > 50 || (pending.length && Date.now() - pending[0].at > 30 * 60000)) pending.shift();
@@ -291,6 +301,7 @@ export default definePluginEntry({
         requesterSessionKey: requesterSessionKey || p.requesterSessionKey,
         model: p.model,
         thinking: p.thinking,
+        runTimeoutSeconds: p.runTimeoutSeconds,
         doneWhen: firstLine(p.brief, "Done when"),
         brief: p.brief,
         items,
@@ -325,6 +336,7 @@ export default definePluginEntry({
       (event, ctx) => {
         try {
           const now = Date.now();
+          knowJob(ctx && ctx.sessionKey);
           if (recordActivity(store.data, ctx && ctx.sessionKey, ctx && ctx.agentId, orchestrator, now)) store.touch();
           const pol = policyDecide(event, ctx, pstate, cfg, log, now);
           if (pol && pol.block) return { block: true, blockReason: pol.blockReason };
@@ -381,6 +393,7 @@ export default definePluginEntry({
       const key = ctx && ctx.sessionKey;
       if (!key) return;
       const now = Date.now();
+      knowJob(key);
       if (recordActivity(store.data, key, ctx.agentId, orchestrator, now)) store.touch();
       if (event && event.error) markLimited(event.error, ctx.agentId || "agent");
       const job = store.data.jobs[key];
@@ -394,9 +407,18 @@ export default definePluginEntry({
       }
     }));
 
+    // The child's run itself ending, with its real outcome (subagent_ended later says "deleted"
+    // when the finished session is cleaned up).
+    api.on("subagent_progress", safe("subagent_progress", (event) => {
+      const key = event && event.childSessionKey;
+      if (!key || !knowJob(key)) return;
+      if (recordProgress(store.data, key, event.phase, event.outcome, Date.now())) { store.touch(); store.save(); }
+    }));
+
     api.on("subagent_ended", safe("subagent_ended", (event) => {
       const key = event.targetSessionKey;
       if (event.error) markLimited(event.error, "task");
+      knowJob(key);
       const job = recordEnd(store.data, key, event.outcome, event.error, event.endedAt || Date.now());
       if (!job) return;
       store.touch();
@@ -430,8 +452,25 @@ export default definePluginEntry({
     api.on("message_sending", safe("message_sending", (event, ctx) => {
       if (!topicsCfg.enabled || !chatId || !ctx || ctx.channelId !== "telegram") return undefined;
       if (!String(event.to || "").includes(chatId)) return undefined;
-      const right = correctTopic({ threadId: event.threadId, text: event.content, projects, teamTopic });
       const current = isGeneral(event.threadId) ? null : Number(event.threadId);
+      // The orchestrator answering a result: the answer belongs in that task's project topic, under the
+      // worker's result, even when the task was dispatched from another topic's session.
+      const sessionKey = String((ctx && ctx.sessionKey) || "");
+      if (sessionKey.startsWith(`agent:${orchestrator}:`) && !event.replyToId) {
+        const now = Date.now();
+        const job = Object.values(fresh().jobs)
+          .filter((j) => j.requesterSessionKey === sessionKey && j.resultMsgId && !j.answeredAt && j.topic && Number(j.topic) !== current && now - (j.endedAt || 0) < 3 * 3600000)
+          .sort((a, b) => (b.endedAt || 0) - (a.endedAt || 0))[0];
+        if (job) {
+          job.answeredAt = now;
+          store.touch();
+          store.save();
+          mirror.post({ accountId: ctx.accountId, topic: job.topic, text: mdToHtml(withMention(event.content, job.agentId), 3500), html: true, replyTo: job.resultMsgId }).catch(() => null);
+          log("info", "token-guard moved an answer to its task's topic", { from: current, to: job.topic });
+          return { cancel: true, cancelReason: `token-guard: answers a result in topic ${job.topic}; reposted there` };
+        }
+      }
+      const right = correctTopic({ threadId: event.threadId, text: event.content, projects, teamTopic });
       if (!right.topic || right.topic === current) return undefined;
       mirror.post({ accountId: ctx.accountId, topic: right.topic, text: mdToHtml(event.content, 3500), html: true }).catch(() => null);
       const pointerKey = `${ctx.runId || ctx.sessionKey || ""}:${current}`;
@@ -511,7 +550,8 @@ export default definePluginEntry({
     api.on("llm_output", safe("llm_output", (event, ctx) => {
       const key = ctx && ctx.sessionKey;
       // The worker's latest text, so the result is known even if agent_end carries none.
-      const job = key && store.data.jobs[key];
+      const job = knowJob(key);
+      if (key && recordActivity(store.data, key, ctx.agentId, orchestrator, Date.now())) store.touch(); // a model call is work too
       const texts = event && Array.isArray(event.assistantTexts) ? event.assistantTexts.filter((t) => typeof t === "string" && t.trim()) : [];
       if (job && texts.length && recordResultText(store.data, key, texts.join("\n"), jobsCfg)) store.touch();
       const over = recordUsage(store.data, key, event && event.usage, jobsCfg);

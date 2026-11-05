@@ -15,7 +15,9 @@ const DEFAULT_JOBS = {
   wakeAfterEndMinutes: 4, // a finished task the orchestrator has not acted on
   rewakeAfterMinutes: 20,
   maxWakesPerJob: 2,
-  stallMinutes: 30, // a running task with no tool activity
+  stallMinutes: 30, // a running task with no tool activity (only judged once the guard has seen it work)
+  defaultRunTimeoutSeconds: 3600, // when the spawn did not say
+  lostAfterTimeoutMinutes: 15, // a "running" task this long past its timeout lost its end event
   restartGraceMinutes: 8, // agents need time to load after a restart
   idleCheckMinutes: 30, // open inbox work with nothing running
   idleOrcQuietMinutes: 20,
@@ -43,6 +45,7 @@ function emptyState() {
     version: 1,
     jobs: {},
     claudeLimitedUntil: 0,
+    codexLimitedUntil: 0,
     claudeLimitText: "",
     orcActivity: {},
     idle: { lastCheckAt: 0, streak: 0, sig: "", escalatedSig: "" },
@@ -83,6 +86,7 @@ function mergeStates(a, b) {
     out.jobs[key] = newerJob((a.jobs || {})[key], (b.jobs || {})[key]);
   }
   out.claudeLimitedUntil = Math.max(a.claudeLimitedUntil || 0, b.claudeLimitedUntil || 0);
+  out.codexLimitedUntil = Math.max(a.codexLimitedUntil || 0, b.codexLimitedUntil || 0);
   out.claudeLimitText = (a.claudeLimitedUntil || 0) >= (b.claudeLimitedUntil || 0) ? a.claudeLimitText : b.claudeLimitText;
   out.orcActivity = Object.assign({}, b.orcActivity, a.orcActivity);
   for (const [k, v] of Object.entries(b.orcActivity || {})) out.orcActivity[k] = Math.max(v, out.orcActivity[k] || 0);
@@ -169,6 +173,7 @@ function recordSpawn(data, info, bootId, now, cfg) {
     doneWhen: info.doneWhen || prev.doneWhen || "",
     brief: String(info.brief || prev.brief || "").slice(0, cfg.maxBriefChars),
     items: info.items || prev.items || [],
+    runTimeoutSeconds: Number(info.runTimeoutSeconds || prev.runTimeoutSeconds) || 0,
     bootId,
   });
   data.jobs[key] = job;
@@ -180,6 +185,7 @@ function recordActivity(data, sessionKey, agentId, orchestratorAgent, now) {
   const job = data.jobs[sessionKey];
   if (job && job.status === "running") {
     job.lastActivityAt = now;
+    if (now - (Number.isFinite(job.spawnedAt) ? job.spawnedAt : now) > 60000) job.activitySeen = true; // the guard can see this task work
     if (job.stallNotifiedAt) job.stallNotifiedAt = 0;
     changed = true;
   }
@@ -209,14 +215,34 @@ function recordResultText(data, sessionKey, text, cfg) {
   return true;
 }
 
+// The real end of the child's run (subagent_progress "ended"), kept for its end event.
+function recordProgress(data, sessionKey, phase, outcome, now) {
+  const job = data.jobs[sessionKey];
+  if (!job) return false;
+  if (phase === "ended" && outcome) job.runOutcome = outcome;
+  if (job.status === "running") job.lastActivityAt = now;
+  return true;
+}
+
 function recordEnd(data, sessionKey, outcome, error, now) {
   const job = data.jobs[sessionKey];
   if (!job || job.status === "ended") return null;
   job.status = "ended";
-  job.outcome = outcome || "unknown";
+  // "deleted"/"reset" describe the session clean-up, not the run: use the run's own outcome.
+  const cleanup = outcome === "deleted" || outcome === "reset";
+  job.outcome = (cleanup ? job.runOutcome || "ok" : outcome) || job.runOutcome || "unknown";
   job.error = error ? String(error).slice(0, 500) : "";
   job.endedAt = now;
   return job;
+}
+
+function setCodexLimited(data, untilMs, text) {
+  if (untilMs > (data.codexLimitedUntil || 0)) {
+    data.codexLimitedUntil = untilMs;
+    data.codexLimitText = String(text || "").slice(0, 200);
+    return true;
+  }
+  return false;
 }
 
 function setClaudeLimited(data, untilMs, text) {
@@ -269,6 +295,8 @@ function scanJobs(data, rawCfg, now, env) {
   const pm = env.pmAgent || voice.pmAgent || "product"; // the PM keeps the board moving, so it chases
   const wake = (sessionKey, message, reason) => {
     if (!sessionKey) return false;
+    // Both subscriptions at their limit: a wake cannot run, so do not spend one.
+    if ((data.claudeLimitedUntil || 0) > now && (data.codexLimitedUntil || 0) > now) return false;
     if (!canWake(data, cfg, now)) {
       const day = dayKey(now);
       if (data.notes.wakeCap !== day) {
@@ -297,8 +325,20 @@ function scanJobs(data, rawCfg, now, env) {
       continue;
     }
     if (job.status === "running") {
+      // A run cannot outlive its timeout: past it (plus margin), its end event was lost.
+      const limit = ((job.runTimeoutSeconds || cfg.defaultRunTimeoutSeconds) * 1000) + cfg.lostAfterTimeoutMinutes * 60000;
+      if (now - job.spawnedAt > limit) {
+        job.status = "ended";
+        job.outcome = "lost";
+        job.endedAt = now;
+        job.wakes = cfg.maxWakesPerJob; // the board audit re-queues its items; no reminder storm
+        job.escalated = true;
+        continue;
+      }
       const quiet = now - (job.lastActivityAt || job.spawnedAt);
-      if (quiet >= cfg.stallMinutes * 60000 && !job.stallNotifiedAt) {
+      // Only a task the guard has seen working can be judged silent: a worker's own CLI tools
+      // are invisible to it, and judging those produced false stall alarms on most long tasks.
+      if (job.activitySeen && quiet >= cfg.stallMinutes * 60000 && !job.stallNotifiedAt) {
         job.stallNotifiedAt = now;
         actions.push({ kind: "post", agentId: pm, topic: job.topic || "system", html: true, replyTo: job.ackMsgId || job.dispatchMsgId || null, text: stallText(voice, job, minutes(quiet)) });
         wake(job.requesterSessionKey,
@@ -397,7 +437,9 @@ export {
   recordUsage,
   recordResultText,
   recordEnd,
+  recordProgress,
   setClaudeLimited,
+  setCodexLimited,
   scanJobs,
   lastAssistantText,
 };
