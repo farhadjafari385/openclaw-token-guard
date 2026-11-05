@@ -65,6 +65,7 @@ const DEFAULT_POLICY = {
     ],
     allowedThinking: ["off", "minimal", "low", "medium", "high"],
     codexModel: "openai/gpt-6-astra",
+    claudeFallbackModel: "anthropic/claude-sonnet-5", // when Codex is at its limit
     limitedProviders: ["anthropic"],
   },
 };
@@ -345,10 +346,19 @@ function spawnRewrite(params, policy, pstate, now) {
     const title = String(next.task || "").split("\n").map((l) => l.trim()).find((l) => l && !/^[A-Za-z ]+:/.test(l)) || "task";
     next.label = `${project || "task"}: ${title}`.slice(0, 80);
   }
-  const limitedUntil = pstate && pstate.claudeLimitedUntil ? pstate.claudeLimitedUntil : 0;
-  if (limitedUntil > now && (!next.model || isClaudeModel(next.model, policy))) {
-    notes.push(`Claude is limited until ${new Date(limitedUntil).toISOString()}: ${next.model || "default model"} -> ${sp.codexModel}`);
+  // Route around a subscription at its limit, never into it. (A Codex limit was once read as a
+  // Claude limit, which sent every task to the exhausted Codex and failed them in seconds.)
+  const claudeUntil = (pstate && pstate.claudeLimitedUntil) || 0;
+  const codexUntil = (pstate && pstate.codexLimitedUntil) || 0;
+  const claudeOff = claudeUntil > now;
+  const codexOff = codexUntil > now;
+  const wantsClaude = !next.model || isClaudeModel(next.model, policy);
+  if (claudeOff && !codexOff && wantsClaude) {
+    notes.push(`Claude is limited until ${new Date(claudeUntil).toISOString().slice(11, 16)} UTC: ${next.model || "default model"} -> ${sp.codexModel}`);
     next.model = sp.codexModel;
+  } else if (codexOff && !claudeOff && !wantsClaude) {
+    notes.push(`Codex is limited until ${new Date(codexUntil).toISOString().slice(11, 16)} UTC: ${next.model} -> ${sp.claudeFallbackModel}`);
+    next.model = sp.claudeFallbackModel;
   }
   return { params: next, notes };
 }
@@ -531,6 +541,12 @@ function policyDecide(event, ctx, pstate, rawConfig, log, now = Date.now()) {
       if (briefProject && itemProject && !itemProject.includes(briefProject) && !briefProject.includes(itemProject) && projectName(policy, itemProject) !== briefProject) {
         return block("projectMismatch", `token-guard: the brief says Project ${briefProject} but its items are ${itemProject}. Fix the brief or the items.`);
       }
+    }
+    const claudeUntil = (pstate && pstate.claudeLimitedUntil) || 0;
+    const codexUntil = (pstate && pstate.codexLimitedUntil) || 0;
+    if (claudeUntil > now && codexUntil > now) {
+      const at = (ms) => new Date(ms).toISOString().slice(11, 16);
+      return block("bothLimited", `token-guard: Claude (until ${at(claudeUntil)} UTC) and Codex (until ${at(codexUntil)} UTC) are both at their usage limits, so this task would fail at once. Do not dispatch now and leave its items in To do: the job tracker wakes you again once a limit has reset.`);
     }
     const input = Object.assign({}, params);
     if (input.model) input.model = normaliseModel(input.model, allowed);

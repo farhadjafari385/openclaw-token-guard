@@ -152,7 +152,8 @@ function resultText(cfg, job, verdict, moves = []) {
   let head = HEADS[verdict] || HEADS.unknown;
   if (job.outcome === "timeout") head = "⌛ I ran out of time";
   else if (job.outcome === "killed") head = "🛑 My task was stopped";
-  else if (job.outcome && job.outcome !== "ok") head = "❌ My run failed";
+  else if (job.outcome === "lost") head = "❔ My task ended without a report reaching the guard";
+  else if (job.outcome === "error") head = "❌ My run failed";
   const { summary, details } = splitReport(job.resultText);
   const first = `${handleOf(cfg, orcOf(cfg))} ${head}${mins ? ` (${mins} min)` : ""}.`;
   const out = [summary ? `${first} ${mdToHtml(summary, 700)}` : first];
@@ -203,9 +204,12 @@ function guardText(cfg, rule, info) {
   return `🛡 Guard stopped ${handleOf(cfg, info.agentId)}: ${esc(GUARD_WHAT[rule] || rule)}${info.tool ? ` (<code>${esc(info.tool)}</code>)` : ""}.`;
 }
 
-function limitText(_cfg, untilMs, codexModel) {
+function limitText(_cfg, untilMs, provider = "claude", spawn = {}) {
   const until = new Date(untilMs).toISOString().slice(11, 16);
-  return `⚠️ Claude's usage limit is reached until ${until} UTC. New tasks run on ${esc(modelName(codexModel || "openai/gpt-6-astra"))} until then.`;
+  if (provider === "codex") {
+    return `⚠️ Codex's usage limit is reached until ${until} UTC. New tasks run on ${esc(modelName((spawn && spawn.claudeFallbackModel) || "anthropic/claude-sonnet-5"))} until then.`;
+  }
+  return `⚠️ Claude's usage limit is reached until ${until} UTC. New tasks run on ${esc(modelName((spawn && spawn.codexModel) || "openai/gpt-6-astra"))} until then.`;
 }
 
 // The orchestrator asks the owner to approve checked work (archiving needs both).

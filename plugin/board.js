@@ -36,9 +36,14 @@ function canMove(from, to) {
   return a === b || (TRANSITIONS[a] || []).includes(b);
 }
 
+// Run outcomes that mean the work did not finish. "deleted" and "reset" are not among them:
+// OpenClaw reports "deleted" when it cleans up a finished task's session (cleanup: delete).
+// Counting it as failed sent finished work back to To do (26 times by 2026-11-05).
+const FAILED_OUTCOMES = new Set(["error", "timeout", "killed", "lost"]);
+
 // The worker's verdict, from the RESULT line of its report.
 function resultVerdict(text, outcome) {
-  if (outcome && outcome !== "ok") return "failed";
+  if (outcome && FAILED_OUTCOMES.has(outcome)) return "failed";
   const m = /^\s*[*_`>]*\s*RESULT\s*[:=-]\s*[*_`]*\s*([a-z ]+)/im.exec(String(text || ""));
   const v = m ? m[1].trim().toLowerCase() : "";
   if (/^(done|approved|pass|passed|merged|released|shipped|complete|completed)\b/.test(v)) return "done";
@@ -154,6 +159,6 @@ function looksLikeRequest(text) {
 }
 
 export {
-  COLUMNS, LEGACY, LABELS, TRANSITIONS, DISPATCHABLE, OPEN, AUTO_FROM,
+  COLUMNS, LEGACY, LABELS, TRANSITIONS, DISPATCHABLE, OPEN, AUTO_FROM, FAILED_OUTCOMES,
   normStatus, canMove, resultVerdict, nextAfterJob, renderBoard, renderOverview, auditBoard, parseApproval, looksLikeRequest,
 };
