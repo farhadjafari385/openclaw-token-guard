@@ -108,6 +108,9 @@ function createMirror({ cfg, log, fetchImpl = globalThis.fetch, readFile = (p) =
           let data = null;
           try { data = typeof res.json === "function" ? await res.json() : null; } catch { data = null; }
           if (res.status === 429 || res.status >= 500) throw new Error(`http ${res.status}`);
+          // An edit with unchanged text is not a failure. (Treating it as one made the board view post
+          // and pin a new copy of itself, 58 times on 2026-11-05.)
+          if (!res.ok && /message is not modified/i.test(String((data && data.description) || ""))) return true;
           if (!res.ok && res.status === 400 && fallbacks < 2 && (payload.parse_mode || payload.reply_parameters)) {
             fallbacks += 1;
             const desc = String((data && data.description) || "");

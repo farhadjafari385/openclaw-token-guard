@@ -161,3 +161,11 @@ test("every copy of the plugin in one process shares one boot, so running tasks 
   assert.deepEqual(scanJobs(d, cfg, Date.now(), env).filter((x) => x.reason === "interrupted"), []);
   assert.equal(d.jobs["agent:qa:subagent:9"].status, "running");
 });
+
+test("mirror: an edit with unchanged text counts as done, so the board view never re-posts itself", async () => {
+  let calls = 0;
+  const fetchImpl = async () => { calls += 1; return { ok: false, status: 400, json: async () => ({ ok: false, description: "Bad Request: message is not modified: specified new message content and reply markup are exactly the same" }) }; };
+  const m = createMirror({ cfg: { chatId: "-1", botTokenFiles: { coordinator: "/t" }, minIntervalMs: 0 }, fetchImpl, readFile: () => "T" });
+  assert.equal(await m.edit({ agentId: "coordinator", messageId: 5, text: "same" }), true);
+  assert.equal(calls, 1);
+});
