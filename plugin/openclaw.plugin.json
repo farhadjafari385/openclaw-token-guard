@@ -196,6 +196,11 @@
       },
       "ownerId": {
         "type": "string"
+      },
+      "triage": {
+        "type": "object",
+        "additionalProperties": true,
+        "description": "10-minute Haiku triage: enabled, everyMinutes, model, orchestratorQuietMinutes"
       }
     }
   }

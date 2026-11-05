@@ -363,6 +363,31 @@ function spawnRewrite(params, policy, pstate, now) {
   return { params: next, notes };
 }
 
+
+// Titles of items that are really a step of another item.
+const GATE_TITLE = /^\s*(retry|re-?try|resume|re-?dispatch|re-?review|qa gate|review gate|live proof|live qa|live frames|qa pr|qa:|review:|verify pr|merge pr)\b/i;
+
+const STOP = new Set(["the", "a", "an", "and", "or", "of", "to", "in", "on", "for", "with", "fix", "add", "make", "is", "it", "not", "no", "from", "at", "by", "be"]);
+function words(text) {
+  return new Set(String(text || "").toLowerCase().replace(/[^a-z0-9#]+/g, " ").split(" ").filter((w) => w.length > 1 && !STOP.has(w)));
+}
+
+// An open item in the same project whose title says the same thing (most of the words shared).
+function similarOpenItem(board, project, title) {
+  const a = words(title);
+  if (a.size < 2) return null;
+  const proj = String(project || "").toLowerCase();
+  for (const it of board.values()) {
+    if (!["backlog", "todo", "in_progress", "review", "qa", "blocked"].includes(String(it.status || "").toLowerCase().replace(/[\s-]+/g, "_"))) continue;
+    if (proj && String(it.project || "").toLowerCase() !== proj) continue;
+    const b = words(it.title);
+    let shared = 0;
+    for (const w of a) if (b.has(w)) shared += 1;
+    if (Math.min(a.size, b.size) >= 3 && shared / Math.min(a.size, b.size) >= 0.75) return it;
+  }
+  return null;
+}
+
 // ---- decision ----
 
 function policyDecide(event, ctx, pstate, rawConfig, log, now = Date.now()) {
@@ -476,6 +501,18 @@ function policyDecide(event, ctx, pstate, rawConfig, log, now = Date.now()) {
       if (!orchestrator && agentId !== policy.board.agent) {
         return block("boardWrite", "token-guard: only the orchestrator and the PM change the board. Put your status in your final answer: the board moves automatically when your task ends.");
       }
+      // One request = one item for its whole life: retries and gates move the same item.
+      if (action === "add") {
+        const title = String(params.title || "");
+        if (GATE_TITLE.test(title)) {
+          return block("itemPerStep", "token-guard: do not add an item for a retry, a gate or a proof step. Keep the owner's original item and move it (task_inbox set: in_progress, review, qa) and dispatch the next agent on that same item id.");
+        }
+        const board = pstate && typeof pstate.boardItems === "function" ? pstate.boardItems() : null;
+        const twin = board ? similarOpenItem(board, String(params.project || ""), title) : null;
+        if (twin) {
+          return block("duplicateItem", `token-guard: this is the same request as open item ${twin.id} ("${String(twin.title).slice(0, 80)}"). Keep one item per request: update ${twin.id} (task_inbox set, with a note) instead of adding a new one.`);
+        }
+      }
     }
   }
 
@@ -561,6 +598,7 @@ function policyDecide(event, ctx, pstate, rawConfig, log, now = Date.now()) {
 }
 
 export {
+  similarOpenItem,
   DEFAULT_POLICY,
   mergePolicy,
   expandHome,

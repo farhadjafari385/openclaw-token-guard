@@ -75,3 +75,46 @@ test("usage limits: route around the limited provider, never into it; both limit
   recordEnd(d, KEY, "ok", "", now - 10 * MIN);
   assert.deepEqual(scanJobs(d, CFG, now, env()).filter((x) => x.kind === "wake"), []);
 });
+
+test("Blocked only by a usage limit resumes by itself; Blocked on the owner never does", async () => {
+  const { isLimitBlock } = await import("../board.js");
+  assert.equal(isLimitBlock("Run died after 16s at start: Claude limited, Codex fallback limited until 3:55 PM EST. Re-dispatch same brief at 3:55."), true);
+  assert.equal(isLimitBlock("No live task. Writer retry died on the Codex usage limit. Re-dispatch after reset"), true);
+  assert.equal(isLimitBlock("Remaining: two real $0.99 payments = spending money, so it needs the owner's OK"), false);
+  assert.equal(isLimitBlock("Cloudflare unverifiable: needs owner decision; Codex limit too"), false);
+  assert.equal(isLimitBlock("Waiting on DNS propagation"), false);
+});
+
+test("one request = one item: no new items for retries or gates, no near-duplicates", async () => {
+  const { similarOpenItem } = await import("../policy.js");
+  const board = new Map([
+    ["2fda6c5a", { id: "2fda6c5a", project: "demo", status: "blocked", title: "Modal buttons (e.g. visitor gift Collect) do nothing on mobile" }],
+    ["aaaa1111", { id: "aaaa1111", project: "demo", status: "done", title: "World map panning stops at the map edges on phone" }],
+  ]);
+  assert.equal(similarOpenItem(board, "demo", "Visitor gift modal: Collect buttons do nothing on mobile").id, "2fda6c5a");
+  assert.equal(similarOpenItem(board, "demo", "World map panning stops at map edges on phone"), null); // that one is done
+  assert.equal(similarOpenItem(board, "demo", "Fix login page"), null); // too short to judge
+  assert.equal(similarOpenItem(board, "other-project", "Modal buttons do nothing on mobile visitor gift"), null); // other project
+  const COORD = { agentId: "coordinator", sessionKey: "agent:coordinator:telegram:group:-100:topic:151" };
+  const pstate = { boardItems: () => board };
+  const add = (title) => policyDecide({ toolName: "task_inbox", params: { action: "add", project: "demo", title } }, COORD, pstate, {});
+  assert.equal(add("Retry: finish modal button fix MR after Codex limit").rule, "itemPerStep");
+  assert.equal(add("QA gate: live proof of PR #47").rule, "itemPerStep");
+  assert.equal(add("Visitor gift modal: Collect buttons do nothing on mobile").rule, "duplicateItem");
+  assert.equal(add("Add a settings page with sound volume"), undefined);
+});
+
+test("triage: no call when nothing needs a decision; a snapshot and a parsed decision otherwise", async () => {
+  const { triageSnapshot, parseTriage, triageWakeMessage } = await import("../triage.js");
+  const now = Date.now();
+  const quiet = emptyState();
+  assert.equal(triageSnapshot(quiet, [{ id: "a", status: "done" }, { id: "b", status: "blocked" }], now), null);
+  const busy = emptyState();
+  const snap = triageSnapshot(busy, [{ id: "2fda6c5a", project: "demo", status: "todo", title: "Modal buttons", owner: "writer" }], now);
+  assert.match(snap, /Open items with no task running \(1\):\n- 2fda6c5a \[todo\] demo: Modal buttons/);
+  assert.deepEqual(parseTriage('Sure.\n{"wake": true, "effort": "high", "why": "asked twice", "instruction": "dispatch 2fda6c5a"}'),
+    { wake: true, effort: "high", why: "asked twice", instruction: "dispatch 2fda6c5a" });
+  assert.equal(parseTriage("no json here"), null);
+  assert.equal(parseTriage('{"wake": true, "effort": "max"}').effort, "medium");
+  assert.match(triageWakeMessage({ effort: "high", why: "x", instruction: "y" }, snap), /^\[triage, effort high\] First set your effort/);
+});

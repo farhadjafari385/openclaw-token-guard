@@ -141,6 +141,14 @@ function auditBoard(items, runningItemIds, ownerAsks, now = Date.now(), cfg = {}
   return issues;
 }
 
+// A Blocked note that says only a usage limit (or a dead provider) stopped the work, so it can
+// resume by itself once the limit resets. Anything waiting on the owner is not.
+const LIMIT_NOTE = /usage limit|limited until|limit until|limits until|codex limit|claude limit|at usage limit|model limits|auth(?:entication)? (?:is )?unavailable|provider (?:was )?down|died (?:at start|after \d+s)/i;
+function isLimitBlock(note) {
+  const n = String(note || "");
+  return LIMIT_NOTE.test(n) && !/owner|approv|decision|payment|money/i.test(n);
+}
+
 // Owner approval in a Telegram message: "approve a1b2c3d4 e5f6a7b8", "approved all", "archive 1a2b3c4d".
 function parseApproval(text) {
   const t = String(text || "");
@@ -160,5 +168,5 @@ function looksLikeRequest(text) {
 
 export {
   COLUMNS, LEGACY, LABELS, TRANSITIONS, DISPATCHABLE, OPEN, AUTO_FROM, FAILED_OUTCOMES,
-  normStatus, canMove, resultVerdict, nextAfterJob, renderBoard, renderOverview, auditBoard, parseApproval, looksLikeRequest,
+  isLimitBlock, normStatus, canMove, resultVerdict, nextAfterJob, renderBoard, renderOverview, auditBoard, parseApproval, looksLikeRequest,
 };

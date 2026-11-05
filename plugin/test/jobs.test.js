@@ -72,13 +72,18 @@ test("a silent running task is flagged once per stall; activity resets it", () =
 
 test("a task cut off by a restart is re-dispatched with its brief after the grace period", () => {
   const d = emptyState();
-  spawned(d, 0);
+  spawned(d, 90 * MIN); // started 10 minutes before the restart
   const later = env({ bootId: "boot2", bootStartedAt: 100 * MIN });
   assert.deepEqual(scanJobs(d, CFG, 103 * MIN, later), []);
   const a = scanJobs(d, CFG, 109 * MIN, later);
   assert.deepEqual(kinds(a), ["post:151", "wake:interrupted"]);
   assert.match(a[1].message, /Done when: pipeline green/);
   assert.equal(d.jobs[CHILD].status, "interrupted");
+  // A phantom far past its timeout is never revived as "cut off" by a restart: it is closed quietly.
+  const old = emptyState();
+  spawned(old, 0);
+  assert.deepEqual(scanJobs(old, CFG, 1200 * MIN, later), []);
+  assert.equal(old.jobs[CHILD].outcome, "lost");
 });
 
 test("open inbox work with nothing running wakes the orchestrator; no change after 3 wakes escalates", () => {
