@@ -100,6 +100,8 @@ function mergeStates(a, b) {
   out.ownerMsgs = Object.assign({}, b.ownerMsgs);
   for (const [k, v] of Object.entries(a.ownerMsgs || {})) if (!out.ownerMsgs[k] || (v && v.at) >= out.ownerMsgs[k].at) out.ownerMsgs[k] = v;
   out.askedApproval = Object.assign({}, b.askedApproval, a.askedApproval);
+  out.triageWakesByDay = Object.assign({}, b.triageWakesByDay);
+  for (const [k, v] of Object.entries(a.triageWakesByDay || {})) out.triageWakesByDay[k] = Math.max(v, out.triageWakesByDay[k] || 0);
   const asks = new Map();
   for (const ask of [...(b.ownerAsks || []), ...(a.ownerAsks || [])]) asks.set(`${ask.at}:${ask.topic}`, Object.assign({}, asks.get(`${ask.at}:${ask.topic}`), ask, { captured: Boolean(ask.captured || (asks.get(`${ask.at}:${ask.topic}`) || {}).captured) }));
   out.ownerAsks = [...asks.values()].sort((x, y) => x.at - y.at).slice(-50);

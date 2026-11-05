@@ -732,11 +732,18 @@ export default definePluginEntry({
       store.touch();
       log("info", "token-guard triage", store.data.triage.last);
       if (!decision || !decision.wake) return;
+      // The triage has its own daily budget: the old reminders once used up the shared cap and the
+      // triage's wake was then dropped without a word.
       const day = new Date(now).toISOString().slice(0, 10);
-      if ((store.data.wakesByDay[day] || 0) >= jobsCfg.maxWakesPerDay) return;
-      store.data.wakesByDay[day] = (store.data.wakesByDay[day] || 0) + 1;
+      store.data.triageWakesByDay = store.data.triageWakesByDay || {};
+      if ((store.data.triageWakesByDay[day] || 0) >= triageCfg.maxWakesPerDay) {
+        log("warn", "token-guard triage wanted to wake the orchestrator but its daily budget is used up", { budget: triageCfg.maxWakesPerDay });
+        return;
+      }
+      store.data.triageWakesByDay[day] = (store.data.triageWakesByDay[day] || 0) + 1;
       store.touch();
       store.save();
+      log("info", "token-guard triage woke the orchestrator", { effort: decision.effort });
       await sub.run({ sessionKey: jobsCfg.idleWakeSession, message: triageWakeMessage(decision, snapshot), deliver: false });
     };
 
