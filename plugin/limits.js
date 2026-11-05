@@ -40,8 +40,23 @@ function zonedToUtc(year, month, day, hour, minute, timeZone) {
   return utc;
 }
 
+// Codex words it differently: "Next reset in 46 minutes, Nov 5 at 6:43 PM EST."
+const RELATIVE_PATTERN = /\breset in (\d+)\s*(minutes?|mins?|hours?|hrs?|days?)\b/i;
+const ABBR_PATTERN = /\b([A-Za-z]{3,9})\.?\s+(\d{1,2}),?\s+at\s+(\d{1,2})(?::(\d{2}))?\s*(am|pm)\s*(EST|EDT|CST|CDT|MST|MDT|PST|PDT|UTC|GMT|CET|CEST)\b/i;
+const ABBR_ZONES = { est: "America/New_York", edt: "America/New_York", cst: "America/Chicago", cdt: "America/Chicago", mst: "America/Denver", mdt: "America/Denver", pst: "America/Los_Angeles", pdt: "America/Los_Angeles", utc: "UTC", gmt: "UTC", cet: "Europe/Berlin", cest: "Europe/Berlin" };
+
 // When does the limit in `text` reset? Returns epoch ms; falls back to now + 1h.
 function limitResetAt(text, now = Date.now()) {
+  const rel = typeof text === "string" ? RELATIVE_PATTERN.exec(text) : null;
+  if (rel) {
+    const unit = /^m/i.test(rel[2]) ? 60000 : /^h/i.test(rel[2]) ? 3600000 : 86400000;
+    return Math.min(now + Number(rel[1]) * unit + 60000, now + MAX_LIMIT_MS); // one minute of margin
+  }
+  const abbr = typeof text === "string" ? ABBR_PATTERN.exec(text) : null;
+  if (abbr) {
+    const [, monthName, dayStr, hourStr, minuteStr, ampm, zone] = abbr;
+    text = `resets ${monthName} ${dayStr}, ${hourStr}${minuteStr ? `:${minuteStr}` : ""}${ampm} (${ABBR_ZONES[zone.toLowerCase()]})`;
+  }
   const m = typeof text === "string" ? RESET_PATTERN.exec(text) : null;
   if (!m) return now + DEFAULT_LIMIT_MS;
   const [, monthName, dayStr, hourStr, minuteStr, ampm, zoneRaw] = m;
