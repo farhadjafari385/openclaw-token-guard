@@ -27,7 +27,7 @@ const DEFAULT_JOBS = {
   budgetTokens: 15000000, // tokens a single task may process (input + cache + output)
   keepEndedHours: 48,
   maxBriefChars: 6000,
-  maxResultChars: 3000,
+  maxResultChars: 6000,
 };
 
 const OPEN_STATUSES = new Set(["backlog", "todo", "in_progress", "review", "qa", "open", "planned", "dispatched"]);
@@ -210,10 +210,24 @@ function recordUsage(data, sessionKey, usage, cfg) {
   return null;
 }
 
+const HAS_RESULT = /^\s*[*_`>]*\s*RESULT\s*[:=-]/im;
+
+// The worker's final answer among its text blocks: from the last block with a RESULT line to the end,
+// else the last block. (Joining every block kept the run's narration and cut the real report off.)
+function finalAnswer(texts) {
+  const list = (texts || []).filter((t) => typeof t === "string" && t.trim());
+  if (!list.length) return "";
+  for (let i = list.length - 1; i >= 0; i--) if (HAS_RESULT.test(list[i])) return list.slice(i).join("\n").trim();
+  return list[list.length - 1].trim();
+}
+
 function recordResultText(data, sessionKey, text, cfg) {
   const job = data.jobs[sessionKey];
   if (!job || !text) return false;
-  job.resultText = String(text).slice(0, cfg.maxResultChars);
+  const next = String(text).trim();
+  // Never replace a real report (with its RESULT line) by later text without one.
+  if (job.resultText && HAS_RESULT.test(job.resultText) && !HAS_RESULT.test(next)) return false;
+  job.resultText = next.length > cfg.maxResultChars ? `${next.slice(0, cfg.maxResultChars - 1)}…` : next;
   return true;
 }
 
@@ -440,6 +454,7 @@ export {
   recordActivity,
   recordUsage,
   recordResultText,
+  finalAnswer,
   recordEnd,
   recordProgress,
   setClaudeLimited,
