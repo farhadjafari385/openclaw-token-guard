@@ -223,6 +223,14 @@ function approvalAskText(cfg, items) {
   return `${ownerTag(cfg)} these are done and I've checked them:\n${list}\nReply <code>approve ${items.map((it) => esc(it.id)).join(" ")}</code> to archive them (or <code>approve all</code>).`;
 }
 
+// The orchestrator's answer under a worker's result when it moved the item without saying so:
+// its own note, the worker mentioned, and the move.
+function boardReplyText(cfg, job, id, status, note) {
+  const said = String(note || "").trim();
+  const body = said ? mdToHtml(clip(said, 700), 800) : "thanks, I've taken it from here.";
+  return `${handleOf(cfg, job.agentId)} ${body}\n<i>Board: ${esc(id)} → ${LABELS[status] || esc(status)}</i>`;
+}
+
 // The reply to the owner's "approve …" message.
 function approvalReplyText(cfg, archived, waiting, notDone) {
   const name = (it) => `${esc(clip(it.title || it.id, 80))} (${esc(it.id)})`;
@@ -244,5 +252,5 @@ function movedText(_cfg, project) {
 export {
   esc, clip, nameOf, handleOf, ownerTag, titleOf, modelName, mdToHtml, htmlToPlain, splitReport,
   dispatchText, ackText, resultText, stallText, interruptedText, unactedText, wakeCapText, teamStuckText,
-  budgetText, guardText, limitText, approvalAskText, approvalReplyText, auditText, movedText,
+  budgetText, guardText, limitText, approvalAskText, approvalReplyText, auditText, movedText, boardReplyText,
 };

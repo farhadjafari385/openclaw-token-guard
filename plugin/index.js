@@ -13,7 +13,7 @@ import {
 import { createMirror, topicFor, messageIdOf } from "./mirror.js";
 import {
   dispatchText, ackText, resultText, guardText, limitText, budgetText, approvalAskText, approvalReplyText,
-  auditText, movedText, mdToHtml, handleOf,
+  auditText, movedText, mdToHtml, handleOf, boardReplyText,
 } from "./voice.js";
 import { inboxArgs, loadInboxItems, runInbox } from "./inbox.js";
 import { processBoot } from "./boot.js";
@@ -178,6 +178,36 @@ export default definePluginEntry({
       if (best) { best.answeredAt = now; store.touch(); store.save(); }
       return best;
     };
+    // The newest unanswered worker result on these items (claimed once): the orchestrator's next move
+    // on an item is its answer to that result, so it is posted in the result's thread.
+    const takeResultForItems = (ids, topic) => {
+      const now = Date.now();
+      let best = null;
+      for (const j of Object.values(fresh().jobs)) {
+        if (!j.resultMsgId || j.answeredAt || now - (j.endedAt || 0) > 6 * 3600000) continue;
+        if (topic && Number(j.topic) !== Number(topic)) continue;
+        if (!(j.items || []).some((id) => ids.includes(id))) continue;
+        if (!best || (j.endedAt || 0) > (best.endedAt || 0)) best = j;
+      }
+      if (best) { best.answeredAt = now; store.touch(); store.save(); }
+      return best;
+    };
+    // The orchestrator moved an item but did not answer the worker: after a short wait (it may still
+    // write its own reply), its board note is posted as the answer under the worker's result.
+    const answerBoardMove = (ids, status, note) => {
+      if (!ids.length || !status) return;
+      const t = setTimeout(() => {
+        try {
+          for (const id of ids) {
+            const job = takeResultForItems([id]);
+            if (job) post(orchestrator, job.topic, boardReplyText(voice, job, id, normStatus(status), note), { html: true, replyTo: job.resultMsgId });
+          }
+        } catch (error) {
+          log("warn", "token-guard board reply failed", { error: String(error && error.message) });
+        }
+      }, 3 * 60000);
+      if (t && typeof t.unref === "function") t.unref();
+    };
     const withMention = (text, agentId) => {
       const h = handleOf(voice, agentId);
       const t = String(text === undefined || text === null ? "" : text);
@@ -334,7 +364,9 @@ export default definePluginEntry({
       store.save();
       if (job) {
         const key = childSessionKey;
-        const replyTo = requestMessageFor(job.topic, items, board);
+        // The next agent on an item answers the previous worker's result in its thread.
+        const prior = items.length ? takeResultForItems(items, job.topic) : null;
+        const replyTo = prior ? prior.resultMsgId : requestMessageFor(job.topic, items, board);
         if (replyTo) setJob(key, { requestMsgId: replyTo });
         const thread = say(orchestrator, job.topic, dispatchText(voice, store.data.jobs[key] || job), { html: true, replyTo })
           .then((id) => {
@@ -399,6 +431,9 @@ export default definePluginEntry({
           const out = JSON.stringify(event.result || "").match(/\b[0-9a-f]{8}\b/g) || [];
           refreshItems([...ids, ...out]);
           if (action === "approve" && ctx && ctx.agentId === orchestrator) askOwnerToApprove(ids);
+          if (action === "set" && ctx && ctx.agentId === orchestrator && event.params && event.params.status) {
+            answerBoardMove(ids, String(event.params.status), event.params.note);
+          }
         }
         return;
       }
