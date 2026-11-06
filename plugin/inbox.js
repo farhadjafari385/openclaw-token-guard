@@ -94,6 +94,7 @@ function loadInboxItems(file = inboxFile()) {
     if (ev.kind === "add") {
       items.set(ev.id, {
         id: ev.id, project: ev.project, title: ev.title, owner: ev.owner, size: ev.size || "medium", area: ev.area,
+        type: ev.type || "task", priority: ev.priority || "normal", rank: null,
         done_when: ev.done_when, status: normStatus(ev.status || "backlog"), note: null,
         orc_approved_ts: null, owner_approved_ts: null, created_ts: ev.ts, updated_ts: ev.ts,
       });
@@ -102,7 +103,8 @@ function loadInboxItems(file = inboxFile()) {
     const it = items.get(ev.id);
     if (!it) continue;
     if (ev.kind === "set") {
-      for (const key of ["owner", "size", "area", "done_when", "title"]) if (ev[key]) it[key] = ev[key];
+      for (const key of ["owner", "size", "area", "done_when", "title", "priority"]) if (ev[key]) it[key] = ev[key];
+      if ("rank" in ev) it.rank = Number(ev.rank) > 0 ? Number(ev.rank) : null; // the PM's queue position (0 clears it)
       if ("note" in ev) it.note = ev.note;
       if (ev.status) {
         const to = normStatus(ev.status);
