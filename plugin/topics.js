@@ -17,9 +17,13 @@ function matchers(projects) {
   for (const [name, p] of Object.entries(projects || {})) {
     const names = [name, ...((p && p.aliases) || [])].map((n) => String(n).toLowerCase()).filter(Boolean);
     const alt = names.map(escapeRe).join("|");
+    // "strict" is for a project whose own name is a common word ("ai"): that name counts only when written
+    // as a project. Its aliases are distinctive names and match like any other name.
+    const plain = (list) => `(?:^|[^a-z0-9_-])(?:${list.map(escapeRe).join("|")})(?:$|[^a-z0-9_-])`;
+    const aliases = names.slice(1);
     const re = p && p.strict
-      ? new RegExp(`(?:\\bproject\\s*[:=]?\\s*\\**\\s*(?:${alt})\\b|#(?:${alt})\\b|\\b(?:${alt})\\s+(?:project|repo|monorepo|topic)\\b)`, "i")
-      : new RegExp(`(?:^|[^a-z0-9_-])(?:${alt})(?:$|[^a-z0-9_-])`, "i");
+      ? new RegExp(`(?:\\bproject\\s*[:=]?\\s*\\**\\s*(?:${alt})\\b|#(?:${alt})\\b|\\b(?:${alt})\\s+(?:project|repo|monorepo|topic)\\b${aliases.length ? `|${plain(aliases)}` : ""})`, "i")
+      : new RegExp(plain(names), "i");
     hit.push({ name, topic: Number(p && p.topic), re });
   }
   cache.set(key, hit);

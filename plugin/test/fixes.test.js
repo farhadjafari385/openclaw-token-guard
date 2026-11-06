@@ -179,3 +179,13 @@ test("no dispatch while a deploy restarts the gateway", () => {
   assert.notEqual((policyDecide(task, COORD, { maintenanceSince: () => now - 40 * 60000 }, {}, null, now) || {}).rule, "maintenance"); // stale flag ignored
   assert.notEqual((policyDecide(task, COORD, { maintenanceSince: () => 0 }, {}, null, now) || {}).rule, "maintenance");
 });
+
+test("a strict project's distinctive aliases match normally; its common-word name stays strict", async () => {
+  const { projectsMentioned } = await import("../topics.js");
+  const projects = { ai: { topic: 153, strict: true, aliases: ["acmeplat", "acmeplat.cloud"] }, "acmeplat-hub": { topic: 154 } };
+  assert.deepEqual(projectsMentioned("The Acmeplat checkout copy is fixed", projects), ["ai"]);
+  assert.deepEqual(projectsMentioned("panel.acmeplat.cloud allowlist updated", projects), ["ai"]);
+  assert.deepEqual(projectsMentioned("acmeplat-hub caddy bound to loopback", projects), ["acmeplat-hub"]);
+  assert.deepEqual(projectsMentioned("we use ai for this", projects), []); // the common word alone is not the project
+  assert.deepEqual(projectsMentioned("Project: ai\nFix X", projects), ["ai"]);
+});
