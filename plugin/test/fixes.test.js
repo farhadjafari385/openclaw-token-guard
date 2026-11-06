@@ -302,3 +302,17 @@ test("triage: the same board state does not wake the orchestrator again", async 
   assert.equal(DEFAULT_TRIAGE.sameStateRewakeMinutes, 180);
   assert.equal(DEFAULT_TRIAGE.maxWakesPerDay, 24);
 });
+
+test("an owner request sent during a usage limit stays open until 6 hours after the reset", async () => {
+  const { askOpen, triageSnapshot } = await import("../triage.js");
+  const H = 3600000;
+  const sentAt = Date.UTC(2026, 10, 6, 7, 52);
+  const reset = Date.UTC(2026, 10, 7, 2, 0);
+  const held = { at: sentAt, topic: 1, text: "Do it, and send me the report", captured: false, heldUntil: reset };
+  const plain = { at: sentAt, topic: 1, text: "fix the login page", captured: false };
+  assert.equal(askOpen(held, reset + 5 * H), true); // 23 hours after it was sent, 5 after the reset
+  assert.equal(askOpen(held, reset + 7 * H), false);
+  assert.equal(askOpen(plain, sentAt + 7 * H), false); // without a limit: 6 hours as before
+  assert.equal(askOpen(Object.assign({}, held, { captured: true }), reset + H), false);
+  assert.match(triageSnapshot({ jobs: {}, ownerAsks: [held] }, [], reset + H), /Owner messages not on the board yet \(1\)/);
+});
