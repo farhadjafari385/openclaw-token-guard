@@ -10,12 +10,17 @@
   },
   "contracts": {
     "tools": [
-      "task_inbox"
+      "task_inbox",
+      "wake_orchestrator"
     ]
   },
   "toolMetadata": {
     "task_inbox": {
       "optional": true,
+      "sideEffecting": true
+    },
+    "wake_orchestrator": {
+      "optional": false,
       "sideEffecting": true
     }
   },
