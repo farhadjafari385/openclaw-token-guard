@@ -20,3 +20,21 @@ test("every named import from a local module exists in that module", async () =>
   }
   assert.deepEqual(broken, []);
 });
+
+test("every tool the plugin registers is declared in the manifest (OpenClaw refuses undeclared tools)", () => {
+  const dir = path.join(path.dirname(fileURLToPath(import.meta.url)), "..");
+  const src = fs.readFileSync(path.join(dir, "index.js"), "utf8");
+  const manifest = JSON.parse(fs.readFileSync(path.join(dir, "openclaw.plugin.json"), "utf8"));
+  const registered = new Set();
+  for (const m of src.matchAll(/api\.registerTool\(/g)) {
+    const after = src.slice(m.index, m.index + 4000);
+    const opt = /\},\s*\{\s*name:\s*"([\w-]+)"\s*\}\s*\)/.exec(after); // registerTool(factory, { name })
+    const own = /name:\s*"([\w-]+)"/.exec(after); // registerTool({ name, ... })
+    registered.add((opt && opt.index < after.indexOf("api.registerTool(", 1) >>> 0 ? opt : own)[1]);
+  }
+  assert.ok(registered.has("task_inbox") && registered.has("wake_orchestrator"), [...registered].join(","));
+  for (const name of registered) {
+    assert.ok(manifest.contracts.tools.includes(name), `${name} missing from contracts.tools`);
+    assert.ok(manifest.toolMetadata && manifest.toolMetadata[name], `${name} missing from toolMetadata`);
+  }
+});
