@@ -26,7 +26,7 @@ const ACTION_FIELDS = {
   add: ["project", "title", "type", "priority", "details", "done_when", "source", "owner", "size", "area"],
   list: ["status", "project"],
   plan: [],
-  set: ["status", "batch", "note", "owner", "size", "area", "done_when", "priority", "rank"],
+  set: ["status", "batch", "note", "owner", "size", "area", "done_when", "priority", "rank", "project"],
   show: [],
   approve: [],
   board: ["project"],
@@ -103,7 +103,7 @@ function loadInboxItems(file = inboxFile()) {
     const it = items.get(ev.id);
     if (!it) continue;
     if (ev.kind === "set") {
-      for (const key of ["owner", "size", "area", "done_when", "title", "priority"]) if (ev[key]) it[key] = ev[key];
+      for (const key of ["owner", "size", "area", "done_when", "title", "priority", "project"]) if (ev[key]) it[key] = ev[key];
       if ("rank" in ev) it.rank = Number(ev.rank) > 0 ? Number(ev.rank) : null; // the PM's queue position (0 clears it)
       if ("note" in ev) it.note = ev.note;
       if (ev.status) {
