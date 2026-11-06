@@ -3,7 +3,7 @@ import { definePluginEntry } from "openclaw/plugin-sdk/plugin-entry";
 import { Type } from "typebox";
 import { createState, decide } from "./guard.js";
 import { policyDecide, firstLine, itemsFromBrief, completeBrief, codexEnabled } from "./policy.js";
-import { isLimitBlock, normStatus, resultVerdict, nextAfterJob, renderBoard, renderOverview, auditBoard, parseApproval, looksLikeRequest } from "./board.js";
+import { isLimitBlock, normStatus, resultVerdict, nextAfterJob, queueState, renderBoard, renderOverview, auditBoard, parseApproval, looksLikeRequest } from "./board.js";
 import { correctTopic, isGeneral, projectOfTopic, projectsMentioned } from "./topics.js";
 import { isLimitError, isLimitReply, allowLimitReply, limitResetAt } from "./limits.js";
 import {
@@ -19,6 +19,7 @@ import { inboxArgs, loadInboxItems, runInbox } from "./inbox.js";
 import { processBoot } from "./boot.js";
 import { selectSkills, skillsLine } from "./skills.js";
 import { mergeTriageConfig, triageSnapshot, triageSignature, TRIAGE_PROMPT, parseTriage, triageWakeMessage } from "./triage.js";
+import { parseCiLink, ciRequest, ciState, failedParts, DEFAULT_CI } from "./ci.js";
 import fs from "node:fs";
 
 // No top-level await: OpenClaw loads plugin entries through require(), which
@@ -290,9 +291,10 @@ export default definePluginEntry({
 
     const runningItemIds = () => {
       const ids = new Set();
-      for (const j of Object.values(store.data.jobs)) if (j.status === "running") for (const id of j.items || []) ids.add(id);
+      for (const j of Object.values(store.data.jobs)) if (j.status === "running" || (j.waitFor && !j.waitFor.done)) for (const id of j.items || []) ids.add(id);
       return ids;
     };
+    const queueCfg = { wip: Number.isFinite(Number((cfg.board || {}).wip)) ? Number(cfg.board.wip) : 1, projectOrder: (cfg.board || {}).projectOrder || [] };
     const orcRunCalls = new Map(); // orchestrator run id -> tool calls so far
     const countOrcCall = (runId) => {
       if (!runId) return;
@@ -313,6 +315,7 @@ export default definePluginEntry({
         return job && job.status === "running" ? job : null;
       },
       runCalls: (runId) => (runId && orcRunCalls.get(runId)) || 0,
+      queue: () => queueState(loadInboxItems(), { wip: queueCfg.wip, projectOrder: queueCfg.projectOrder }),
       onBlock: (rule, info) => {
         if (["protectedFile", "protectedConfig", "backChannel", "spawnByWorker", "sendByWorker", "orchestratorOnly", "modelPin"].includes(rule)) {
           systemNote(`${rule}:${info.agentId}`, guardText(voice, rule, info), { html: true });
@@ -526,7 +529,12 @@ export default definePluginEntry({
         // Proof that is cited must exist: a PASS resting on missing screenshots is no proof.
         const missing = missingProof(cur.resultText, (f) => fs.existsSync(f.replace(/^~/, process.env.HOME || "")));
         if (missing.length) { cur.missingEvidence = missing; store.touch(); }
-        const verdict = resultVerdict(cur.resultText, cur.outcome);
+        let verdict = resultVerdict(cur.resultText, cur.outcome);
+        if (verdict === "waiting") {
+          const link = parseCiLink(cur.resultText);
+          if (link) { cur.waitFor = Object.assign(link, { since: Date.now() }); store.touch(); store.save(); }
+          else verdict = "unknown";
+        }
         const board = loadInboxItems();
         const plan = (cur.items || []).filter((id) => board.has(id)).map((id) => {
           const before = normStatus(board.get(id).status);
@@ -700,6 +708,8 @@ export default definePluginEntry({
         try { await resumeLimitBlocked(inboxItems); } catch (error) { log("warn", "token-guard resume failed", { error: String(error && error.message) }); }
       }
       try { await triageTick(inboxItems); } catch (error) { log("warn", "token-guard triage failed", { error: String(error && error.message) }); }
+      try { await ciTick(inboxItems); } catch (error) { log("warn", "token-guard CI watch failed", { error: String(error && error.message) }); }
+      try { writeQueue(inboxItems); } catch (error) { log("warn", "token-guard queue file failed", { error: String(error && error.message) }); }
       store.touch();
       store.save();
       for (const action of actions) {
@@ -721,6 +731,83 @@ export default definePluginEntry({
           }
         }
       }
+    };
+    // ---- the CI watch: pipelines are followed by code, not by a model waiting in its session ----
+    const ciCfg = Object.assign({}, DEFAULT_CI, jobsCfg.ci || {});
+    const home = process.env.HOME || "";
+    const readToken = (file) => { try { return file ? fs.readFileSync(String(file).replace(/^~/, home), "utf8").trim() : ""; } catch { return ""; } };
+    const ciFetch = async (req) => {
+      const headers = { Accept: "application/json", "User-Agent": "token-guard" };
+      const token = readToken(req.host === "gitlab" ? ciCfg.gitlabTokenFile : ciCfg.githubTokenFile);
+      if (token && req.host === "gitlab") headers["PRIVATE-TOKEN"] = token;
+      if (token && req.host === "github") headers.Authorization = `Bearer ${token}`;
+      const r = await fetch(req.url, { headers, signal: AbortSignal.timeout(20000) });
+      if (!r.ok) throw new Error(`HTTP ${r.status} from ${req.host}`);
+      return r.json();
+    };
+    const ciTick = async (inboxItems) => {
+      const now = Date.now();
+      const board = new Map(inboxItems.map((it) => [it.id, it]));
+      for (const job of Object.values(store.data.jobs)) {
+        const w = job.waitFor;
+        if (!w || w.done || now - (w.checkedAt || 0) < ciCfg.pollSeconds * 1000) continue;
+        w.checkedAt = now;
+        store.touch();
+        let state = "running";
+        let parts = [];
+        try {
+          const body = await ciFetch(ciRequest(w));
+          const checks = w.kind === "github-pr" && body && body.head && body.head.sha
+            ? await ciFetch({ host: "github", url: `https://api.github.com/repos/${w.repo}/commits/${body.head.sha}/check-runs?per_page=100` }) : null;
+          state = ciState(w, body, checks);
+          parts = failedParts(w, body, checks);
+        } catch (error) {
+          w.errors = (w.errors || 0) + 1;
+          log("warn", "token-guard CI watch could not read the pipeline", { url: w.url, error: String(error && error.message) });
+          if (w.errors < 5) continue;
+          state = "unreadable";
+        }
+        if (state === "running" && now - (w.since || now) < ciCfg.maxWaitMinutes * 60000) continue;
+        const outcome = state === "running" ? "still running" : state;
+        w.done = { state: outcome, at: now };
+        const verdict = outcome === "success" ? "done" : outcome === "failed" ? "failed" : "unknown";
+        const plan = (job.items || []).filter((id) => board.has(id))
+          .map((id) => { const before = normStatus(board.get(id).status); return { id, before, to: nextAfterJob(before, job.agentId, verdict) }; })
+          .filter((m) => m.to !== m.before);
+        await Promise.all(plan.map((m) => systemMove(m.id, m.to, `CI ${outcome}: ${w.url} [job ${job.short || ""}]`)));
+        refreshItems(job.items || []);
+        store.save();
+        const moved = plan.map((m) => `${m.id} → ${m.to}`).join(", ") || "no board change";
+        const todo = outcome === "success" ? "Dispatch the next gate on the same item."
+          : outcome === "failed" ? `Dispatch ${job.agentId} again on the same item to fix it${parts.length ? ` (failed: ${parts.join(", ")})` : ""}; give it the pipeline link.`
+            : "Open the pipeline yourself and decide (it did not finish in time or could not be read).";
+        log("info", "token-guard CI watch: pipeline finished", { url: w.url, outcome, moved });
+        post(orchestrator, job.topic || "system", `🔁 CI ${outcome === "success" ? "passed ✅" : outcome === "failed" ? "failed ❌" : outcome} for <b>${String(job.label || "").replace(/[<>&]/g, "")}</b>: ${moved}`, { html: true, replyTo: job.resultMsgId || null });
+        const day = new Date(now).toISOString().slice(0, 10);
+        store.data.wakesByDay[day] = (store.data.wakesByDay[day] || 0) + 1;
+        if (api.runtime && api.runtime.subagent && typeof api.runtime.subagent.run === "function") {
+          await api.runtime.subagent.run({ sessionKey: jobsCfg.idleWakeSession, deliver: false,
+            message: `[ci] The pipeline of "${job.label}" ended: ${outcome} (${w.url}). Board: ${moved}. ${todo} One item at a time: this item stays in hand until it is Done or Blocked.` })
+            .catch((error) => log("warn", "token-guard could not wake the orchestrator after CI", { error: String(error && error.message) }));
+        }
+      }
+    };
+    // The queue for the team's UI and anyone reading the state: the item in hand and what comes next.
+    let lastQueue = "";
+    const writeQueue = (inboxItems) => {
+      const q = queueState(inboxItems, queueCfg);
+      const brief = (it) => ({ id: it.id, project: it.project, title: it.title, status: normStatus(it.status), owner: it.owner, rank: it.rank || null, priority: it.priority });
+      const waits = Object.values(store.data.jobs).filter((j) => j.waitFor && !j.waitFor.done).map((j) => ({ items: j.items || [], url: j.waitFor.url, since: j.waitFor.since }));
+      const out = JSON.stringify({ wip: q.wip, inHand: q.active.map(brief), next: q.next.map(brief), queue: q.queue.slice(0, 40).map(brief), ciWaits: waits }, null, 1);
+      if (out === lastQueue) return;
+      lastQueue = out;
+      fs.writeFileSync(String(jobsCfg.stateFile).replace(/^~/, home).replace(/[^/]+$/, "queue.json"), out);
+    };
+    const queueText = () => {
+      const q = queueState(loadInboxItems(), queueCfg);
+      const line = (it, i) => `${i + 1}. ${it.id} [${normStatus(it.status)}] ${it.project || "?"}: ${String(it.title || "").slice(0, 80)} (owner ${it.owner || "?"}${it.rank ? `, rank ${it.rank}` : ""}${it.priority && it.priority !== "normal" ? `, ${it.priority}` : ""})`;
+      return [`In hand (${q.active.length} of ${q.wip}):`, ...(q.active.length ? q.active.map(line) : ["- nothing"]),
+        "Next in the queue:", ...(q.queue.length ? q.queue.slice(0, 15).map(line) : ["- To do is empty"])].join("\n");
     };
     const auditTick = async (inboxItems) => {
       const now = Date.now();
@@ -873,14 +960,16 @@ export default definePluginEntry({
         "One inbox for all incoming tasks and bugs. add: record one item (project, title, owner, size, area, type, priority, details, done_when, source). " +
         "list: show items. plan: group open items into sessions: every medium or large item gets its own fresh session; small items of the " +
         "same project, owner and area share one (max 4); flags items that need info. " +
-        "set: change an item's status (open|planned|dispatched|done|blocked|dropped), owner, size or area. show: one item.",
+        "set: change an item's status, owner, size, area, priority or rank (the PM keeps the queue's order with rank). show: one item. " +
+        "queue: the item in hand and the order of the queue (one item at a time).",
       parameters: Type.Object({
-        action: Type.String({ description: "add | list | plan | set | show" }),
+        action: Type.String({ description: "add | list | plan | set | show | queue" }),
         id: text("Item id for set/show."),
         project: text("Project name (add, list filter)."),
         title: text("One-line title (add)."),
         type: text("bug | task | feature | question (add)."),
-        priority: text("low | normal | high | urgent (add)."),
+        priority: text("low | normal | high | urgent (add, set)."),
+        rank: text("Queue position, set by the PM: 1 = next, 2 = after that (set)."),
         details: text("What is wrong or wanted; expected vs actual (add)."),
         done_when: text("Exact checks that prove it is done (add)."),
         source: text("Where it came from, e.g. a message id (add)."),
@@ -893,6 +982,7 @@ export default definePluginEntry({
         json: Type.Optional(Type.Boolean({ description: "JSON output for list/plan." })),
       }),
       async execute(_id, params) {
+        if (params && String(params.action || "") === "queue") return { content: [{ type: "text", text: queueText() }], details: { ok: true } };
         let args;
         try {
           args = inboxArgs(params);

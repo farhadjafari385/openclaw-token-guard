@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { normStatus, canMove, resultVerdict, nextAfterJob, renderBoard, renderOverview, auditBoard, parseApproval, looksLikeRequest } from "../board.js";
+import { normStatus, canMove, resultVerdict, nextAfterJob, renderBoard, renderOverview, auditBoard, parseApproval, looksLikeRequest, queueState } from "../board.js";
 import { projectsMentioned, correctTopic } from "../topics.js";
 import { policyDecide, itemsFromBrief } from "../policy.js";
 
@@ -146,4 +146,53 @@ test("policy: a code task writes only inside its project", () => {
   assert.equal(w("/srv/projects/demo/src/a.ts"), undefined);
   assert.equal(w("/tmp/x.txt"), undefined);
   assert.equal(w("/srv/projects/other/a.ts").rule, "outOfTask");
+});
+
+test("the queue: one item at a time, in the PM's order (rank, then the owner's project order, priority, age)", async () => {
+  const { queueState, queueOrder } = await import("../board.js");
+  const order = ["shop", "hub", "game", "demo-ui"];
+  const items = [
+    { id: "aaaaaaa1", project: "demo-ui", status: "todo", created_ts: "2026-11-01" },
+    { id: "aaaaaaa2", project: "game", status: "todo", created_ts: "2026-11-02" },
+    { id: "aaaaaaa3", project: "shop", status: "todo", priority: "low", created_ts: "2026-11-03" },
+    { id: "aaaaaaa4", project: "shop", status: "todo", priority: "urgent", created_ts: "2026-11-04" },
+    { id: "aaaaaaa5", project: "demo-ui", status: "todo", rank: 1, created_ts: "2026-11-05" }, // the PM put it first
+    { id: "aaaaaaa6", project: "shop", status: "backlog" }, // not in the queue until the PM moves it to To do
+  ];
+  assert.deepEqual(queueOrder(items, order).map((i) => i.id), ["aaaaaaa5", "aaaaaaa4", "aaaaaaa3", "aaaaaaa2", "aaaaaaa1"]);
+  let q = queueState(items, { wip: 1, projectOrder: order });
+  assert.deepEqual(q.next.map((i) => i.id), ["aaaaaaa5"]);
+  q = queueState([...items, { id: "aaaaaaa7", project: "shop", status: "review" }], { wip: 1, projectOrder: order });
+  assert.deepEqual(q.active.map((i) => i.id), ["aaaaaaa7"]);
+  assert.deepEqual(q.next, []); // one in hand: nothing new starts
+});
+
+test("policy: a dispatch is the next gate of the item in hand, or the head of the queue", () => {
+  const items = new Map([
+    ["a1b2c3d4", { id: "a1b2c3d4", project: "demo", status: "todo", rank: 2, title: "second" }],
+    ["b1b2c3d4", { id: "b1b2c3d4", project: "demo", status: "todo", rank: 1, title: "first" }],
+    ["c1b2c3d4", { id: "c1b2c3d4", project: "demo", status: "review", title: "in hand" }],
+  ]);
+  const ps = (board) => ({ boardItems: () => board, runningItemIds: () => new Set(), queue: () => queueState(board, { wip: 1 }) });
+  const spawn = (id, agentId = "writer") => ({ toolName: "sessions_spawn", params: { agentId, task: `Project: demo (/srv/demo)\nScope: x\nItems:\n${id}\nDone when: tests pass\nStop if: y` } });
+  // something is in hand: only its next gate may start
+  assert.equal(policyDecide(spawn("b1b2c3d4"), COORD, ps(items), CFG).rule, "queueBusy");
+  assert.equal(policyDecide(spawn("c1b2c3d4", "reviewer"), COORD, ps(items), CFG).params.cleanup, "delete");
+  // nothing in hand: only the head of the queue may start
+  const free = new Map([...items].filter(([id]) => id !== "c1b2c3d4"));
+  const early = policyDecide(spawn("a1b2c3d4"), COORD, ps(free), CFG);
+  assert.equal(early.rule, "queueOrder");
+  assert.match(early.blockReason, /Next: b1b2c3d4 "first"/);
+  assert.equal(policyDecide(spawn("b1b2c3d4"), COORD, ps(free), CFG).params.cleanup, "delete");
+  // the queue can be turned off (wip 0)
+  assert.equal(policyDecide(spawn("a1b2c3d4"), COORD, ps(free), Object.assign({}, CFG, { board: { wip: 0 } })).params.cleanup, "delete");
+});
+
+test("a worker that pushed reports waiting: the item stays where it is until its pipeline ends", () => {
+  assert.equal(resultVerdict("Pushed and opened the MR.\nRESULT: waiting for CI https://gitlab.com/g/p/-/pipelines/12"), "waiting");
+  assert.equal(nextAfterJob("in_progress", "writer", "waiting"), "in_progress");
+  assert.equal(nextAfterJob("review", "reviewer", "waiting"), "review");
+  assert.equal(nextAfterJob("in_progress", "writer", "done"), "review"); // what the CI watch applies on green
+  assert.equal(nextAfterJob("review", "reviewer", "done"), "qa");
+  assert.equal(nextAfterJob("in_progress", "writer", "failed"), "todo"); // on red: back to the head of the queue
 });

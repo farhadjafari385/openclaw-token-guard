@@ -48,6 +48,8 @@ function resultVerdict(text, outcome) {
   const v = m ? m[1].trim().toLowerCase() : "";
   if (/^(done|approved|pass|passed|merged|released|shipped|complete|completed)\b/.test(v)) return "done";
   if (/^blocked\b/.test(v)) return "blocked";
+  // Pushed and handed to CI: the guard watches the pipeline, so the worker does not wait in its session.
+  if (/^(waiting|pending|awaiting)\b/.test(v)) return "waiting";
   if (/^(changes requested|fail|failed|partly|partially|partial|not done)\b/.test(v)) return "failed";
   return "unknown"; // no clear verdict (or no text captured): the orchestrator checks it in Review
 }
@@ -62,12 +64,43 @@ function nextAfterJob(before, role, verdict) {
   const s = normStatus(before);
   if (!AUTO_FROM.has(s)) return s;
   if (verdict === "blocked") return "blocked";
+  if (verdict === "waiting") return s; // stays where it is until its pipeline ends (the CI watch moves it)
   if (verdict === "failed") return "todo";
   if (verdict !== "done") return "review"; // no clear verdict: the orchestrator checks it
   if (role === "reviewer") return "qa";
   if (role === "qa") return "done";
   if (role === "devops" && s === "qa") return "done"; // release after QA
   return "review";
+}
+
+// ---- the queue: one item at a time, in the order the PM keeps ----
+// Items in In progress, Review or QA are the work in hand; To do is the queue. The order: the PM's rank
+// (1 first; unranked after), then the project order the owner set, then priority, then age.
+const ACTIVE = new Set(["in_progress", "review", "qa"]);
+const PRIORITY_RANK = { urgent: 0, high: 1, normal: 2, low: 3 };
+
+function queueOrder(items, projectOrder = []) {
+  const list = [...(items instanceof Map ? items.values() : items || [])].filter((it) => normStatus(it.status) === "todo");
+  const order = (projectOrder || []).map((p) => String(p).toLowerCase());
+  const projectIndex = (it) => {
+    const i = order.indexOf(String(it.project || "").toLowerCase());
+    return i < 0 ? order.length : i;
+  };
+  const rank = (it) => (Number(it.rank) > 0 ? Number(it.rank) : Infinity);
+  return list.sort((a, b) =>
+    rank(a) - rank(b) ||
+    projectIndex(a) - projectIndex(b) ||
+    (PRIORITY_RANK[a.priority] ?? 2) - (PRIORITY_RANK[b.priority] ?? 2) ||
+    String(a.created_ts || "").localeCompare(String(b.created_ts || "")));
+}
+
+// The work in hand and what may start next: with `wip` items in hand nothing new starts.
+function queueState(items, { wip = 1, projectOrder = [] } = {}) {
+  const all = [...(items instanceof Map ? items.values() : items || [])];
+  const active = all.filter((it) => ACTIVE.has(normStatus(it.status)));
+  const queue = queueOrder(all, projectOrder);
+  const free = wip > 0 ? Math.max(0, wip - active.length) : queue.length;
+  return { wip, active, queue, next: queue.slice(0, free) };
 }
 
 const SHORT = {
@@ -168,5 +201,6 @@ function looksLikeRequest(text) {
 
 export {
   COLUMNS, LEGACY, LABELS, TRANSITIONS, DISPATCHABLE, OPEN, AUTO_FROM, FAILED_OUTCOMES,
+  ACTIVE, queueOrder, queueState,
   isLimitBlock, normStatus, canMove, resultVerdict, nextAfterJob, renderBoard, renderOverview, auditBoard, parseApproval, looksLikeRequest,
 };

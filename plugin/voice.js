@@ -145,7 +145,7 @@ function ackText(_cfg, job) {
   return esc(pick(ACKS, `${job.key || job.short || ""}:ack`));
 }
 
-const HEADS = { done: "✅ Done", blocked: "⛔ I'm blocked", failed: "❌ Not done yet", unknown: "📝 Finished, please check" };
+const HEADS = { done: "✅ Done", blocked: "⛔ I'm blocked", failed: "❌ Not done yet", waiting: "⏳ Pushed, CI is running (the guard watches it)", unknown: "📝 Finished, please check" };
 
 function resultText(cfg, job, verdict, moves = []) {
   const mins = Number.isFinite(job.endedAt) && Number.isFinite(job.spawnedAt) ? Math.max(1, Math.round((job.endedAt - job.spawnedAt) / 60000)) : null;

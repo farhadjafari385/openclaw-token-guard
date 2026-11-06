@@ -48,7 +48,8 @@ const DEFAULT_POLICY = {
   },
   orchestratorOnly: { enabled: true },
   pins: { enabled: true },
-  board: { enabled: true, requireItems: true, agent: "product" }, // agent = the PM, who may also edit the board
+  // agent = the PM, who may also edit the board and keeps the queue's order; wip = items in hand at once (0 = no queue)
+  board: { enabled: true, requireItems: true, agent: "product", wip: 1, projectOrder: [] },
   topics: { enabled: true, chatId: "", teamTopic: 160 },
   taskPaths: { enabled: true, roles: ["writer", "designer", "qa", "reviewer"] },
   projects: {}, // { name: { topic, path, aliases, strict } }
@@ -625,6 +626,23 @@ function policyDecide(event, ctx, pstate, rawConfig, log, now = Date.now()) {
       const itemProject = [...projects][0];
       if (briefProject && itemProject && !itemProject.includes(briefProject) && !briefProject.includes(itemProject) && projectName(policy, itemProject) !== briefProject) {
         return block("projectMismatch", `token-guard: the brief says Project ${briefProject} but its items are ${itemProject}. Fix the brief or the items.`);
+      }
+      // The queue: one item at a time, in the PM's order. The item in hand gets its next gate; a new
+      // item starts only when nothing is in hand, and only the one at the head of the queue.
+      if (typeof pstate.queue === "function" && Number(policy.board.wip) > 0) {
+        const q = pstate.queue();
+        const inHand = new Set(q.active.map((it) => it.id));
+        const fresh = ids.filter((id) => !inHand.has(id));
+        const name = (it) => `${it.id} "${String(it.title || "").slice(0, 60)}" (${normStatus(it.status)})`;
+        if (fresh.length && q.active.length >= q.wip) {
+          return block("queueBusy", `token-guard: one item at a time. ${q.active.map(name).join(", ")} is in hand: take it to Done (dispatch its next gate) or Blocked (with the reason) before anything new starts.`);
+        }
+        const allowed = new Set(q.next.map((it) => it.id));
+        const early = fresh.filter((id) => !allowed.has(id));
+        if (early.length) {
+          const head = q.next.length ? q.next.map(name).join(", ") : "nothing (To do is empty: the PM moves the next item from Backlog to To do)";
+          return block("queueOrder", `token-guard: ${early.join(", ")} is not next in the queue. Next: ${head}. The PM keeps the order (task_inbox set: rank, priority).`);
+        }
       }
     }
     // A deploy is restarting the gateway: a task started now would be cut off by the restart.

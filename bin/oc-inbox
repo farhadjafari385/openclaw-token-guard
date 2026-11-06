@@ -121,6 +121,7 @@ def fold_state(events):
                 "title": ev.get("title"),
                 "type": ev.get("type", "task"),
                 "priority": ev.get("priority", "normal"),
+                "rank": None,
                 "details": ev.get("details"),
                 "done_when": ev.get("done_when"),
                 "source": ev.get("source"),
@@ -140,9 +141,11 @@ def fold_state(events):
             continue
         elif kind == "set":
             it = items[item_id]
-            for key in ("owner", "size", "area", "done_when", "title"):
+            for key in ("owner", "size", "area", "done_when", "title", "priority"):
                 if ev.get(key):
                     it[key] = ev[key]
+            if "rank" in ev:  # the PM's queue position (1 = next); 0 clears it
+                it["rank"] = ev["rank"] or None
             if "batch" in ev:
                 it["batch"] = ev["batch"]
             if "note" in ev:
@@ -324,9 +327,14 @@ def cmd_set(args):
         event["batch"] = args.batch
     if args.note is not None:
         event["note"] = args.note
-    for key in ("owner", "size", "area", "done_when", "title"):
+    for key in ("owner", "size", "area", "done_when", "title", "priority"):
         if getattr(args, key, None):
             event[key] = getattr(args, key)
+    if args.rank is not None:
+        if args.rank < 0:
+            print("oc-inbox: --rank is a queue position (1 = next) or 0 to clear it", file=sys.stderr)
+            return 2
+        event["rank"] = args.rank
     append_event(path, event)
     print(args.id)
     return 0
@@ -420,6 +428,8 @@ def main(argv):
     p_set.add_argument("--area")
     p_set.add_argument("--done-when")
     p_set.add_argument("--title")
+    p_set.add_argument("--priority", choices=PRIORITIES)
+    p_set.add_argument("--rank", type=int, help="queue position set by the PM: 1 = next, 0 clears it")
     p_set.add_argument("--by", default="agent", help="who moves it; 'system' (token-guard) may make any move except archiving")
     p_set.set_defaults(func=cmd_set)
 

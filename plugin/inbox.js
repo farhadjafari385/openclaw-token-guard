@@ -20,12 +20,13 @@ const INBOX_FLAGS = {
   owner: "--owner",
   size: "--size",
   area: "--area",
+  rank: "--rank",
 };
 const ACTION_FIELDS = {
   add: ["project", "title", "type", "priority", "details", "done_when", "source", "owner", "size", "area"],
   list: ["status", "project"],
   plan: [],
-  set: ["status", "batch", "note", "owner", "size", "area", "done_when"],
+  set: ["status", "batch", "note", "owner", "size", "area", "done_when", "priority", "rank"],
   show: [],
   approve: [],
   board: ["project"],
