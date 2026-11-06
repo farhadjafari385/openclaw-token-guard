@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import os from "node:os";
-import { policyDecide, isProtectedPath, mergePolicy, writesProtected, orchestratorMutation } from "../policy.js";
+import { policyDecide, isProtectedPath, mergePolicy, writesProtected, orchestratorMutation, DEFAULT_POLICY } from "../policy.js";
 
 const H = os.homedir();
 const COORD = { agentId: "coordinator", sessionKey: "agent:coordinator:telegram:group:-100:topic:151" };
@@ -182,4 +182,11 @@ test("git safety: no hook bypass, no direct pushes to protected branches (every 
   for (const cmd of ["git push origin agent/123-main-fix", "git push -u origin agent/abc", "git config --get core.hooksPath", "git log main..HEAD"]) {
     assert.equal(policyDecide(exec(cmd), DEVOPS, {}, {}), undefined, cmd);
   }
+});
+
+test("every setting the policy reads is allowed by the plugin's config schema (OpenClaw refuses unknown keys)", async () => {
+  const fs = await import("node:fs");
+  const schema = JSON.parse(fs.readFileSync(new URL("../openclaw.plugin.json", import.meta.url), "utf8")).configSchema;
+  assert.deepEqual(Object.keys(DEFAULT_POLICY).filter((k) => !(k in schema.properties)), []);
+  for (const k of ["jobs", "triage", "skills", "mirror", "topics", "board", "projects"]) assert.ok(k in schema.properties, k);
 });

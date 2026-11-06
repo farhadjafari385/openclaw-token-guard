@@ -152,6 +152,11 @@
       "orchestratorAgent": {
         "type": "string"
       },
+      "orchestratorMaxCallsPerRun": {
+        "type": "integer",
+        "minimum": 0,
+        "description": "Tool calls one orchestrator run may make; after that only a message to the owner is allowed (0 = no limit)."
+      },
       "workspaceRoot": {
         "type": "string"
       },
