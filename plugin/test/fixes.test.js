@@ -169,3 +169,13 @@ test("a brief missing required lines is completed from its board items instead o
     { agentId: "coordinator", sessionKey: "agent:coordinator:main" }, createState(), {}, null, Date.now());
   assert.notEqual(r && r.rule, "briefFields");
 });
+
+test("no dispatch while a deploy restarts the gateway", () => {
+  const now = Date.now();
+  const COORD = { agentId: "coordinator", sessionKey: ORC };
+  const task = { toolName: "sessions_spawn", params: { agentId: "devops", task: "Project: demo\nFix CI", label: "demo: x" } };
+  const r = policyDecide(task, COORD, { maintenanceSince: () => now - 60000 }, {}, null, now);
+  assert.equal(r.rule, "maintenance");
+  assert.notEqual((policyDecide(task, COORD, { maintenanceSince: () => now - 40 * 60000 }, {}, null, now) || {}).rule, "maintenance"); // stale flag ignored
+  assert.notEqual((policyDecide(task, COORD, { maintenanceSince: () => 0 }, {}, null, now) || {}).rule, "maintenance");
+});

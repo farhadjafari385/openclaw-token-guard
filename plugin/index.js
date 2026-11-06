@@ -286,6 +286,10 @@ export default definePluginEntry({
     const pstate = {
       get claudeLimitedUntil() { return store.data.claudeLimitedUntil || 0; },
       get codexLimitedUntil() { return store.data.codexLimitedUntil || 0; },
+      // The deploy script touches this file before it stops the gateway (and removes it once it is back).
+      maintenanceSince: () => {
+        try { return fs.statSync(String(jobsCfg.stateFile).replace(/^~/, process.env.HOME || "").replace(/[^/]+$/, "maintenance")).mtimeMs; } catch { return 0; }
+      },
       boardItems: () => loadInboxItems(),
       runningItemIds,
       jobFor: (sessionKey) => {

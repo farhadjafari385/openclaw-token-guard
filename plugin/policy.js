@@ -600,6 +600,13 @@ function policyDecide(event, ctx, pstate, rawConfig, log, now = Date.now()) {
         return block("projectMismatch", `token-guard: the brief says Project ${briefProject} but its items are ${itemProject}. Fix the brief or the items.`);
       }
     }
+    // A deploy is restarting the gateway: a task started now would be cut off by the restart.
+    if (pstate && typeof pstate.maintenanceSince === "function") {
+      const since = pstate.maintenanceSince();
+      if (since && now - since < 30 * 60000) {
+        return block("maintenance", "token-guard: the gateway is being restarted for maintenance, so a task started now would be cut off. Do not dispatch now and leave the items as they are: the job tracker wakes you again once the gateway is back.");
+      }
+    }
     const claudeUntil = (pstate && pstate.claudeLimitedUntil) || 0;
     const codexUntil = (pstate && pstate.codexLimitedUntil) || 0;
     if (claudeUntil > now && codexUntil > now) {
