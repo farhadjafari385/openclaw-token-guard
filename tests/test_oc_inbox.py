@@ -41,6 +41,11 @@ class TestOcInbox(unittest.TestCase):
         self.assertEqual(run(["set", item_id, "--rank", "-2"], self.inbox_file).returncode, 2)
         self.assertNotEqual(run(["set", item_id, "--priority", "huge"], self.inbox_file).returncode, 0)
 
+    def test_set_moves_an_item_to_another_project(self):
+        item_id = run(["add", "--project", "Shop SEO", "--title", "Landing pages live"], self.inbox_file).stdout.strip()
+        self.assertEqual(run(["set", item_id, "--project", "shop"], self.inbox_file).returncode, 0)
+        self.assertEqual(json.loads(run(["list", "--json"], self.inbox_file).stdout)[0]["project"], "shop")
+
     def test_add_and_list(self):
         p = run(["add", "--project", "demo", "--title", "Do the thing", "--priority", "high",
                  "--done-when", "it is done"], self.inbox_file)

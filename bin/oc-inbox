@@ -141,7 +141,7 @@ def fold_state(events):
             continue
         elif kind == "set":
             it = items[item_id]
-            for key in ("owner", "size", "area", "done_when", "title", "priority"):
+            for key in ("owner", "size", "area", "done_when", "title", "priority", "project"):
                 if ev.get(key):
                     it[key] = ev[key]
             if "rank" in ev:  # the PM's queue position (1 = next); 0 clears it
@@ -327,7 +327,7 @@ def cmd_set(args):
         event["batch"] = args.batch
     if args.note is not None:
         event["note"] = args.note
-    for key in ("owner", "size", "area", "done_when", "title", "priority"):
+    for key in ("owner", "size", "area", "done_when", "title", "priority", "project"):
         if getattr(args, key, None):
             event[key] = getattr(args, key)
     if args.rank is not None:
@@ -429,6 +429,7 @@ def main(argv):
     p_set.add_argument("--done-when")
     p_set.add_argument("--title")
     p_set.add_argument("--priority", choices=PRIORITIES)
+    p_set.add_argument("--project", help="move the item to another project (its canonical name)")
     p_set.add_argument("--rank", type=int, help="queue position set by the PM: 1 = next, 0 clears it")
     p_set.add_argument("--by", default="agent", help="who moves it; 'system' (token-guard) may make any move except archiving")
     p_set.set_defaults(func=cmd_set)

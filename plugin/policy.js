@@ -357,6 +357,20 @@ function itemsFromBrief(text) {
   return [...new Set(out)];
 }
 
+// The project-name contract: a project is named only by its canonical name or one of its aliases
+// (projects config, from projects.toml). Returns the canonical name, or "" for an unknown name.
+// Matching is exact (case and a trailing "(path)" ignored), never a guess from free text.
+function canonicalProject(policy, name) {
+  const want = String(name || "").replace(/\(.*$/, "").trim().toLowerCase();
+  if (!want) return "";
+  for (const [canon, p] of Object.entries(policy.projects || {})) {
+    if (canon.toLowerCase() === want) return canon;
+    if (((p && p.aliases) || []).some((a) => String(a).toLowerCase() === want)) return canon;
+  }
+  return "";
+}
+const projectList = (policy) => Object.keys(policy.projects || {}).join(", ");
+
 function projectName(policy, line) {
   const names = projectsMentioned(` project: ${line} `, policy.projects);
   return names[0] || "";
@@ -564,6 +578,7 @@ function policyDecide(event, ctx, pstate, rawConfig, log, now = Date.now()) {
   }
 
   // 5. The board: everyone reads it; only the orchestrator and the PM change it; only the orchestrator approves.
+  let boardProject = "";
   if (policy.board.enabled && tool === "task_inbox") {
     const action = String(params.action || "");
     if (!["list", "show", "board", "plan"].includes(action)) {
@@ -574,6 +589,13 @@ function policyDecide(event, ctx, pstate, rawConfig, log, now = Date.now()) {
         return block("boardWrite", "token-guard: only the orchestrator and the PM change the board. Put your status in your final answer: the board moves automatically when your task ends.");
       }
       // One request = one item for its whole life: retries and gates move the same item.
+      if ((action === "add" || (action === "set" && params.project)) && Object.keys(policy.projects || {}).length) {
+        const canon = canonicalProject(policy, params.project);
+        if (!canon) {
+          return block("unknownProject", `token-guard: "${params.project || ""}" is not a project name. Use exactly one of: ${projectList(policy)}.`);
+        }
+        if (canon !== params.project) boardProject = canon;
+      }
       if (action === "add") {
         const title = String(params.title || "");
         if (GATE_TITLE.test(title)) {
@@ -587,6 +609,8 @@ function policyDecide(event, ctx, pstate, rawConfig, log, now = Date.now()) {
       }
     }
   }
+
+  if (boardProject) return { params: Object.assign({}, params, { project: boardProject }) }; // stored by its canonical name
 
   // 6. Topics: a group post goes to the topic of the project it is about (or the team topic), never General.
   if (policy.topics.enabled && tool === "message" && policy.topics.chatId) {
@@ -643,6 +667,16 @@ function policyDecide(event, ctx, pstate, rawConfig, log, now = Date.now()) {
     if (wantThinking && !(policy.spawn.allowedThinking || []).includes(String(wantThinking).toLowerCase())) {
       return block("spawnThinking", `token-guard: thinking "${wantThinking}" is not allowed. Use one of: ${(policy.spawn.allowedThinking || []).join(", ")}.`);
     }
+    // The project-name contract: the brief's Project line names a known project (an alias becomes its name).
+    let task = params.task;
+    if (Object.keys(policy.projects || {}).length) {
+      const line = firstLine(params.task, "Project");
+      const canon = canonicalProject(policy, line);
+      if (!canon) {
+        return block("unknownProject", `token-guard: the brief's Project line ("${line}") is not a project name. Use exactly one of: ${projectList(policy)}.`);
+      }
+      if (canon !== line.replace(/\(.*$/, "").trim()) task = String(params.task).replace(/^([\s>*#_\-]*Project\s*:?[ \t]*)[^(\n]*/im, `$1${canon} `);
+    }
     if (policy.board.enabled && policy.board.requireItems && pstate && typeof pstate.boardItems === "function") {
       const board = pstate.boardItems();
       const ids = itemsFromBrief(params.task).filter((id) => board.has(id));
@@ -696,7 +730,7 @@ function policyDecide(event, ctx, pstate, rawConfig, log, now = Date.now()) {
     if (claudeUntil > now && codexUntil > now) {
       return block("bothLimited", `token-guard: Claude (until ${at(claudeUntil)} UTC) and Codex (until ${at(codexUntil)} UTC) are both at their usage limits, so this task would fail at once. Do not dispatch now and leave its items in To do: the job tracker wakes you again once a limit has reset.`);
     }
-    const input = Object.assign({}, params);
+    const input = Object.assign({}, params, { task });
     if (wantModel) input.model = wantModel;
     if (wantThinking) input.thinking = wantThinking;
     if (input.model) input.model = normaliseModel(input.model, allowed);
@@ -711,6 +745,7 @@ function policyDecide(event, ctx, pstate, rawConfig, log, now = Date.now()) {
 }
 
 export {
+  canonicalProject,
   briefSetting,
   CHECK_COMMAND,
   GIT_PUSH,

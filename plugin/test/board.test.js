@@ -196,3 +196,31 @@ test("a worker that pushed reports waiting: the item stays where it is until its
   assert.equal(nextAfterJob("review", "reviewer", "done"), "qa");
   assert.equal(nextAfterJob("in_progress", "writer", "failed"), "todo"); // on red: back to the head of the queue
 });
+
+test("the project-name contract: only canonical names and their aliases; aliases are stored as the name", async () => {
+  const { canonicalProject } = await import("../policy.js");
+  const P = { projects: { shop: { topic: 153, aliases: ["shopsite", "shop.example"] }, team: { topic: 160, aliases: ["general"] } } };
+  assert.equal(canonicalProject(P, "shop"), "shop");
+  assert.equal(canonicalProject(P, "Shop.Example"), "shop");
+  assert.equal(canonicalProject(P, "shopsite (/srv/shop)"), "shop");
+  assert.equal(canonicalProject(P, "Shop SEO"), ""); // not a name: never guessed from free text
+  assert.equal(canonicalProject(P, "team-wide"), "");
+  const ORCH = { agentId: "coordinator", sessionKey: "agent:coordinator:main" };
+  const add = (project) => policyDecide({ toolName: "task_inbox", params: { action: "add", project, title: "Fix the cart total" } }, ORCH, {}, P);
+  assert.equal(add("shopsite").params.project, "shop");
+  assert.equal(add("shop"), undefined); // already canonical: unchanged
+  const move = (project) => policyDecide({ toolName: "task_inbox", params: { action: "set", id: "a1b2c3d4", project } }, ORCH, {}, P);
+  assert.equal(move("shop.example").params.project, "shop"); // moving an item to a project: same contract
+  assert.equal(move("Shop SEO").rule, "unknownProject");
+  const bad = add("Shop SEO");
+  assert.equal(bad.rule, "unknownProject");
+  assert.match(bad.blockReason, /Use exactly one of: shop, team/);
+  // a brief's Project line follows the same contract
+  const spawn = (project) => policyDecide({ toolName: "sessions_spawn", params: { agentId: "writer",
+    task: `Project: ${project} (/srv/shop)\nScope: x\nItems:\na1b2c3d4\nDone when: y\nStop if: z\nModel: sonnet-5\nEffort: low` } },
+    ORCH, {}, Object.assign({ board: { requireItems: false } }, P));
+  assert.match(spawn("shopsite").params.task, /^Project: shop \(\/srv\/shop\)/);
+  assert.equal(spawn("Shop SEO").rule, "unknownProject");
+  // without a projects list (a plain install) nothing is enforced
+  assert.equal(policyDecide({ toolName: "task_inbox", params: { action: "add", project: "anything", title: "x y z" } }, ORCH, {}, {}), undefined);
+});
