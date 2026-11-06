@@ -66,6 +66,7 @@ const DEFAULT_POLICY = {
     // Off by default: while Claude is at its limit, tasks wait for the reset. Set a Codex model here
     // (and add it to allowedModels) to move new tasks to Codex instead.
     codexModel: "",
+    allowAcp: false, // sessions_spawn runtime "acp" (external harnesses such as the Codex CLI)
     claudeFallbackModel: "anthropic/claude-sonnet-5", // when Codex is on and at its limit
     limitedProviders: ["anthropic"],
   },
@@ -579,6 +580,12 @@ function policyDecide(event, ctx, pstate, rawConfig, log, now = Date.now()) {
   // 8. Spawn policy: fresh isolated task sessions that are deleted when done, enough time to finish, allowed models only.
   if (policy.spawn.enabled && tool === "sessions_spawn" && orchestrator && !subagent) {
     const allowed = policy.spawn.allowedModels || [];
+    // External harnesses (ACP: Codex CLI, Claude Code, ...) run outside the team's roles, models, board
+    // and budgets, and "codex" there would bypass a Codex-off decision. Team tasks are sub-agents only.
+    const runtime = String(params.runtime || "subagent").toLowerCase();
+    if (runtime !== "subagent" && !(runtime === "acp" && policy.spawn.allowAcp)) {
+      return block("spawnRuntime", `token-guard: runtime "${params.runtime}" is not allowed. Dispatch a team agent (agentId = the role) without runtime.`);
+    }
     if (params.model) {
       const m = normaliseModel(params.model, allowed);
       if (m === null) return block("spawnModel", `token-guard: model "${params.model}" is not allowed. Use one of: ${allowed.join(", ")}.`);

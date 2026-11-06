@@ -240,3 +240,15 @@ test("missing proof: real files are judged, shortened or pattern paths are not",
   assert.deepEqual(missingProof(text, exists), ["/tmp/gone.png"]);
   assert.deepEqual(missingProof("no paths here", exists), []);
 });
+
+test("no back door to Codex: ACP harness spawns are refused unless allowAcp is set", () => {
+  const COORD = { agentId: "coordinator", sessionKey: ORC };
+  const acp = { toolName: "sessions_spawn", params: { runtime: "acp", agentId: "codex", task: "Project: demo\nFix CI", label: "demo: x" } };
+  const r = policyDecide(acp, COORD, {}, {});
+  assert.equal(r.block, true);
+  assert.match(r.blockReason, /runtime "acp" is not allowed/);
+  const ok = policyDecide(acp, COORD, {}, { spawn: { allowAcp: true }, board: { requireItems: false } });
+  assert.notEqual(ok && ok.block, true);
+  const plain = policyDecide({ toolName: "sessions_spawn", params: { runtime: "subagent", agentId: "devops", task: "Project: demo\nFix CI", label: "demo: x" } }, COORD, {}, { board: { requireItems: false } });
+  assert.notEqual(plain && plain.block, true);
+});
