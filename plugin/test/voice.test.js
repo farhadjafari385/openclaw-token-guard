@@ -2,7 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import {
   mdToHtml, htmlToPlain, splitReport, dispatchText, ackText, resultText, stallText, approvalAskText, approvalReplyText,
-  ownerTag, handleOf, titleOf, modelName, guardText,
+  ownerTag, handleOf, titleOf, modelName, guardText, limitText,
 } from "../voice.js";
 import { createMirror, messageIdOf } from "../mirror.js";
 import { emptyState, recordSpawn, mergeStates, mergeJobsConfig } from "../jobs.js";
@@ -168,4 +168,12 @@ test("mirror: an edit with unchanged text counts as done, so the board view neve
   const m = createMirror({ cfg: { chatId: "-1", botTokenFiles: { coordinator: "/t" }, minIntervalMs: 0 }, fetchImpl, readFile: () => "T" });
   assert.equal(await m.edit({ agentId: "coordinator", messageId: 5, text: "same" }), true);
   assert.equal(calls, 1);
+});
+
+test("limit message: tasks wait when Codex is off, move to Codex only when it is on", () => {
+  const until = Date.UTC(2026, 10, 6, 7, 3);
+  assert.match(limitText({}, until, "claude", {}), /New tasks wait until then \(no Codex fallback\)/);
+  assert.doesNotMatch(limitText({}, until, "claude", {}), /GPT|Codex model/);
+  assert.match(limitText({}, until, "claude", { codexModel: "openai/gpt-6-astra" }), /run on GPT-6 Astra/);
+  assert.match(limitText({}, until, "claude", {}), /07:03 UTC/);
 });

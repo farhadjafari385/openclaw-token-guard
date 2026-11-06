@@ -210,7 +210,10 @@ function limitText(_cfg, untilMs, provider = "claude", spawn = {}) {
   if (provider === "codex") {
     return `⚠️ Codex's usage limit is reached until ${until} UTC. New tasks run on ${esc(modelName((spawn && spawn.claudeFallbackModel) || "anthropic/claude-sonnet-5"))} until then.`;
   }
-  return `⚠️ Claude's usage limit is reached until ${until} UTC. New tasks run on ${esc(modelName((spawn && spawn.codexModel) || "openai/gpt-6-astra"))} until then.`;
+  if (!(spawn && spawn.codexModel)) {
+    return `⚠️ Claude's usage limit is reached until ${until} UTC. New tasks wait until then (no Codex fallback) and pick up again by themselves.`;
+  }
+  return `⚠️ Claude's usage limit is reached until ${until} UTC. New tasks run on ${esc(modelName(spawn.codexModel))} until then.`;
 }
 
 // The orchestrator asks the owner to approve checked work (archiving needs both).

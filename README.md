@@ -42,7 +42,7 @@ skip it, and none of it calls a model unless something needs a decision:
 
 | Part | What it does |
 |---|---|
-| `policy.js` | Rules on every tool call: protected files and config, no back channels, only the orchestrator dispatches and it does no specialist work, no model pins, git safety (no `--no-verify`, no pushes to main), one request = one board item, briefs completed from their board items, usage limits routed around (Claude to Codex and back), no dispatch during a gateway restart. |
+| `policy.js` | Rules on every tool call: protected files and config, no back channels, only the orchestrator dispatches and it does no specialist work, no model pins, git safety (no `--no-verify`, no pushes to main), one request = one board item, briefs completed from their board items, usage limits respected (a task waits for the reset; Codex only if you turn it on), no dispatch during a gateway restart. |
 | `board.js`, `bin/oc-inbox` | The task board: Backlog, To do, In progress, Review, QA, Done, Archived (plus Blocked and Dropped). A task's end moves its items by the worker's RESULT line; archiving needs the orchestrator's and the owner's approval. |
 | `jobs.js`, `triage.js` | Follows every task to its end: unanswered results, silent tasks, restarts and lost end events. Every 10 minutes, when something needs a decision, a cheap model call (no tools) decides whether to wake the orchestrator and at what effort. |
 | `skills.js` | Names, in every brief, the skills of that agent that fit the task (matched against each skill's own description). |
@@ -68,17 +68,21 @@ typo", "deploy the pricing page") become two sessions: the two small web UI
 fixes share one, the deploy gets its own. The specialist's result returns to
 the coordinator by itself, so nobody polls.
 
-## Fallback when a limit is hit
+## When a usage limit is hit
 
-An agent whose own model has no fallback list is strict in OpenClaw: when the
-Claude weekly or 5-hour limit hits, it just stops. `apply.sh
---fallback-model=openai/gpt-6-astra` adds the fallback to the default model,
-the sub-agent model and every agent's own model in one config change.
-`verify.sh` warns about any model without one.
+By default nothing switches provider. When Claude reports its usage limit, the guard records the reset time,
+refuses new dispatches until then (they would fail at once), spends no wakes or triage calls, and moves items
+that were blocked only by the limit back to To do once it has reset. The orchestrator is told the reset time in
+the System topic.
 
-The fallback needs a credential in OpenClaw's own auth store (a Codex CLI
-login in `~/.codex` is not used by agent-scoped Codex runs). Sign in once and
-let every agent inherit it:
+**Optional: a second provider.** To let new tasks run on Codex while Claude is limited, set
+`spawn.codexModel` (e.g. `"openai/gpt-6-astra"`) and add that model to `spawn.allowedModels`. A Codex limit is
+then routed back to `spawn.claudeFallbackModel`, and a dispatch waits only when both are limited.
+`apply.sh --fallback-model=openai/gpt-6-astra` also adds the model to OpenClaw's own fallback lists (default
+model, sub-agent model, every agent's model); `verify.sh` lists the models without one.
+
+That fallback needs a credential in OpenClaw's own auth store (a Codex CLI login in `~/.codex` is not used by
+agent-scoped Codex runs). Sign in once and let every agent inherit it:
 
 ```bash
 openclaw config set agents.defaults.authInheritance.agentId '"coordinator"' --strict-json

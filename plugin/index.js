@@ -2,7 +2,7 @@ import crypto from "node:crypto";
 import { definePluginEntry } from "openclaw/plugin-sdk/plugin-entry";
 import { Type } from "typebox";
 import { createState, decide } from "./guard.js";
-import { policyDecide, firstLine, itemsFromBrief, completeBrief } from "./policy.js";
+import { policyDecide, firstLine, itemsFromBrief, completeBrief, codexEnabled } from "./policy.js";
 import { isLimitBlock, normStatus, resultVerdict, nextAfterJob, renderBoard, renderOverview, auditBoard, parseApproval, looksLikeRequest } from "./board.js";
 import { correctTopic, isGeneral, projectOfTopic, projectsMentioned } from "./topics.js";
 import { isLimitError, limitResetAt } from "./limits.js";
@@ -316,6 +316,7 @@ export default definePluginEntry({
 
     // A usage limit belongs to the provider that reported it: Codex limits must not be taken for
     // Claude's (that once routed every task into the exhausted Codex).
+    const useCodex = codexEnabled(cfg); // off unless spawn.codexModel is set: Claude's limit then means "wait"
     const markLimited = (text, source) => {
       if (!isLimitError(text) && !/usage limit/i.test(String(text))) return;
       const until = limitResetAt(text);
@@ -324,7 +325,7 @@ export default definePluginEntry({
         store.touch();
         store.save();
         log("info", `token-guard: ${codex ? "Codex" : "Claude"} limit`, { source, text: String(text).slice(0, 160) });
-        post(orchestrator, "system", limitText(voice, until, codex ? "codex" : "claude", cfg.spawn), { html: true });
+        if (!codex || useCodex) post(orchestrator, "system", limitText(voice, until, codex ? "codex" : "claude", cfg.spawn), { html: true });
       }
     };
     // This copy of the plugin may not know a task another copy started: read the shared state first.
@@ -667,6 +668,7 @@ export default definePluginEntry({
         voice,
         pmAgent: pm,
         triage: triageCfg.enabled && store.data.triageHealthy !== false, // the old idle wake covers a broken triage
+        codexEnabled: useCodex,
       });
       if (boardCfg.enabled) {
         try { await auditTick(inboxItems); } catch (error) { log("warn", "token-guard board audit failed", { error: String(error && error.message) }); }
@@ -742,7 +744,7 @@ export default definePluginEntry({
     // limit is active (they used to stay Blocked for good: nothing ever picks Blocked work up again).
     const resumeLimitBlocked = async (inboxItems) => {
       const now = Date.now();
-      if ((store.data.claudeLimitedUntil || 0) > now || (store.data.codexLimitedUntil || 0) > now) return;
+      if ((store.data.claudeLimitedUntil || 0) > now || (useCodex && (store.data.codexLimitedUntil || 0) > now)) return;
       for (const it of inboxItems) {
         if (normStatus(it.status) !== "blocked") continue;
         if (!isLimitBlock(it.note)) continue;

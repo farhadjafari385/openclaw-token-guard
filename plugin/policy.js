@@ -61,11 +61,12 @@ const DEFAULT_POLICY = {
       "anthropic/claude-sonnet-5",
       "anthropic/claude-sonnet-5-5",
       "anthropic/claude-haiku-5-5",
-      "openai/gpt-6-astra",
     ],
     allowedThinking: ["off", "minimal", "low", "medium", "high"],
-    codexModel: "openai/gpt-6-astra",
-    claudeFallbackModel: "anthropic/claude-sonnet-5", // when Codex is at its limit
+    // Off by default: while Claude is at its limit, tasks wait for the reset. Set a Codex model here
+    // (and add it to allowedModels) to move new tasks to Codex instead.
+    codexModel: "",
+    claudeFallbackModel: "anthropic/claude-sonnet-5", // when Codex is on and at its limit
     limitedProviders: ["anthropic"],
   },
 };
@@ -294,6 +295,11 @@ function orchestratorMutation(policy, command, agentId) {
 
 // ---- spawn policy ----
 
+// Whether tasks may move to Codex while Claude is at its limit (spawn.codexModel set).
+function codexEnabled(cfg) {
+  return Boolean(mergePolicy(cfg).spawn.codexModel);
+}
+
 function isClaudeModel(model, policy) {
   const provider = String(model || "").split("/")[0];
   return (policy.spawn.limitedProviders || []).includes(provider);
@@ -353,7 +359,7 @@ function spawnRewrite(params, policy, pstate, now) {
   const claudeOff = claudeUntil > now;
   const codexOff = codexUntil > now;
   const wantsClaude = !next.model || isClaudeModel(next.model, policy);
-  if (claudeOff && !codexOff && wantsClaude) {
+  if (claudeOff && !codexOff && wantsClaude && sp.codexModel) {
     notes.push(`Claude is limited until ${new Date(claudeUntil).toISOString().slice(11, 16)} UTC: ${next.model || "default model"} -> ${sp.codexModel}`);
     next.model = sp.codexModel;
   } else if (codexOff && !claudeOff && !wantsClaude) {
@@ -609,8 +615,11 @@ function policyDecide(event, ctx, pstate, rawConfig, log, now = Date.now()) {
     }
     const claudeUntil = (pstate && pstate.claudeLimitedUntil) || 0;
     const codexUntil = (pstate && pstate.codexLimitedUntil) || 0;
+    const at = (ms) => new Date(ms).toISOString().slice(11, 16);
+    if (claudeUntil > now && !policy.spawn.codexModel) {
+      return block("claudeLimited", `token-guard: Claude is at its usage limit until ${at(claudeUntil)} UTC and there is no fallback (Codex is off), so this task would fail at once. Do not dispatch now and leave its items in To do: the job tracker wakes you again once the limit has reset.`);
+    }
     if (claudeUntil > now && codexUntil > now) {
-      const at = (ms) => new Date(ms).toISOString().slice(11, 16);
       return block("bothLimited", `token-guard: Claude (until ${at(claudeUntil)} UTC) and Codex (until ${at(codexUntil)} UTC) are both at their usage limits, so this task would fail at once. Do not dispatch now and leave its items in To do: the job tracker wakes you again once a limit has reset.`);
     }
     const input = Object.assign({}, params);
@@ -630,6 +639,7 @@ export {
   similarOpenItem,
   DEFAULT_POLICY,
   mergePolicy,
+  codexEnabled,
   expandHome,
   isProtectedPath,
   mentionsProtected,
