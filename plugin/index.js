@@ -17,6 +17,7 @@ import {
 } from "./voice.js";
 import { inboxArgs, loadInboxItems, runInbox } from "./inbox.js";
 import { processBoot } from "./boot.js";
+import { selectSkills, skillsLine } from "./skills.js";
 import { mergeTriageConfig, triageSnapshot, TRIAGE_PROMPT, parseTriage, triageWakeMessage } from "./triage.js";
 import fs from "node:fs";
 
@@ -257,6 +258,13 @@ export default definePluginEntry({
       if (!parts.length) return null;
       return Object.assign({}, p, { task: `${p.task}\n\nThe owner's exact words (this is the spec: do exactly this, keep the change minimal, and do not redo work that is already right):\n${parts.join("\n")}` });
     };
+    // Every brief names the skills of that agent that fit the task (from openclaw-team's skill catalog).
+    const withSkills = (p) => {
+      const catalog = (cfg.skills || {})[String(p.agentId || "")];
+      if (!Array.isArray(catalog) || !catalog.length || /Skills for this task/.test(String(p.task || ""))) return null;
+      const line = skillsLine(selectSkills(String(p.task || ""), catalog));
+      return line ? Object.assign({}, p, { task: `${p.task}\n\n${line}` }) : null;
+    };
     // After the orchestrator approves checked work, ask the owner once (archiving needs both approvals).
     const askOwnerToApprove = (ids) => {
       const board = loadInboxItems();
@@ -414,6 +422,7 @@ export default definePluginEntry({
           let params = (res && res.params) || (pol && pol.params) || (base !== event ? base.params : undefined);
           if (event.toolName === "sessions_spawn" && ctx && ctx.agentId === orchestrator) {
             params = withOwnerWords(params || event.params || {}) || params;
+            params = withSkills(params || event.params || {}) || params;
             rememberSpawn(params || event.params || {}, ctx);
           }
           const bare = String(event.toolName || "").split("__").pop();
