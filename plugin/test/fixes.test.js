@@ -152,3 +152,20 @@ test("the orchestrator's board move becomes its answer under the worker's result
     "@devops_bot Checked pipeline <b>1234</b> myself: green.\n<i>Board: ab12cd34 → QA</i>");
   assert.equal(boardReplyText(cfg, job, "ab12cd34", "todo", ""), "@devops_bot thanks, I've taken it from here.\n<i>Board: ab12cd34 → To do</i>");
 });
+
+test("a brief missing required lines is completed from its board items instead of rejected", async () => {
+  const { completeBrief } = await import("../policy.js");
+  const board = new Map([["ab12cd34", { id: "ab12cd34", project: "demo", done_when: "pipeline green and the fix live" }]]);
+  const brief = "Fix the modal buttons on phone (item ab12cd34). The fix sits in the worktree.";
+  const out = completeBrief(brief, board);
+  for (const line of ["Project: demo", "Items: ab12cd34", "Done when: pipeline green and the fix live", "Stop if: anything that needs the owner's OK"]) assert.ok(out.includes(line), line);
+  assert.match(out, /\nScope: in: exactly these items/);
+  const full = "Project: demo\nScope: x\nItems: ab12cd34\nDone when: y\nStop if: z";
+  assert.equal(completeBrief(full, board), full); // nothing to add
+  assert.equal(completeBrief("No item ids here", board), "No item ids here");
+  // and the completed brief passes the old brief-field check
+  const { decide, createState } = await import("../guard.js");
+  const r = decide({ toolName: "sessions_spawn", params: { agentId: "writer", task: out + " ".repeat(700), context: "isolated", label: "demo: x" } },
+    { agentId: "coordinator", sessionKey: "agent:coordinator:main" }, createState(), {}, null, Date.now());
+  assert.notEqual(r && r.rule, "briefFields");
+});

@@ -388,6 +388,27 @@ function similarOpenItem(board, project, title) {
   return null;
 }
 
+
+// A brief that misses a required line gets it from its board items instead of a rejection (on
+// 2026-11-05 the orchestrator lost 23 turns resending briefs for a missing Done when or Stop if).
+function completeBrief(task, board) {
+  const text = String(task || "");
+  if (!board || typeof board.get !== "function") return text;
+  const ids = itemsFromBrief(text).filter((id) => board.has(id));
+  if (!ids.length) return text;
+  const items = ids.map((id) => board.get(id));
+  const has = (field) => text.split("\n").some((l) => l.replace(/^[\s>*#_\-]+/, "").toLowerCase().startsWith(`${field}:`));
+  const add = [];
+  const projects = [...new Set(items.map((it) => String(it.project || "").trim()).filter(Boolean))];
+  if (!has("project") && projects.length === 1) add.push(`Project: ${projects[0]}`);
+  if (!has("items")) add.push(`Items: ${ids.join(" ")}`);
+  if (!has("scope")) add.push("Scope: in: exactly these items and the owner's words for them; out: anything else (put it under Next in your report)");
+  const done = items.map((it) => String(it.done_when || "").trim()).filter(Boolean);
+  if (!has("done when") && done.length) add.push(`Done when: ${done.join(" AND ")}`);
+  if (!has("stop if")) add.push("Stop if: anything that needs the owner's OK (a production change, money, credentials, anything public, deleting data)");
+  return add.length ? `${text.trimEnd()}\n${add.join("\n")}` : text;
+}
+
 // ---- decision ----
 
 function policyDecide(event, ctx, pstate, rawConfig, log, now = Date.now()) {
@@ -598,6 +619,7 @@ function policyDecide(event, ctx, pstate, rawConfig, log, now = Date.now()) {
 }
 
 export {
+  completeBrief,
   similarOpenItem,
   DEFAULT_POLICY,
   mergePolicy,
