@@ -76,6 +76,10 @@ test("owner approvals and requests", () => {
   assert.equal(parseApproval("I approve of the plan"), null);
   assert.equal(looksLikeRequest("please fix the login page, it is broken on phones"), true);
   assert.equal(looksLikeRequest("ok thanks"), false);
+  // short orders to go ahead were not seen as requests, so one sent during a usage limit was lost
+  assert.equal(looksLikeRequest("Do it, and gime and them a report of 3 before they sent"), true);
+  assert.equal(looksLikeRequest("go ahead and connect the new bot to the team"), true);
+  assert.equal(looksLikeRequest("I tested it myself, looks nice now"), false);
 });
 
 const PROJECTS = {

@@ -163,7 +163,7 @@ function parseApproval(text) {
 function looksLikeRequest(text) {
   const t = String(text || "").trim();
   if (t.length < 25 || parseApproval(t)) return false;
-  return /\b(fix|add|make|change|create|deploy|remove|delete|build|implement|update|move|rename|need|needs|should|must|want|why|broken|bug|error|issue|not working|doesn'?t work|failing|failed|wrong|missing|improve|redesign|check)\b/i.test(t);
+  return /\b(fix|add|make|change|create|deploy|remove|delete|build|implement|update|move|rename|need|needs|should|must|want|why|broken|bug|error|issue|not working|doesn'?t work|failing|failed|wrong|missing|improve|redesign|check|do it|go ahead|send|report|connect|install|set up|setup|start|stop|run|ship|publish|test|verify|review|merge|finish|continue|give me|show me|tell me)\b/i.test(t);
 }
 
 export {

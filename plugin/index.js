@@ -653,7 +653,8 @@ export default definePluginEntry({
       }
       if (looksLikeRequest(event.content)) {
         store.data.ownerAsks = (store.data.ownerAsks || []).slice(-49);
-        store.data.ownerAsks.push({ at: Date.now(), topic, text: String(event.content).slice(0, 1500), captured: false });
+        const held = (store.data.claudeLimitedUntil || 0) > Date.now() ? store.data.claudeLimitedUntil : 0; // nobody can act before then
+        store.data.ownerAsks.push({ at: Date.now(), topic, text: String(event.content).slice(0, 1500), captured: false, heldUntil: held });
         store.touch();
       }
     }));

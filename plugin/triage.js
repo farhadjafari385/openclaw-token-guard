@@ -5,6 +5,11 @@
 
 import { normStatus } from "./board.js";
 
+// An owner request stays open for 6 hours, counted from when the team could first act on it: one sent
+// while Claude was at its usage limit is still open 6 hours after the reset (it was once lost overnight).
+const ASK_OPEN_MS = 6 * 3600000;
+const askOpen = (a, now) => !a.captured && now - Math.max(a.at || 0, a.heldUntil || 0) < ASK_OPEN_MS;
+
 const DEFAULT_TRIAGE = {
   enabled: true,
   everyMinutes: 10,
@@ -33,7 +38,7 @@ function triageSnapshot(data, items, now) {
   const open = items.filter((it) => ["todo", "in_progress", "review", "qa"].includes(normStatus(it.status)));
   const waiting = open.filter((it) => !covered.has(it.id));
   const unacted = jobs.filter((j) => j.status !== "running" && j.resultMsgId && !j.answeredAt && now - (j.endedAt || 0) < 6 * 3600000);
-  const asks = (data.ownerAsks || []).filter((a) => !a.captured && now - a.at < 6 * 3600000);
+  const asks = (data.ownerAsks || []).filter((a) => askOpen(a, now));
   if (!waiting.length && !unacted.length && !asks.length) return null;
   const line = (it) => `- ${it.id} [${normStatus(it.status)}] ${it.project || "?"}: ${String(it.title || "").slice(0, 90)} (owner ${it.owner || "?"}, updated ${ago(now, it.updated_ts || it.created_ts)})`;
   const parts = [];
@@ -55,7 +60,7 @@ function triageSignature(data, items, now) {
   const unacted = jobs
     .filter((j) => j.status !== "running" && j.resultMsgId && !j.answeredAt && now - (j.endedAt || 0) < 6 * 3600000)
     .map((j) => `r:${j.resultMsgId}`);
-  const asks = (data.ownerAsks || []).filter((a) => !a.captured && now - a.at < 6 * 3600000).map((a) => `a:${a.at}`);
+  const asks = (data.ownerAsks || []).filter((a) => askOpen(a, now)).map((a) => `a:${a.at}`);
   return [...waiting.sort(), ...unacted.sort(), ...asks.sort()].join(",");
 }
 
@@ -90,4 +95,4 @@ function triageWakeMessage(decision, snapshot) {
   );
 }
 
-export { DEFAULT_TRIAGE, mergeTriageConfig, triageSnapshot, triageSignature, TRIAGE_PROMPT, parseTriage, triageWakeMessage };
+export { askOpen, DEFAULT_TRIAGE, mergeTriageConfig, triageSnapshot, triageSignature, TRIAGE_PROMPT, parseTriage, triageWakeMessage };
