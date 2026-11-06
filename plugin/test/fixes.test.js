@@ -189,3 +189,24 @@ test("a strict project's distinctive aliases match normally; its common-word nam
   assert.deepEqual(projectsMentioned("we use ai for this", projects), []); // the common word alone is not the project
   assert.deepEqual(projectsMentioned("Project: ai\nFix X", projects), ["ai"]);
 });
+
+test("each brief names the skills that fit its task", async () => {
+  const { selectSkills, skillsLine } = await import("../skills.js");
+  const designer = [
+    { name: "product-design-playbook", about: "How a senior product designer works here", always: true },
+    { name: "verification-before-completion", about: "Use when about to claim work is complete; evidence before claims", always: true },
+    { name: "design-taste-frontend", about: "Builds professional company websites, landing page, product, shop, SaaS or game site; when a page looks generic or AI-made" },
+    { name: "ui-ux-pro-max", about: "UI/UX design intelligence: accessibility, responsive layout, typography, color, touch targets, mobile" },
+    { name: "emil-design-eng", about: "UI polish, component design, animation decisions and the invisible details" },
+    { name: "break-ui", about: "Try to break a UI with worst-case data: long names, huge counts, empty states, non-Latin text" },
+    { name: "canvas-design", about: "Create visual art, posters and images as PNG or PDF" },
+  ];
+  const a = selectSkills("Project: demo\nRedesign the landing page so it stops looking generic; responsive on mobile with real typography", designer);
+  assert.deepEqual(a.slice(0, 2), ["product-design-playbook", "verification-before-completion"]);
+  assert.ok(a.includes("design-taste-frontend") && a.includes("ui-ux-pro-max"), a.join());
+  assert.ok(!a.includes("canvas-design"), a.join());
+  const b = selectSkills("The task board breaks with long agent names and when there are zero items", designer);
+  assert.ok(b.includes("break-ui"), b.join());
+  assert.match(skillsLine(a), /^Skills for this task \(open each one's SKILL.md before you start and follow it\): product-design-playbook/);
+  assert.deepEqual(selectSkills("anything", []), []);
+});

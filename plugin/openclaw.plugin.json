@@ -201,6 +201,11 @@
         "type": "object",
         "additionalProperties": true,
         "description": "10-minute Haiku triage: enabled, everyMinutes, model, orchestratorQuietMinutes"
+      },
+      "skills": {
+        "type": "object",
+        "additionalProperties": true,
+        "description": "Per agent: [{name, about, always}] skill catalog used to name the right skills in each brief"
       }
     }
   }
