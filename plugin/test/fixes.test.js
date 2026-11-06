@@ -332,3 +332,26 @@ test("the board tool passes the PM's rank and priority on set", async () => {
   const { inboxArgs } = await import("../inbox.js");
   assert.deepEqual(inboxArgs({ action: "set", id: "a1b2c3d4", rank: 1, priority: "urgent" }), ["set", "a1b2c3d4", "--priority", "urgent", "--rank", "1", "--by", "agent"]);
 });
+
+test("the queue reads the PM's rank and priority from the real board file (written by oc-inbox)", async () => {
+  const fs = await import("node:fs");
+  const os = await import("node:os");
+  const path = await import("node:path");
+  const { loadInboxItems } = await import("../inbox.js");
+  const { queueState } = await import("../board.js");
+  const file = path.join(fs.mkdtempSync(path.join(os.tmpdir(), "tg-board-")), "inbox.jsonl");
+  const ev = (o) => JSON.stringify(o);
+  fs.writeFileSync(file, [
+    ev({ kind: "add", id: "aaaaaaa1", project: "shop", title: "older", owner: "writer", done_when: "x", status: "todo", ts: "2026-11-01T00:00:00Z" }),
+    ev({ kind: "add", id: "aaaaaaa2", project: "shop", title: "newer", owner: "writer", done_when: "x", status: "todo", priority: "low", ts: "2026-11-02T00:00:00Z" }),
+    ev({ kind: "add", id: "aaaaaaa3", project: "game", title: "ranked", owner: "writer", done_when: "x", status: "todo", ts: "2026-11-03T00:00:00Z" }),
+    ev({ kind: "set", id: "aaaaaaa3", by: "system", rank: 1, priority: "urgent", ts: "2026-11-06T00:00:00Z" }),
+    ev({ kind: "set", id: "aaaaaaa1", by: "system", rank: 0, ts: "2026-11-06T00:00:00Z" }),
+  ].join("\n") + "\n");
+  const items = loadInboxItems(file);
+  assert.equal(items.get("aaaaaaa3").rank, 1);
+  assert.equal(items.get("aaaaaaa3").priority, "urgent");
+  assert.equal(items.get("aaaaaaa1").rank, null);
+  assert.equal(items.get("aaaaaaa2").priority, "low");
+  assert.deepEqual(queueState(items, { wip: 1, projectOrder: ["shop", "game"] }).queue.map((i) => i.id), ["aaaaaaa3", "aaaaaaa1", "aaaaaaa2"]);
+});
