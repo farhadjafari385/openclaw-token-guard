@@ -35,6 +35,23 @@ thinking level. On a large session with high thinking that can take longer than
 180 seconds; OpenClaw then kills it ("CLI exceeded timeout (180s)") after Claude
 has already read the whole session, and every retry pays for it again.
 
+## Running a whole team (v2)
+
+Besides the token rules above, the plugin runs an agent team end to end. Every part is code, so agents cannot
+skip it, and none of it calls a model unless something needs a decision:
+
+| Part | What it does |
+|---|---|
+| `policy.js` | Rules on every tool call: protected files and config, no back channels, only the orchestrator dispatches and it does no specialist work, no model pins, git safety (no `--no-verify`, no pushes to main), one request = one board item, briefs completed from their board items, usage limits routed around (Claude to Codex and back), no dispatch during a gateway restart. |
+| `board.js`, `bin/oc-inbox` | The task board: Backlog, To do, In progress, Review, QA, Done, Archived (plus Blocked and Dropped). A task's end moves its items by the worker's RESULT line; archiving needs the orchestrator's and the owner's approval. |
+| `jobs.js`, `triage.js` | Follows every task to its end: unanswered results, silent tasks, restarts and lost end events. Every 10 minutes, when something needs a decision, a cheap model call (no tools) decides whether to wake the orchestrator and at what effort. |
+| `skills.js` | Names, in every brief, the skills of that agent that fit the task (matched against each skill's own description). |
+| `voice.js`, `mirror.js` | Writes the team's Telegram threads: request, dispatch, "on it", result (summary first, details folded), the orchestrator's answer, approval asks, all as replies with @mentions. |
+| `index.js` | Wires it into OpenClaw's hooks. |
+
+Configure it under `plugins.entries.token-guard.config` (see `plugin/openclaw.plugin.json`); a team repo can
+generate that config (`ownerId`, `projects`, `topics`, `mirror`, `jobs`, `triage`, `skills`).
+
 ## One task, one fresh session
 
 Every model call re-reads the whole session, so a chat that collects task
