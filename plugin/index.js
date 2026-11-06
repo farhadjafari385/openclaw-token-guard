@@ -250,7 +250,9 @@ export default definePluginEntry({
         if (!it) continue;
         const said = /Owner said: «([\s\S]*?)»/.exec(String(it.details || ""));
         const past = (it.history || []).filter((h) => h.note && h.by !== "system").slice(-4).map((h) => `  - ${h.from} -> ${h.to}: ${String(h.note).slice(0, 240)}`);
-        parts.push(`- ${id} ${it.title || ""}${said ? `\n  Owner said: «${said[1].slice(0, 1200)}»` : ""}${past.length ? `\n  Earlier on this item:\n${past.join("\n")}` : ""}`);
+        const noteNow = String(it.note || "").trim();
+        parts.push(`- ${id} ${it.title || ""}${said ? `\n  Owner said: «${said[1].slice(0, 1200)}»` : ""}` +
+          `${noteNow ? `\n  Latest note on the item: ${noteNow.slice(0, 900)}` : ""}${past.length ? `\n  Earlier on this item:\n${past.join("\n")}` : ""}`);
       }
       if (!parts.length) return null;
       return Object.assign({}, p, { task: `${p.task}\n\nThe owner's exact words (this is the spec: do exactly this, keep the change minimal, and do not redo work that is already right):\n${parts.join("\n")}` });
