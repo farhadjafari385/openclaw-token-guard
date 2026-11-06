@@ -152,6 +152,26 @@ test("Codex limit messages: the reset time is read correctly", async () => {
   assert.equal(new Date(limitResetAt("usage limit. Next reset in 4 hours", now)).toISOString(), "2026-11-06T02:58:00.000Z");
 });
 
+test("at a usage limit a chat gets the error reply once, not once per message", async () => {
+  const { isLimitReply, allowLimitReply } = await import("../limits.js");
+  const err = "⚠️ ⚠️ ⚠️ You've hit your weekly limit · resets 9pm (America/New_York)";
+  assert.equal(isLimitReply(err), true);
+  // An agent's own words about a limit, and other failure replies, are not held back.
+  assert.equal(isLimitReply("Claude hit its weekly limit, so the CI fix waits until 02:00 UTC."), false);
+  assert.equal(isLimitReply("⚠️ OpenClaw couldn't finish this request."), false);
+  assert.equal(isLimitReply(""), false);
+  const seen = new Map();
+  const now = Date.UTC(2026, 10, 6, 6, 35); // 01:35 New York; resets 21:00 New York = 02:00 UTC next day
+  const group = "orchestrator:telegram:-100200:";
+  assert.equal(allowLimitReply(seen, group, err, now), true);
+  assert.equal(allowLimitReply(seen, group, err, now + 10000), false);
+  assert.equal(allowLimitReply(seen, group, err, now + 30 * 60000), false);
+  assert.equal(allowLimitReply(seen, "orchestrator:telegram:-100300:154", err, now + 60000), true); // another chat or topic
+  assert.equal(new Date(seen.get(group)).toISOString(), "2026-11-07T02:00:00.000Z");
+  // After the reset a new limit is reported again.
+  assert.equal(allowLimitReply(seen, group, err, Date.UTC(2026, 10, 7, 2, 1)), true);
+});
+
 test("the worker's final report is kept, not the narration before it", async () => {
   const { finalAnswer, recordResultText } = await import("../jobs.js");
   const narration = ["I'll start by exploring the project.", "Found the live host. Let me check it.", "Now building the composites."];

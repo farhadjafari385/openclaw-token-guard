@@ -5,7 +5,7 @@ import { createState, decide } from "./guard.js";
 import { policyDecide, firstLine, itemsFromBrief, completeBrief, codexEnabled } from "./policy.js";
 import { isLimitBlock, normStatus, resultVerdict, nextAfterJob, renderBoard, renderOverview, auditBoard, parseApproval, looksLikeRequest } from "./board.js";
 import { correctTopic, isGeneral, projectOfTopic, projectsMentioned } from "./topics.js";
-import { isLimitError, limitResetAt } from "./limits.js";
+import { isLimitError, isLimitReply, allowLimitReply, limitResetAt } from "./limits.js";
 import {
   createJobStore, mergeJobsConfig, recordSpawn, recordActivity, recordUsage, recordResultText, finalAnswer, missingProof,
   recordEnd, recordProgress, setClaudeLimited, setCodexLimited, scanJobs, lastAssistantText,
@@ -536,7 +536,17 @@ export default definePluginEntry({
 
     // ---- topics: a reply that belongs in another topic is cancelled and reposted there ----
     const pointed = new Set();
+    const limitReplies = new Map(); // destination -> limit reset time
     api.on("message_sending", safe("message_sending", (event, ctx) => {
+      // At a usage limit every message gets the same error back; one per chat and topic says it.
+      if (isLimitReply(event && event.content)) {
+        const dest = `${(ctx && ctx.accountId) || ""}:${event.to || ""}:${event.threadId || ""}`;
+        if (!allowLimitReply(limitReplies, dest, event.content)) {
+          log("info", "token-guard held back a repeated usage-limit reply", { to: event.to, threadId: event.threadId });
+          return { cancel: true, cancelReason: "token-guard: this chat was already told about the usage limit" };
+        }
+        return undefined;
+      }
       if (!topicsCfg.enabled || !chatId || !ctx || ctx.channelId !== "telegram") return undefined;
       if (!String(event.to || "").includes(chatId)) return undefined;
       const current = isGeneral(event.threadId) ? null : Number(event.threadId);
