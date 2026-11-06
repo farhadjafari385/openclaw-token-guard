@@ -7,7 +7,7 @@ import { isLimitBlock, normStatus, resultVerdict, nextAfterJob, renderBoard, ren
 import { correctTopic, isGeneral, projectOfTopic, projectsMentioned } from "./topics.js";
 import { isLimitError, limitResetAt } from "./limits.js";
 import {
-  createJobStore, mergeJobsConfig, recordSpawn, recordActivity, recordUsage, recordResultText, finalAnswer,
+  createJobStore, mergeJobsConfig, recordSpawn, recordActivity, recordUsage, recordResultText, finalAnswer, missingProof,
   recordEnd, recordProgress, setClaudeLimited, setCodexLimited, scanJobs, lastAssistantText,
 } from "./jobs.js";
 import { createMirror, topicFor, messageIdOf } from "./mirror.js";
@@ -509,9 +509,8 @@ export default definePluginEntry({
         store.save();
         const cur = store.data.jobs[key] || job;
         // Proof that is cited must exist: a PASS resting on missing screenshots is no proof.
-        const cited = [...new Set(String(cur.resultText || "").match(/(?:~|\/home|\/tmp|\/srv)\/[^\s`'")\]]+\.(?:png|jpe?g|webp|gif|webm|mp4|json|log|txt|html)/gi) || [])].slice(0, 30);
-        const missing = cited.filter((f) => { try { return !fs.existsSync(f.replace(/^~/, process.env.HOME || "")); } catch { return false; } });
-        if (missing.length) { cur.missingEvidence = missing.slice(0, 10); store.touch(); }
+        const missing = missingProof(cur.resultText, (f) => fs.existsSync(f.replace(/^~/, process.env.HOME || "")));
+        if (missing.length) { cur.missingEvidence = missing; store.touch(); }
         const verdict = resultVerdict(cur.resultText, cur.outcome);
         const board = loadInboxItems();
         const plan = (cur.items || []).filter((id) => board.has(id)).map((id) => {
