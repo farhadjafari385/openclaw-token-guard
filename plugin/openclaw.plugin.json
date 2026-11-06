@@ -152,6 +152,20 @@
       "orchestratorAgent": {
         "type": "string"
       },
+      "requireChecksBeforePush": {
+        "type": "boolean",
+        "description": "A task may push only after running its project's pipeline steps locally (lint, typecheck, tests, security, build)."
+      },
+      "wake": {
+        "type": "object",
+        "additionalProperties": false,
+        "description": "Agents waking the orchestrator with the wake_orchestrator tool.",
+        "properties": {
+          "perAgentMinutes": { "type": "integer", "minimum": 1 },
+          "perHour": { "type": "integer", "minimum": 1 },
+          "maxChars": { "type": "integer", "minimum": 50 }
+        }
+      },
       "orchestratorMaxCallsPerRun": {
         "type": "integer",
         "minimum": 0,

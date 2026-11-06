@@ -225,6 +225,14 @@ function recordCall(data, sessionKey, cfg) {
   return null;
 }
 
+// A task ran one of its project's pipeline steps locally (lint, typecheck, tests, security, build).
+function recordCheck(data, sessionKey) {
+  const job = data.jobs[sessionKey];
+  if (!job || job.status !== "running") return false;
+  job.checksRun = (job.checksRun || 0) + 1;
+  return true;
+}
+
 const HAS_RESULT = /^\s*[*_`>]*\s*RESULT\s*[:=-]/im;
 
 // Proof files a report cites that do not exist. Shortened ("…", "...") or pattern paths ({a,b}, *) are not
@@ -477,6 +485,7 @@ export {
   recordActivity,
   recordUsage,
   recordCall,
+  recordCheck,
   recordResultText,
   finalAnswer,
   missingProof,

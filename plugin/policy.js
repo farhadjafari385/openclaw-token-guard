@@ -12,6 +12,7 @@ const HOME = os.homedir();
 const DEFAULT_POLICY = {
   orchestratorAgent: "coordinator",
   orchestratorMaxCallsPerRun: 60, // tool calls in one orchestrator run (0 = no limit)
+  requireChecksBeforePush: true, // a task pushes only after running its project's pipeline steps locally
   workspaceRoot: "~/.openclaw/workspace",
   protect: {
     enabled: true,
@@ -312,9 +313,30 @@ function normaliseModel(model, allowed) {
   const m = String(model || "").trim();
   if (!m) return "";
   if (allowed.includes(m)) return m;
-  const hit = allowed.find((a) => a.split("/").pop() === m || a.endsWith("/" + m));
+  // "claude-sonnet-5" and the short "sonnet-5" both name anthropic/claude-sonnet-5
+  const hit = allowed.find((a) => a.split("/").pop() === m || a.endsWith("/" + m) || a.split("/").pop() === `claude-${m}`);
   return hit || null;
 }
+
+// A brief's own setting line, "Model: <value>" or "Effort: <value>": the colon is required (so "Model
+// routing ..." is not one) and only the first word counts.
+function briefSetting(text, field) {
+  const m = new RegExp(`^[\\s>*#_\\-]*${field}\\s*:\\s*\\**\\s*([\\w./:-]+)`, "im").exec(String(text || ""));
+  return m ? m[1].replace(/[.,;]+$/, "") : "";
+}
+
+// Commands that run a project's own pipeline steps locally (lint, typecheck, tests, security, build).
+const CHECK_COMMAND = new RegExp([
+  String.raw`\b(?:npm|pnpm|yarn|bun)\s+(?:run\s+)?(?:test|lint|typecheck|type-check|check|build|ci(?::[\w-]+)?|audit|verify)\b`,
+  String.raw`\bnpx\s+(?:eslint|tsc|vitest|jest|playwright|prettier\s+--check)\b`,
+  String.raw`\b(?:tsc|eslint|vitest|jest|pytest|ruff|mypy|gitleaks|semgrep|trivy|bandit|shellcheck|yamllint|gitlab-ci-local)\b`,
+  String.raw`\bgo\s+(?:test|vet|build)\b`, String.raw`\bcargo\s+(?:test|clippy|check|build)\b`,
+  String.raw`\bmake\s+(?:test|check|lint|ci|build)\b`, String.raw`\bphp\s+artisan\s+test\b`,
+  String.raw`vendor/bin/(?:phpunit|phpstan|pint|pest)\b`, String.raw`\bcomposer\s+(?:test|lint|analyse)\b`,
+  String.raw`\bdocker\s+(?:compose\s+)?build\b`, String.raw`\bglab\s+ci\s+lint\b`, String.raw`\bnode\s+--test\b`,
+  String.raw`\bpython3?\s+-m\s+(?:unittest|pytest)\b`, String.raw`\btests/run-all\.sh\b`,
+].join("|"), "i");
+const GIT_PUSH = /(?:^|[\s;&|(])git(?:\s+-C\s+\S+)*\s+push\b/;
 
 function firstLine(text, field) {
   const re = new RegExp(`^[\\s>*#_\\-]*${field}\\s*:?\\s*(.+)$`, "im");
@@ -467,6 +489,13 @@ function policyDecide(event, ctx, pstate, rawConfig, log, now = Date.now()) {
     if (tool === "exec") {
       const command = typeof params.command === "string" ? params.command : "";
       const git = gitViolation(command);
+      // The owner's order: every pipeline step runs locally before any push (lint, typecheck, security, tests).
+      if (subagent && GIT_PUSH.test(command) && policy.requireChecksBeforePush !== false) {
+        const task = pstate && typeof pstate.jobFor === "function" ? pstate.jobFor(sessionKey) : null;
+        if (task && !(task.checksRun > 0)) {
+          return block("pushWithoutChecks", "token-guard: run the project's pipeline steps locally before you push (lint, typecheck, tests, security scan, build: the same commands as its CI), and quote each result under \"Local checks\" in your report. Then push.");
+        }
+      }
       if (git) return block("gitSafety", `token-guard: blocked: ${git}. Merges to main happen only through a reviewed merge request (the Team Lead merges when the pipeline is green).`);
       if (MUTATING_OPENCLAW.test(command)) return block("protectedConfig", `token-guard: changing OpenClaw config, plugins, crons, secrets, agents or models is not allowed for agents. ${RULES_MESSAGE}`);
       if (/(?:^|[\s;&|])chattr\s/.test(command)) return block("protectedFile", `token-guard: chattr is not allowed. ${RULES_MESSAGE}`);
@@ -601,12 +630,18 @@ function policyDecide(event, ctx, pstate, rawConfig, log, now = Date.now()) {
     if (runtime !== "subagent" && !(runtime === "acp" && policy.spawn.allowAcp)) {
       return block("spawnRuntime", `token-guard: runtime "${params.runtime}" is not allowed. Dispatch a team agent (agentId = the role) without runtime.`);
     }
-    if (params.model) {
-      const m = normaliseModel(params.model, allowed);
-      if (m === null) return block("spawnModel", `token-guard: model "${params.model}" is not allowed. Use one of: ${allowed.join(", ")}.`);
+    // The brief's "Model:" and "Effort:" lines decide the task's model and thinking (they win over the
+    // parameters, so what the brief says is what runs).
+    const lineModel = briefSetting(params.task, "Model");
+    const lineEffort = briefSetting(params.task, "Effort").toLowerCase();
+    const wantModel = lineModel || params.model;
+    const wantThinking = lineEffort || params.thinking;
+    if (wantModel) {
+      const m = normaliseModel(wantModel, allowed);
+      if (m === null) return block("spawnModel", `token-guard: model "${wantModel}" is not allowed. Use one of: ${allowed.join(", ")}.`);
     }
-    if (params.thinking && !(policy.spawn.allowedThinking || []).includes(String(params.thinking).toLowerCase())) {
-      return block("spawnThinking", `token-guard: thinking "${params.thinking}" is not allowed. Use one of: ${(policy.spawn.allowedThinking || []).join(", ")}.`);
+    if (wantThinking && !(policy.spawn.allowedThinking || []).includes(String(wantThinking).toLowerCase())) {
+      return block("spawnThinking", `token-guard: thinking "${wantThinking}" is not allowed. Use one of: ${(policy.spawn.allowedThinking || []).join(", ")}.`);
     }
     if (policy.board.enabled && policy.board.requireItems && pstate && typeof pstate.boardItems === "function") {
       const board = pstate.boardItems();
@@ -662,6 +697,8 @@ function policyDecide(event, ctx, pstate, rawConfig, log, now = Date.now()) {
       return block("bothLimited", `token-guard: Claude (until ${at(claudeUntil)} UTC) and Codex (until ${at(codexUntil)} UTC) are both at their usage limits, so this task would fail at once. Do not dispatch now and leave its items in To do: the job tracker wakes you again once a limit has reset.`);
     }
     const input = Object.assign({}, params);
+    if (wantModel) input.model = wantModel;
+    if (wantThinking) input.thinking = wantThinking;
     if (input.model) input.model = normaliseModel(input.model, allowed);
     if (input.thinking) input.thinking = String(input.thinking).toLowerCase();
     const { params: next, notes } = spawnRewrite(input, policy, pstate, now);
@@ -674,6 +711,9 @@ function policyDecide(event, ctx, pstate, rawConfig, log, now = Date.now()) {
 }
 
 export {
+  briefSetting,
+  CHECK_COMMAND,
+  GIT_PUSH,
   completeBrief,
   similarOpenItem,
   DEFAULT_POLICY,
