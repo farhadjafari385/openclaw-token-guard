@@ -210,3 +210,11 @@ test("each brief names the skills that fit its task", async () => {
   assert.match(skillsLine(a), /^Skills for this task \(open each one's SKILL.md before you start and follow it\): product-design-playbook/);
   assert.deepEqual(selectSkills("anything", []), []);
 });
+
+test("missing proof: real files are judged, shortened or pattern paths are not", async () => {
+  const { missingProof } = await import("../jobs.js");
+  const exists = (f) => f === "/tmp/real.png";
+  const text = "Shots: /tmp/real.png and /tmp/gone.png; also /home/u/media/e3a16ae0...png and /home/u/qa/after-{390x844,1440x900}.png and /tmp/shot-*.png";
+  assert.deepEqual(missingProof(text, exists), ["/tmp/gone.png"]);
+  assert.deepEqual(missingProof("no paths here", exists), []);
+});

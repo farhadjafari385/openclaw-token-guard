@@ -212,6 +212,14 @@ function recordUsage(data, sessionKey, usage, cfg) {
 
 const HAS_RESULT = /^\s*[*_`>]*\s*RESULT\s*[:=-]/im;
 
+// Proof files a report cites that do not exist. Shortened ("…", "...") or pattern paths ({a,b}, *) are not
+// literal files, so they are not judged (they produced false "missing proof" flags).
+function missingProof(text, exists) {
+  const cited = [...new Set(String(text || "").match(/(?:~|\/home|\/tmp|\/srv)\/[^\s`'")\]]+\.(?:png|jpe?g|webp|gif|webm|mp4|json|log|txt|html)/gi) || [])]
+    .filter((f) => !/\.\.\.|…|[{}*?]/.test(f)).slice(0, 30);
+  return cited.filter((f) => { try { return !exists(f); } catch { return false; } }).slice(0, 10);
+}
+
 // The worker's final answer among its text blocks: from the last block with a RESULT line to the end,
 // else the last block. (Joining every block kept the run's narration and cut the real report off.)
 function finalAnswer(texts) {
@@ -455,6 +463,7 @@ export {
   recordUsage,
   recordResultText,
   finalAnswer,
+  missingProof,
   recordEnd,
   recordProgress,
   setClaudeLimited,
