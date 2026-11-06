@@ -87,4 +87,23 @@ function limitResetAt(text, now = Date.now()) {
   }
 }
 
-export { isLimitError, limitResetAt, tzOffsetMinutes, zonedToUtc, DEFAULT_LIMIT_MS };
+// The provider's usage-limit error that OpenClaw sends as the agent's reply when a run fails
+// ("⚠️ You've hit your weekly limit · resets 9pm (America/New_York)"). OpenClaw's failure replies
+// start with ⚠️; an agent's own message that only talks about a limit is longer or starts otherwise.
+function isLimitReply(text) {
+  const t = String(text || "").trim();
+  return t.length > 0 && t.length <= 300 && t.startsWith("⚠️") && isLimitError(t);
+}
+
+// One limit reply per chat (and topic) until the limit resets. In a group where the agent answers
+// every message, each message would otherwise get the same error back. `seen` maps a destination
+// to the reset time; returns true when this reply may go out.
+function allowLimitReply(seen, dest, text, now = Date.now()) {
+  for (const [k, until] of seen) if (until <= now) seen.delete(k);
+  if ((seen.get(dest) || 0) > now) return false;
+  seen.set(dest, limitResetAt(text, now));
+  if (seen.size > 500) seen.delete(seen.keys().next().value);
+  return true;
+}
+
+export { isLimitError, isLimitReply, allowLimitReply, limitResetAt, tzOffsetMinutes, zonedToUtc, DEFAULT_LIMIT_MS };
