@@ -7,7 +7,7 @@ import { isLimitBlock, normStatus, resultVerdict, nextAfterJob, renderBoard, ren
 import { correctTopic, isGeneral, projectOfTopic, projectsMentioned } from "./topics.js";
 import { isLimitError, isLimitReply, allowLimitReply, limitResetAt } from "./limits.js";
 import {
-  createJobStore, mergeJobsConfig, recordSpawn, recordActivity, recordUsage, recordResultText, finalAnswer, missingProof,
+  createJobStore, mergeJobsConfig, recordSpawn, recordActivity, recordUsage, recordCall, recordResultText, finalAnswer, missingProof,
   recordEnd, recordProgress, setClaudeLimited, setCodexLimited, scanJobs, lastAssistantText,
 } from "./jobs.js";
 import { createMirror, topicFor, messageIdOf } from "./mirror.js";
@@ -18,7 +18,7 @@ import {
 import { inboxArgs, loadInboxItems, runInbox } from "./inbox.js";
 import { processBoot } from "./boot.js";
 import { selectSkills, skillsLine } from "./skills.js";
-import { mergeTriageConfig, triageSnapshot, TRIAGE_PROMPT, parseTriage, triageWakeMessage } from "./triage.js";
+import { mergeTriageConfig, triageSnapshot, triageSignature, TRIAGE_PROMPT, parseTriage, triageWakeMessage } from "./triage.js";
 import fs from "node:fs";
 
 // No top-level await: OpenClaw loads plugin entries through require(), which
@@ -293,6 +293,12 @@ export default definePluginEntry({
       for (const j of Object.values(store.data.jobs)) if (j.status === "running") for (const id of j.items || []) ids.add(id);
       return ids;
     };
+    const orcRunCalls = new Map(); // orchestrator run id -> tool calls so far
+    const countOrcCall = (runId) => {
+      if (!runId) return;
+      orcRunCalls.set(runId, (orcRunCalls.get(runId) || 0) + 1);
+      if (orcRunCalls.size > 200) orcRunCalls.delete(orcRunCalls.keys().next().value);
+    };
     const pstate = {
       get claudeLimitedUntil() { return store.data.claudeLimitedUntil || 0; },
       get codexLimitedUntil() { return store.data.codexLimitedUntil || 0; },
@@ -306,6 +312,7 @@ export default definePluginEntry({
         const job = store.data.jobs[sessionKey];
         return job && job.status === "running" ? job : null;
       },
+      runCalls: (runId) => (runId && orcRunCalls.get(runId)) || 0,
       onBlock: (rule, info) => {
         if (["protectedFile", "protectedConfig", "backChannel", "spawnByWorker", "sendByWorker", "orchestratorOnly", "modelPin"].includes(rule)) {
           systemNote(`${rule}:${info.agentId}`, guardText(voice, rule, info), { html: true });
@@ -409,6 +416,13 @@ export default definePluginEntry({
           const now = Date.now();
           knowJob(ctx && ctx.sessionKey);
           if (recordActivity(store.data, ctx && ctx.sessionKey, ctx && ctx.agentId, orchestrator, now)) store.touch();
+          // Budgets count tool calls: the Claude CLI reports almost no token usage to plugins.
+          if (ctx && ctx.agentId === orchestrator) countOrcCall(ctx.runId);
+          const spent = recordCall(store.data, ctx && ctx.sessionKey, jobsCfg);
+          if (spent) {
+            store.save();
+            post(pm, spent.topic || "system", budgetText(voice, spent, `${jobsCfg.budgetCalls} tool calls`), { html: true, replyTo: spent.dispatchMsgId || null });
+          }
           // A dispatch brief missing a required line is completed from its board items.
           let base = event;
           if (event.toolName === "sessions_spawn" && ctx && ctx.agentId === orchestrator && event.params && event.params.task) {
@@ -654,7 +668,7 @@ export default definePluginEntry({
       const over = recordUsage(store.data, key, event && event.usage, jobsCfg);
       if (over) {
         store.touch();
-        post(pm, over.topic || "system", budgetText(voice, over, Math.round(over.usedTokens / 1e6)), { html: true, replyTo: over.dispatchMsgId || null });
+        post(pm, over.topic || "system", budgetText(voice, over, `${Math.round(over.usedTokens / 1e6)}M tokens`), { html: true, replyTo: over.dispatchMsgId || null });
       }
     }));
 
@@ -781,6 +795,10 @@ export default definePluginEntry({
       store.save();
       const snapshot = triageSnapshot(store.data, inboxItems, now);
       if (!snapshot) return; // nothing to decide: no tokens spent
+      // Nothing changed since the last wake: the orchestrator already saw this state (no tokens spent).
+      const sig = triageSignature(store.data, inboxItems, now);
+      const t = store.data.triage;
+      if (t.wokeSig === sig && now - (t.wokeAt || 0) < triageCfg.sameStateRewakeMinutes * 60000) return;
       const sessionKey = `agent:${orchestrator}:subagent:triage-${now.toString(36)}`;
       const [provider, ...rest] = String(triageCfg.model).split("/");
       let decision = null;
@@ -808,6 +826,8 @@ export default definePluginEntry({
         return;
       }
       store.data.triageWakesByDay[day] = (store.data.triageWakesByDay[day] || 0) + 1;
+      store.data.triage.wokeSig = sig;
+      store.data.triage.wokeAt = now;
       store.touch();
       store.save();
       log("info", "token-guard triage woke the orchestrator", { effort: decision.effort });

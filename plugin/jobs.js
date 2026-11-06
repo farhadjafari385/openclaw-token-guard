@@ -25,6 +25,9 @@ const DEFAULT_JOBS = {
   idleWakeSession: "agent:coordinator:main",
   maxWakesPerDay: 48,
   budgetTokens: 15000000, // tokens a single task may process (input + cache + output)
+  // Tool calls a single task may make. The Claude CLI reports almost no usage to plugins (a 6.4M-token
+  // task showed up as under 0.1M), so the token budget alone never fired; every tool call reaches the guard.
+  budgetCalls: 100,
   keepEndedHours: 48,
   maxBriefChars: 6000,
   maxResultChars: 6000,
@@ -204,6 +207,18 @@ function recordUsage(data, sessionKey, usage, cfg) {
   const n = (usage.input || 0) + (usage.cacheRead || 0) + (usage.cacheWrite || 0) + (usage.output || 0);
   job.usedTokens = (job.usedTokens || 0) + n;
   if (!job.overBudget && cfg.budgetTokens > 0 && job.usedTokens > cfg.budgetTokens) {
+    job.overBudget = true;
+    return job;
+  }
+  return null;
+}
+
+// One tool call by a running task; returns the job when this call used up its budget.
+function recordCall(data, sessionKey, cfg) {
+  const job = data.jobs[sessionKey];
+  if (!job || job.status !== "running") return null;
+  job.toolCalls = (job.toolCalls || 0) + 1;
+  if (!job.overBudget && cfg.budgetCalls > 0 && job.toolCalls > cfg.budgetCalls) {
     job.overBudget = true;
     return job;
   }
@@ -461,6 +476,7 @@ export {
   recordSpawn,
   recordActivity,
   recordUsage,
+  recordCall,
   recordResultText,
   finalAnswer,
   missingProof,

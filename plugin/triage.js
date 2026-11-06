@@ -10,7 +10,10 @@ const DEFAULT_TRIAGE = {
   everyMinutes: 10,
   model: "anthropic/claude-haiku-5-5",
   orchestratorQuietMinutes: 10, // do not interrupt an orchestrator that is working
-  maxWakesPerDay: 72, // its own budget, separate from the plain reminders
+  maxWakesPerDay: 24, // its own budget, separate from the plain reminders
+  // The same board state does not wake the orchestrator again within this time: woken every 36 minutes
+  // for the same 30 waiting items, it once spent the whole weekly Claude limit re-checking them.
+  sameStateRewakeMinutes: 180,
 };
 
 function mergeTriageConfig(cfg) {
@@ -41,12 +44,28 @@ function triageSnapshot(data, items, now) {
   return parts.join("\n");
 }
 
+// What the orchestrator would be woken for: waiting items (id and column), unanswered results and owner
+// requests. Times are left out, so the same state gives the same signature.
+function triageSignature(data, items, now) {
+  const jobs = Object.values(data.jobs || {});
+  const covered = new Set(jobs.filter((j) => j.status === "running").flatMap((j) => j.items || []));
+  const waiting = items
+    .filter((it) => ["todo", "in_progress", "review", "qa"].includes(normStatus(it.status)) && !covered.has(it.id))
+    .map((it) => `${it.id}:${normStatus(it.status)}`);
+  const unacted = jobs
+    .filter((j) => j.status !== "running" && j.resultMsgId && !j.answeredAt && now - (j.endedAt || 0) < 6 * 3600000)
+    .map((j) => `r:${j.resultMsgId}`);
+  const asks = (data.ownerAsks || []).filter((a) => !a.captured && now - a.at < 6 * 3600000).map((a) => `a:${a.at}`);
+  return [...waiting.sort(), ...unacted.sort(), ...asks.sort()].join(",");
+}
+
 const TRIAGE_PROMPT =
   "You are the team's triage check. The orchestrator (on Opus) runs a team of AI agents for the owner. " +
   "Below is the current state. Decide whether the orchestrator must act now. It must act when an open item " +
   "has no task running and is not waiting on the owner, when a result is unanswered, or when an owner request " +
-  "is not on the board. Choose its effort: low for routine dispatch or acceptance, medium by default, high for " +
-  "production, repeated failures, a red main or anything the owner asked for more than once. " +
+  "is not on the board. Do not wake it for items that wait on the owner, an approval or a usage limit. Choose its effort: " +
+  "low for routine dispatch or acceptance (the default), medium when a decision needs thought, high only for a " +
+  "production outage or a red main. " +
   'Reply with JSON only: {"wake": true|false, "effort": "low"|"medium"|"high", "why": "<one line>", ' +
   '"instruction": "<what the orchestrator should do first, naming item ids>"}\n\n';
 
@@ -71,4 +90,4 @@ function triageWakeMessage(decision, snapshot) {
   );
 }
 
-export { DEFAULT_TRIAGE, mergeTriageConfig, triageSnapshot, TRIAGE_PROMPT, parseTriage, triageWakeMessage };
+export { DEFAULT_TRIAGE, mergeTriageConfig, triageSnapshot, triageSignature, TRIAGE_PROMPT, parseTriage, triageWakeMessage };
