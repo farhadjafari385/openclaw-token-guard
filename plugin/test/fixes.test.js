@@ -55,17 +55,18 @@ test("a 'running' task far past its timeout lost its end event: closed quietly, 
   assert.equal(long.jobs[KEY].status, "running"); // a longer timeout is respected
 });
 
-test("usage limits: route around the limited provider, never into it; both limited blocks the spawn", () => {
+test("usage limits (Codex turned on): route around the limited provider, never into it; both limited blocks the spawn", () => {
   const now = Date.now();
   const COORD = { agentId: "coordinator", sessionKey: ORC };
+  const ON = { spawn: { codexModel: "openai/gpt-6-astra", allowedModels: ["anthropic/claude-opus-5-5", "anthropic/claude-sonnet-5", "anthropic/claude-sonnet-5-5", "openai/gpt-6-astra"] } };
   const task = (model) => ({ toolName: "sessions_spawn", params: { agentId: "devops", task: "Project: demo\nFix CI", model, label: "demo: x" } });
   const codexOff = { codexLimitedUntil: now + 3600000 };
   const claudeOff = { claudeLimitedUntil: now + 3600000 };
-  assert.equal(policyDecide(task("openai/gpt-6-astra"), COORD, codexOff, {}, null, now).params.model, "anthropic/claude-sonnet-5");
-  assert.equal(policyDecide(task("anthropic/claude-sonnet-5-5"), COORD, codexOff, {}, null, now).params.model, "anthropic/claude-sonnet-5-5");
-  assert.equal(policyDecide(task("anthropic/claude-opus-5-5"), COORD, claudeOff, {}, null, now).params.model, "openai/gpt-6-astra");
-  assert.equal(policyDecide(task("openai/gpt-6-astra"), COORD, claudeOff, {}, null, now).params.model, "openai/gpt-6-astra");
-  const both = policyDecide(task("anthropic/claude-sonnet-5"), COORD, Object.assign({}, codexOff, claudeOff), {}, null, now);
+  assert.equal(policyDecide(task("openai/gpt-6-astra"), COORD, codexOff, ON, null, now).params.model, "anthropic/claude-sonnet-5");
+  assert.equal(policyDecide(task("anthropic/claude-sonnet-5-5"), COORD, codexOff, ON, null, now).params.model, "anthropic/claude-sonnet-5-5");
+  assert.equal(policyDecide(task("anthropic/claude-opus-5-5"), COORD, claudeOff, ON, null, now).params.model, "openai/gpt-6-astra");
+  assert.equal(policyDecide(task("openai/gpt-6-astra"), COORD, claudeOff, ON, null, now).params.model, "openai/gpt-6-astra");
+  const both = policyDecide(task("anthropic/claude-sonnet-5"), COORD, Object.assign({}, codexOff, claudeOff), ON, null, now);
   assert.equal(both.block, true);
   assert.match(both.blockReason, /both at their usage limits/);
   // and the tracker spends no wakes while both are limited
@@ -73,7 +74,28 @@ test("usage limits: route around the limited provider, never into it; both limit
   Object.assign(d, { claudeLimitedUntil: now + 3600000, codexLimitedUntil: now + 3600000 });
   recordSpawn(d, { childSessionKey: KEY, agentId: "devops", label: "x", requesterSessionKey: ORC }, "b", now - 20 * MIN, CFG);
   recordEnd(d, KEY, "ok", "", now - 10 * MIN);
+  assert.deepEqual(scanJobs(d, CFG, now, Object.assign(env(), { codexEnabled: true })).filter((x) => x.kind === "wake"), []);
+});
+
+test("Codex off (the default): Claude's limit alone stops wakes, and a stale Codex limit changes nothing", () => {
+  const now = Date.now();
+  const COORD = { agentId: "coordinator", sessionKey: ORC };
+  const task = (model) => ({ toolName: "sessions_spawn", params: { agentId: "devops", task: "Project: demo\nFix CI", model, label: "demo: x" } });
+  const claudeOff = policyDecide(task("anthropic/claude-sonnet-5"), COORD, { claudeLimitedUntil: now + 3600000 }, {}, null, now);
+  assert.equal(claudeOff.block, true);
+  assert.match(claudeOff.blockReason, /Claude is at its usage limit until .* there is no fallback/);
+  // an old Codex limit does not block or reroute anything while Codex is off
+  const codexOnly = policyDecide(task("anthropic/claude-sonnet-5"), COORD, { codexLimitedUntil: now + 3600000 }, {}, null, now);
+  assert.equal(codexOnly.block, undefined);
+  assert.equal(codexOnly.params.model, "anthropic/claude-sonnet-5");
+  const d = emptyState();
+  d.claudeLimitedUntil = now + 3600000;
+  recordSpawn(d, { childSessionKey: KEY, agentId: "devops", label: "x", requesterSessionKey: ORC }, "b", now - 20 * MIN, CFG);
+  recordEnd(d, KEY, "ok", "", now - 10 * MIN);
   assert.deepEqual(scanJobs(d, CFG, now, env()).filter((x) => x.kind === "wake"), []);
+  // after the reset the result is followed up again
+  d.claudeLimitedUntil = now - 1;
+  assert.ok(scanJobs(d, CFG, now + 30 * MIN, env()).some((x) => x.kind === "wake"));
 });
 
 test("Blocked only by a usage limit resumes by itself; Blocked on the owner never does", async () => {

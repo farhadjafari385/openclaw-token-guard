@@ -319,8 +319,8 @@ function scanJobs(data, rawCfg, now, env) {
   const pm = env.pmAgent || voice.pmAgent || "product"; // the PM keeps the board moving, so it chases
   const wake = (sessionKey, message, reason) => {
     if (!sessionKey) return false;
-    // Both subscriptions at their limit: a wake cannot run, so do not spend one.
-    if ((data.claudeLimitedUntil || 0) > now && (data.codexLimitedUntil || 0) > now) return false;
+    // Claude at its limit and no Codex to run on (off, or limited too): a wake cannot run, so do not spend one.
+    if ((data.claudeLimitedUntil || 0) > now && (!env.codexEnabled || (data.codexLimitedUntil || 0) > now)) return false;
     if (!canWake(data, cfg, now)) {
       const day = dayKey(now);
       if (data.notes.wakeCap !== day) {

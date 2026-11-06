@@ -113,12 +113,28 @@ test("spawn policy: delete when done, isolated, enough time, allowed models and 
   assert.equal(rule(policyDecide(spawn({ thinking: "xhigh" }), COORD, {}, {})), "spawnThinking");
 });
 
-test("while Claude is limited, new tasks go to Codex automatically", () => {
+const CODEX_ON = { spawn: { codexModel: "openai/gpt-6-astra", allowedModels: ["anthropic/claude-opus-5-5", "anthropic/claude-sonnet-5", "anthropic/claude-sonnet-5-5", "anthropic/claude-haiku-5-5", "openai/gpt-6-astra"] } };
+
+test("with Codex turned on (spawn.codexModel), new tasks go to Codex while Claude is limited", () => {
   const now = Date.now();
   const spawn = (extra) => ({ toolName: "sessions_spawn", params: { agentId: "writer", task: "Project: ai\nX", ...extra } });
   const limited = { claudeLimitedUntil: now + 3600000 };
-  assert.equal(policyDecide(spawn({ model: "anthropic/claude-opus-5-5" }), COORD, limited, {}, null, now).params.model, "openai/gpt-6-astra");
-  assert.equal(policyDecide(spawn({}), COORD, limited, {}, null, now).params.model, "openai/gpt-6-astra");
+  assert.equal(policyDecide(spawn({ model: "anthropic/claude-opus-5-5" }), COORD, limited, CODEX_ON, null, now).params.model, "openai/gpt-6-astra");
+  assert.equal(policyDecide(spawn({}), COORD, limited, CODEX_ON, null, now).params.model, "openai/gpt-6-astra");
+  assert.equal(policyDecide(spawn({ model: "anthropic/claude-opus-5-5" }), COORD, { claudeLimitedUntil: now - 1 }, CODEX_ON, null, now).params.model, "anthropic/claude-opus-5-5");
+});
+
+test("Codex is off by default: while Claude is limited a task waits (blocked), it never moves to Codex", () => {
+  const now = Date.now();
+  const spawn = (extra) => ({ toolName: "sessions_spawn", params: { agentId: "writer", task: "Project: ai\nX", ...extra } });
+  const limited = { claudeLimitedUntil: now + 3600000 };
+  const r = policyDecide(spawn({ model: "anthropic/claude-opus-5-5" }), COORD, limited, {}, null, now);
+  assert.equal(r.block, true);
+  assert.match(r.blockReason, /no fallback \(Codex is off\)/);
+  assert.equal(policyDecide(spawn({}), COORD, limited, {}, null, now).block, true);
+  // a Codex model is not even allowed by default
+  assert.equal(rule(policyDecide(spawn({ model: "openai/gpt-6-astra" }), COORD, {}, {})), "spawnModel");
+  // once the limit has reset, the task runs on the model it asked for
   assert.equal(policyDecide(spawn({ model: "anthropic/claude-opus-5-5" }), COORD, { claudeLimitedUntil: now - 1 }, {}, null, now).params.model, "anthropic/claude-opus-5-5");
 });
 

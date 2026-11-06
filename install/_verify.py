@@ -47,7 +47,8 @@ def main(argv):
     # Not a failure (fallback is optional), but without one a limit stops the agent.
     strict = [p for p, m in _plan.model_paths(cfg) if not (isinstance(m, dict) and m.get("fallbacks"))]
     print(("PASS  every model has a fallback" if not strict else
-           f"WARN  no fallback model, so a limit stops these: {', '.join(strict)} (apply.sh --fallback-model=...)"))
+           f"INFO  no fallback model: at a usage limit these wait for the reset: {', '.join(strict)} "
+           "(fine on one provider; apply.sh --fallback-model=... adds a second one)"))
     tools, path = _plan.agent_tools(cfg, args.coordinator)
     check("task_inbox" in (tools.get("alsoAllow") or []) + (tools.get("allow") or []), f"{path} allows task_inbox")
 
