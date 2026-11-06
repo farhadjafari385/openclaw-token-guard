@@ -2,7 +2,7 @@ import crypto from "node:crypto";
 import { definePluginEntry } from "openclaw/plugin-sdk/plugin-entry";
 import { Type } from "typebox";
 import { createState, decide } from "./guard.js";
-import { policyDecide, firstLine, itemsFromBrief } from "./policy.js";
+import { policyDecide, firstLine, itemsFromBrief, completeBrief } from "./policy.js";
 import { isLimitBlock, normStatus, resultVerdict, nextAfterJob, renderBoard, renderOverview, auditBoard, parseApproval, looksLikeRequest } from "./board.js";
 import { correctTopic, isGeneral, projectOfTopic, projectsMentioned } from "./topics.js";
 import { isLimitError, limitResetAt } from "./limits.js";
@@ -394,12 +394,18 @@ export default definePluginEntry({
           const now = Date.now();
           knowJob(ctx && ctx.sessionKey);
           if (recordActivity(store.data, ctx && ctx.sessionKey, ctx && ctx.agentId, orchestrator, now)) store.touch();
-          const pol = policyDecide(event, ctx, pstate, cfg, log, now);
+          // A dispatch brief missing a required line is completed from its board items.
+          let base = event;
+          if (event.toolName === "sessions_spawn" && ctx && ctx.agentId === orchestrator && event.params && event.params.task) {
+            const task = completeBrief(event.params.task, loadInboxItems());
+            if (task !== event.params.task) base = Object.assign({}, event, { params: Object.assign({}, event.params, { task }) });
+          }
+          const pol = policyDecide(base, ctx, pstate, cfg, log, now);
           if (pol && pol.block) return { block: true, blockReason: pol.blockReason };
-          const rewritten = pol && pol.params ? Object.assign({}, event, { params: pol.params }) : event;
+          const rewritten = pol && pol.params ? Object.assign({}, base, { params: pol.params }) : base;
           const res = decide(rewritten, ctx, state, cfg, log, now);
           if (res && res.block) return res;
-          let params = (res && res.params) || (pol && pol.params);
+          let params = (res && res.params) || (pol && pol.params) || (base !== event ? base.params : undefined);
           if (event.toolName === "sessions_spawn" && ctx && ctx.agentId === orchestrator) {
             params = withOwnerWords(params || event.params || {}) || params;
             rememberSpawn(params || event.params || {}, ctx);
