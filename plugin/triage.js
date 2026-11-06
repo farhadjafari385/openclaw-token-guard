@@ -34,10 +34,11 @@ const ago = (now, ts) => {
 function triageSnapshot(data, items, now) {
   const jobs = Object.values(data.jobs || {});
   const running = jobs.filter((j) => j.status === "running");
-  const covered = new Set(running.flatMap((j) => j.items || []));
+  const ciWait = (j) => j.waitFor && !j.waitFor.done; // pushed, the guard follows its pipeline
+  const covered = new Set(jobs.filter((j) => j.status === "running" || ciWait(j)).flatMap((j) => j.items || []));
   const open = items.filter((it) => ["todo", "in_progress", "review", "qa"].includes(normStatus(it.status)));
   const waiting = open.filter((it) => !covered.has(it.id));
-  const unacted = jobs.filter((j) => j.status !== "running" && j.resultMsgId && !j.answeredAt && now - (j.endedAt || 0) < 6 * 3600000);
+  const unacted = jobs.filter((j) => j.status !== "running" && !ciWait(j) && j.resultMsgId && !j.answeredAt && now - (j.endedAt || 0) < 6 * 3600000);
   const asks = (data.ownerAsks || []).filter((a) => askOpen(a, now));
   if (!waiting.length && !unacted.length && !asks.length) return null;
   const line = (it) => `- ${it.id} [${normStatus(it.status)}] ${it.project || "?"}: ${String(it.title || "").slice(0, 90)} (owner ${it.owner || "?"}, updated ${ago(now, it.updated_ts || it.created_ts)})`;
@@ -53,12 +54,12 @@ function triageSnapshot(data, items, now) {
 // requests. Times are left out, so the same state gives the same signature.
 function triageSignature(data, items, now) {
   const jobs = Object.values(data.jobs || {});
-  const covered = new Set(jobs.filter((j) => j.status === "running").flatMap((j) => j.items || []));
+  const covered = new Set(jobs.filter((j) => j.status === "running" || (j.waitFor && !j.waitFor.done)).flatMap((j) => j.items || []));
   const waiting = items
     .filter((it) => ["todo", "in_progress", "review", "qa"].includes(normStatus(it.status)) && !covered.has(it.id))
     .map((it) => `${it.id}:${normStatus(it.status)}`);
   const unacted = jobs
-    .filter((j) => j.status !== "running" && j.resultMsgId && !j.answeredAt && now - (j.endedAt || 0) < 6 * 3600000)
+    .filter((j) => j.status !== "running" && !(j.waitFor && !j.waitFor.done) && j.resultMsgId && !j.answeredAt && now - (j.endedAt || 0) < 6 * 3600000)
     .map((j) => `r:${j.resultMsgId}`);
   const asks = (data.ownerAsks || []).filter((a) => askOpen(a, now)).map((a) => `a:${a.at}`);
   return [...waiting.sort(), ...unacted.sort(), ...asks.sort()].join(",");

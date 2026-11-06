@@ -30,6 +30,17 @@ class TestOcInbox(unittest.TestCase):
     def tearDown(self):
         self.tmpdir.cleanup()
 
+    def test_pm_sets_queue_rank_and_priority(self):
+        item_id = run(["add", "--project", "demo", "--title", "Ship the paywall", "--done-when", "live"], self.inbox_file).stdout.strip()
+        p = run(["set", item_id, "--rank", "1", "--priority", "urgent"], self.inbox_file)
+        self.assertEqual(p.returncode, 0, p.stderr)
+        it = json.loads(run(["list", "--json"], self.inbox_file).stdout)[0]
+        self.assertEqual((it["rank"], it["priority"]), (1, "urgent"))
+        run(["set", item_id, "--rank", "0"], self.inbox_file)  # 0 clears the rank
+        self.assertIsNone(json.loads(run(["list", "--json"], self.inbox_file).stdout)[0]["rank"])
+        self.assertEqual(run(["set", item_id, "--rank", "-2"], self.inbox_file).returncode, 2)
+        self.assertNotEqual(run(["set", item_id, "--priority", "huge"], self.inbox_file).returncode, 0)
+
     def test_add_and_list(self):
         p = run(["add", "--project", "demo", "--title", "Do the thing", "--priority", "high",
                  "--done-when", "it is done"], self.inbox_file)

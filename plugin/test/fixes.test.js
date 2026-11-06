@@ -316,3 +316,19 @@ test("an owner request sent during a usage limit stays open until 6 hours after 
   assert.equal(askOpen(Object.assign({}, held, { captured: true }), reset + H), false);
   assert.match(triageSnapshot({ jobs: {}, ownerAsks: [held] }, [], reset + H), /Owner messages not on the board yet \(1\)/);
 });
+
+test("an item waiting on CI is in hand: triage does not wake for it, and its result needs no answer yet", async () => {
+  const { triageSnapshot, triageSignature } = await import("../triage.js");
+  const now = Date.UTC(2026, 10, 7, 3, 0);
+  const waitJob = { status: "ended", items: ["2fda6c5a"], resultMsgId: 9, endedAt: now - 60000, waitFor: { kind: "gitlab-pipeline", url: "https://gitlab.com/g/p/-/pipelines/1", since: now - 60000 } };
+  const items = [{ id: "2fda6c5a", project: "demo", status: "in_progress", title: "Fix CI" }];
+  assert.equal(triageSnapshot({ jobs: { k: waitJob }, ownerAsks: [] }, items, now), null);
+  const finished = Object.assign({}, waitJob, { waitFor: Object.assign({}, waitJob.waitFor, { done: { state: "failed" } }) });
+  assert.match(triageSnapshot({ jobs: { k: finished }, ownerAsks: [] }, items, now), /Open items with no task running \(1\)/);
+  assert.notEqual(triageSignature({ jobs: { k: waitJob }, ownerAsks: [] }, items, now), triageSignature({ jobs: { k: finished }, ownerAsks: [] }, items, now));
+});
+
+test("the board tool passes the PM's rank and priority on set", async () => {
+  const { inboxArgs } = await import("../inbox.js");
+  assert.deepEqual(inboxArgs({ action: "set", id: "a1b2c3d4", rank: 1, priority: "urgent" }), ["set", "a1b2c3d4", "--priority", "urgent", "--rank", "1", "--by", "agent"]);
+});
