@@ -2,12 +2,12 @@ import crypto from "node:crypto";
 import { definePluginEntry } from "openclaw/plugin-sdk/plugin-entry";
 import { Type } from "typebox";
 import { createState, decide } from "./guard.js";
-import { policyDecide, firstLine, itemsFromBrief, completeBrief, codexEnabled } from "./policy.js";
+import { policyDecide, firstLine, itemsFromBrief, completeBrief, codexEnabled, CHECK_COMMAND } from "./policy.js";
 import { isLimitBlock, normStatus, resultVerdict, nextAfterJob, queueState, renderBoard, renderOverview, auditBoard, parseApproval, looksLikeRequest } from "./board.js";
 import { correctTopic, isGeneral, projectOfTopic, projectsMentioned } from "./topics.js";
 import { isLimitError, isLimitReply, allowLimitReply, limitResetAt } from "./limits.js";
 import {
-  createJobStore, mergeJobsConfig, recordSpawn, recordActivity, recordUsage, recordCall, recordResultText, finalAnswer, missingProof,
+  createJobStore, mergeJobsConfig, recordSpawn, recordActivity, recordUsage, recordCall, recordCheck, recordResultText, finalAnswer, missingProof,
   recordEnd, recordProgress, setClaudeLimited, setCodexLimited, scanJobs, lastAssistantText,
 } from "./jobs.js";
 import { createMirror, topicFor, messageIdOf } from "./mirror.js";
@@ -20,6 +20,7 @@ import { processBoot } from "./boot.js";
 import { selectSkills, skillsLine } from "./skills.js";
 import { mergeTriageConfig, triageSnapshot, triageSignature, TRIAGE_PROMPT, parseTriage, triageWakeMessage } from "./triage.js";
 import { parseCiLink, ciRequest, ciState, failedParts, DEFAULT_CI } from "./ci.js";
+import { allowAgentWake, wakeMessage, DEFAULT_WAKE, WAKE_REASONS } from "./wake.js";
 import fs from "node:fs";
 
 // No top-level await: OpenClaw loads plugin entries through require(), which
@@ -421,6 +422,8 @@ export default definePluginEntry({
           if (recordActivity(store.data, ctx && ctx.sessionKey, ctx && ctx.agentId, orchestrator, now)) store.touch();
           // Budgets count tool calls: the Claude CLI reports almost no token usage to plugins.
           if (ctx && ctx.agentId === orchestrator) countOrcCall(ctx.runId);
+          const bareName = String(event.toolName || "").split("__").pop();
+          if (bareName === "exec" && CHECK_COMMAND.test(String((event.params && event.params.command) || ""))) recordCheck(store.data, ctx && ctx.sessionKey);
           const spent = recordCall(store.data, ctx && ctx.sessionKey, jobsCfg);
           if (spent) {
             store.save();
@@ -843,6 +846,12 @@ export default definePluginEntry({
           text = lastAssistantText(got && got.messages);
         }
         post(pm, teamTopic, auditText(voice, res && res.status, text), { html: true });
+        // The PM's findings reach the orchestrator at once (owner's order), not at its next wake.
+        if (String(text || "").trim()) {
+          await api.runtime.subagent.run({ sessionKey: jobsCfg.idleWakeSession, deliver: false,
+            message: `[PM heads-up] The board audit found and fixed this; act on what is left for you (one item at a time):\n${String(text).slice(0, 2500)}` })
+            .catch((error) => log("warn", "token-guard could not pass the PM's heads-up on", { error: String(error && error.message) }));
+        }
         for (const ask of store.data.ownerAsks) ask.captured = true; // the PM has seen them
         if (typeof api.runtime.subagent.deleteSession === "function") await api.runtime.subagent.deleteSession({ sessionKey }).catch(() => null);
         const board = loadInboxItems();
@@ -951,6 +960,42 @@ export default definePluginEntry({
         },
       });
     }
+
+    // ---- agents wake the orchestrator (owner's order), rate-limited ----
+    const wakeCfg = Object.assign({}, DEFAULT_WAKE, cfg.wake || {});
+    const wakeState = { last: {}, recent: [] };
+    api.registerTool((tctx) => {
+      const agentId = String((tctx && tctx.agentId) || "");
+      if (!agentId || agentId === orchestrator) return null;
+      const callerKey = String((tctx && tctx.sessionKey) || "");
+      return {
+        name: "wake_orchestrator",
+        label: "Wake the orchestrator",
+        description: `Wake the orchestrator now when you are blocked, need its decision, or finished something it must act on before your task ends. ` +
+          `At most once per ${wakeCfg.perAgentMinutes} minutes, ${wakeCfg.maxChars} characters. Your final report still reaches it as usual.`,
+        parameters: Type.Object({
+          reason: Type.String({ description: WAKE_REASONS.join(" | ") }),
+          message: Type.String({ description: `What the orchestrator must know or decide (at most ${wakeCfg.maxChars} characters).` }),
+        }),
+        async execute(_id, params) {
+          const now = Date.now();
+          const gate = allowAgentWake(wakeState, agentId, now, wakeCfg);
+          if (!gate.ok) return { content: [{ type: "text", text: `Not sent: ${gate.why}` }], details: { ok: false } };
+          const job = knowJob(callerKey) || null;
+          const message = wakeMessage(agentId, params && params.reason, params && params.message, job, wakeCfg.maxChars);
+          const day = new Date(now).toISOString().slice(0, 10);
+          store.data.wakesByDay[day] = (store.data.wakesByDay[day] || 0) + 1;
+          store.touch();
+          try {
+            await api.runtime.subagent.run({ sessionKey: jobsCfg.idleWakeSession, message, deliver: false });
+          } catch (error) {
+            return { content: [{ type: "text", text: `Not sent: ${String(error && error.message).slice(0, 160)}. Put it in your final report.` }], details: { ok: false } };
+          }
+          log("info", "token-guard: an agent woke the orchestrator", { agentId, reason: params && params.reason });
+          return { content: [{ type: "text", text: "Sent: the orchestrator is awake and has your message. Carry on with your task." }], details: { ok: true } };
+        },
+      };
+    }, { name: "wake_orchestrator" });
 
     const text = (description) => Type.Optional(Type.String({ description }));
     api.registerTool({

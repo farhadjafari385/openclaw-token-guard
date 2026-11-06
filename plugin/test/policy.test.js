@@ -190,3 +190,33 @@ test("every setting the policy reads is allowed by the plugin's config schema (O
   assert.deepEqual(Object.keys(DEFAULT_POLICY).filter((k) => !(k in schema.properties)), []);
   for (const k of ["jobs", "triage", "skills", "mirror", "topics", "board", "projects"]) assert.ok(k in schema.properties, k);
 });
+
+test("the brief's Model: and Effort: lines decide the task's model and thinking", () => {
+  const brief = (extra) => `Project: demo (/srv/demo)\nScope: x\nItems:\na1b2c3d4\nDone when: tests pass\nStop if: y\n${extra}`;
+  const spawn = (task, params = {}) => ({ toolName: "sessions_spawn", params: Object.assign({ agentId: "writer", task }, params) });
+  const cfg = { board: { requireItems: false } };
+  let r = policyDecide(spawn(brief("Model: anthropic/claude-sonnet-5-5\nEffort: medium")), COORD, {}, cfg);
+  assert.deepEqual([r.params.model, r.params.thinking], ["anthropic/claude-sonnet-5-5", "medium"]);
+  r = policyDecide(spawn(brief("Model: haiku-5-5\nEffort: low"), { model: "anthropic/claude-opus-5-5", thinking: "high" }), COORD, {}, cfg);
+  assert.deepEqual([r.params.model, r.params.thinking], ["anthropic/claude-haiku-5-5", "low"]); // the brief wins
+  assert.equal(rule(policyDecide(spawn(brief("Model: openai/gpt-6\nEffort: low")), COORD, {}, cfg)), "spawnModel");
+  assert.equal(rule(policyDecide(spawn(brief("Model: sonnet-5\nEffort: xhigh")), COORD, {}, cfg)), "spawnThinking");
+  assert.equal(policyDecide(spawn(brief("Model: sonnet-5\nEffort: low")), COORD, {}, cfg).params.model, "anthropic/claude-sonnet-5");
+  assert.equal(policyDecide(spawn(brief("Model: claude-opus-5-5\nEffort: high")), COORD, {}, cfg).params.model, "anthropic/claude-opus-5-5");
+  assert.equal(rule(policyDecide(spawn(brief("Model: 5\nEffort: low")), COORD, {}, cfg)), "spawnModel"); // not a model name
+  // "Model routing ..." in the text is not a Model: line
+  r = policyDecide(spawn(brief("Model routing policy for wake-ups"), { model: "anthropic/claude-sonnet-5" }), COORD, {}, cfg);
+  assert.equal(r.params.model, "anthropic/claude-sonnet-5");
+});
+
+test("a task pushes only after running its project's checks locally (owner's order)", () => {
+  const job = { checksRun: 0 };
+  const ps = { jobFor: (k) => (k === DEVOPS.sessionKey ? job : null) };
+  const r = policyDecide(exec("git -C /srv/demo push -u origin agent/x"), DEVOPS, ps, {});
+  assert.equal(rule(r), "pushWithoutChecks");
+  assert.match(r.blockReason, /Local checks/);
+  job.checksRun = 2;
+  assert.equal(rule(policyDecide(exec("git -C /srv/demo push -u origin agent/x"), DEVOPS, ps, {})), null);
+  assert.equal(rule(policyDecide(exec("git status"), DEVOPS, { jobFor: () => ({ checksRun: 0 }) }, {})), null);
+  assert.equal(rule(policyDecide(exec("git push origin agent/x"), DEVOPS, { jobFor: () => ({ checksRun: 0 }) }, { requireChecksBeforePush: false })), null);
+});
