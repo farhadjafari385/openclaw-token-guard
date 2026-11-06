@@ -144,6 +144,27 @@ test("a task over its token budget may only finish", () => {
   assert.equal(policyDecide(exec("ls"), WRITER_TOPIC, ps, {}), undefined);
 });
 
+test("a task over its tool-call budget is told how many calls it made", () => {
+  const ps = { jobFor: (k) => (k === DEVOPS.sessionKey ? { overBudget: true, toolCalls: 101 } : null) };
+  const r = policyDecide(exec("ls"), DEVOPS, ps, {});
+  assert.equal(rule(r), "taskBudget");
+  assert.match(r.blockReason, /101 tool calls/);
+});
+
+test("one orchestrator run may make only so many tool calls; telling the owner stays allowed", () => {
+  const RUN = Object.assign({ runId: "run-1" }, COORD);
+  const calls = new Map([["run-1", 61], ["run-2", 60]]);
+  const ps = { runCalls: (id) => calls.get(id) || 0 };
+  const r = policyDecide(exec("curl -s https://example.com"), RUN, ps, {});
+  assert.equal(rule(r), "runBudget");
+  assert.match(r.blockReason, /made 60 tool calls/);
+  assert.equal(rule(policyDecide({ toolName: "message", params: { action: "send", message: "status" } }, RUN, ps, {})), null);
+  assert.equal(rule(policyDecide(exec("ls"), Object.assign({}, RUN, { runId: "run-2" }), ps, {})), null); // the 60th call is fine
+  // workers are budgeted per task instead, and 0 turns the run limit off
+  assert.equal(rule(policyDecide(exec("ls"), Object.assign({ runId: "run-1" }, DEVOPS), ps, {})), null);
+  assert.equal(rule(policyDecide(exec("ls"), RUN, ps, { orchestratorMaxCallsPerRun: 0 })), null);
+});
+
 test("warn mode logs and never blocks", () => {
   assert.equal(policyDecide(exec("openclaw config set x y"), DEVOPS, {}, { mode: "warn" }), undefined);
 });

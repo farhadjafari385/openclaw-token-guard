@@ -187,8 +187,8 @@ function teamStuckText(cfg, items, reminders) {
   return `${ownerTag(cfg)} the team is stuck: these items have not moved after ${reminders} reminders to ${handleOf(cfg, orcOf(cfg))}.\n${list}${items.length > 12 ? `\n…and ${items.length - 12} more` : ""}`;
 }
 
-function budgetText(cfg, job, usedMillions) {
-  return `💸 ${handleOf(cfg, job.agentId)}, <b>${esc(titleOf(job.label))}</b> has used its token budget (${usedMillions}M tokens). The guard is stopping new steps: please report what you have now.`;
+function budgetText(cfg, job, used) {
+  return `💸 ${handleOf(cfg, job.agentId)}, <b>${esc(titleOf(job.label))}</b> has used its budget (${esc(String(used))}). The guard is stopping new steps: please report what you have now.`;
 }
 
 const GUARD_WHAT = {

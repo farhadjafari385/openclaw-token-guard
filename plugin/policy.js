@@ -11,6 +11,7 @@ const HOME = os.homedir();
 
 const DEFAULT_POLICY = {
   orchestratorAgent: "coordinator",
+  orchestratorMaxCallsPerRun: 60, // tool calls in one orchestrator run (0 = no limit)
   workspaceRoot: "~/.openclaw/workspace",
   protect: {
     enabled: true,
@@ -437,9 +438,22 @@ function policyDecide(event, ctx, pstate, rawConfig, log, now = Date.now()) {
   // Per-task budget: a worker over budget may only finish with its final answer.
   const job = pstate && typeof pstate.jobFor === "function" ? pstate.jobFor(sessionKey) : null;
   if (job && job.overBudget) {
+    const used = job.toolCalls ? `${job.toolCalls} tool calls` : `${Math.round((job.usedTokens || 0) / 1e6)}M tokens`;
     return block("taskBudget",
-      `token-guard: this task used its token budget (${Math.round((job.usedTokens || 0) / 1e6)}M). Stop now and write your final answer: ` +
+      `token-guard: this task used its budget (${used}). Stop now and write your final answer: ` +
       "RESULT (done / partly done / blocked), what is finished with evidence, what is left, and the exact next step.");
+  }
+
+  // One orchestrator run (a wake or an owner message) may make only so many tool calls: one woken run
+  // once made 617 Opus calls in six hours, doing checks a worker should do. Telling the owner stays allowed.
+  const maxRun = Number(policy.orchestratorMaxCallsPerRun) || 0;
+  if (orchestrator && maxRun > 0 && pstate && typeof pstate.runCalls === "function" && tool !== "message") {
+    const n = pstate.runCalls(ctx && ctx.runId);
+    if (n > maxRun) {
+      return block("runBudget",
+        `token-guard: this run has made ${n - 1} tool calls, the limit for one orchestrator run. Stop now: tell the owner in one short ` +
+        "message what you did and what is next. Checks and fixes belong in a worker's task; the next wake continues the rest.");
+    }
   }
 
   // 1. Rules, guard and config are read-only for every agent.

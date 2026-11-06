@@ -272,3 +272,33 @@ test("no back door to Codex: ACP harness spawns are refused unless allowAcp is s
   const plain = policyDecide({ toolName: "sessions_spawn", params: { runtime: "subagent", agentId: "devops", task: "Project: demo\nFix CI", label: "demo: x" } }, COORD, {}, { board: { requireItems: false } });
   assert.notEqual(plain && plain.block, true);
 });
+
+test("a task's budget counts its tool calls, since the Claude CLI reports almost no token usage", async () => {
+  const { emptyState, recordSpawn, recordCall, mergeJobsConfig } = await import("../jobs.js");
+  const cfg = mergeJobsConfig({ budgetCalls: 3 });
+  const d = emptyState();
+  recordSpawn(d, { childSessionKey: KEY, agentId: "devops", label: "demo: fix CI", topic: 151, requesterSessionKey: ORC }, "b", 0, cfg);
+  assert.equal(recordCall(d, KEY, cfg), null);
+  assert.equal(recordCall(d, KEY, cfg), null);
+  assert.equal(recordCall(d, KEY, cfg), null);
+  const over = recordCall(d, KEY, cfg); // the 4th call is over a budget of 3: reported once
+  assert.equal(over && over.overBudget, true);
+  assert.equal(recordCall(d, KEY, cfg), null);
+  assert.equal(d.jobs[KEY].toolCalls, 5);
+  assert.equal(recordCall(d, "agent:coordinator:telegram:group:-100:topic:1", cfg), null); // not a task
+  assert.equal(mergeJobsConfig({}).budgetCalls, 100);
+});
+
+test("triage: the same board state does not wake the orchestrator again", async () => {
+  const { triageSignature, DEFAULT_TRIAGE } = await import("../triage.js");
+  const items = [{ id: "2fda6c5a", status: "todo", updated_ts: 1 }, { id: "11cec036", status: "review", updated_ts: 2 }, { id: "aaaa0000", status: "blocked" }];
+  const d = { jobs: {}, ownerAsks: [] };
+  const a = triageSignature(d, items, 1000);
+  assert.equal(triageSignature(d, items.map((it) => Object.assign({}, it, { updated_ts: 999 })), 900000), a); // only times changed
+  assert.notEqual(triageSignature(d, [Object.assign({}, items[0], { status: "in_progress" }), items[1]], 1000), a); // an item moved
+  assert.notEqual(triageSignature({ jobs: {}, ownerAsks: [{ at: 500, text: "x" }] }, items, 1000), a); // the owner asked something
+  const running = { jobs: { k: { status: "running", items: ["2fda6c5a"] } }, ownerAsks: [] };
+  assert.notEqual(triageSignature(running, items, 1000), a); // a task picked an item up
+  assert.equal(DEFAULT_TRIAGE.sameStateRewakeMinutes, 180);
+  assert.equal(DEFAULT_TRIAGE.maxWakesPerDay, 24);
+});

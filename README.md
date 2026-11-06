@@ -42,9 +42,9 @@ skip it, and none of it calls a model unless something needs a decision:
 
 | Part | What it does |
 |---|---|
-| `policy.js` | Rules on every tool call: protected files and config, no back channels, only the orchestrator dispatches and it does no specialist work, no model pins, git safety (no `--no-verify`, no pushes to main), one request = one board item, briefs completed from their board items, usage limits respected (a task waits for the reset; Codex only if you turn it on), no dispatch during a gateway restart. |
+| `policy.js` | Rules on every tool call: protected files and config, no back channels, only the orchestrator dispatches and it does no specialist work, no model pins, git safety (no `--no-verify`, no pushes to main), one request = one board item, briefs completed from their board items, usage limits respected (a task waits for the reset; Codex only if you turn it on), no dispatch during a gateway restart, budgets: a task may make `jobs.budgetCalls` tool calls (100) and one orchestrator run `orchestratorMaxCallsPerRun` (60). |
 | `board.js`, `bin/oc-inbox` | The task board: Backlog, To do, In progress, Review, QA, Done, Archived (plus Blocked and Dropped). A task's end moves its items by the worker's RESULT line; archiving needs the orchestrator's and the owner's approval. |
-| `jobs.js`, `triage.js` | Follows every task to its end: unanswered results, silent tasks, restarts and lost end events. Every 10 minutes, when something needs a decision, a cheap model call (no tools) decides whether to wake the orchestrator and at what effort. |
+| `jobs.js`, `triage.js` | Follows every task to its end: unanswered results, silent tasks, restarts and lost end events. Every 10 minutes, when something needs a decision, a cheap model call (no tools) decides whether to wake the orchestrator and at what effort; a board state it already woke the orchestrator for does not wake it again for `triage.sameStateRewakeMinutes` (180). |
 | `skills.js` | Names, in every brief, the skills of that agent that fit the task (matched against each skill's own description). |
 | `voice.js`, `mirror.js` | Writes the team's Telegram threads: request, dispatch, "on it", result (summary first, details folded), the orchestrator's answer, approval asks, all as replies with @mentions. |
 | `index.js` | Wires it into OpenClaw's hooks. |
@@ -73,7 +73,13 @@ the coordinator by itself, so nobody polls.
 By default nothing switches provider. When Claude reports its usage limit, the guard records the reset time,
 refuses new dispatches until then (they would fail at once), spends no wakes or triage calls, and moves items
 that were blocked only by the limit back to To do once it has reset. The orchestrator is told the reset time in
-the System topic.
+the System topic. While the limit lasts, each chat and topic gets OpenClaw's limit error once, not once per
+message.
+
+**Budgets count tool calls.** The Claude CLI reports almost no token usage to plugins (a task that processed 6.4M
+tokens showed up as under 0.1M), so `jobs.budgetTokens` alone never stops a task. Every tool call does reach the
+guard, and each one re-reads the whole context, so the budgets count calls: `jobs.budgetCalls` per task (then it
+may only write its final answer) and `orchestratorMaxCallsPerRun` per orchestrator run (then it may only message).
 
 **Optional: a second provider.** To let new tasks run on Codex while Claude is limited, set
 `spawn.codexModel` (e.g. `"openai/gpt-6-astra"`) and add that model to `spawn.allowedModels`. A Codex limit is
