@@ -614,6 +614,13 @@ function decide(event, ctx, state, rawConfig, log, now = Date.now()) {
         "Spawn with context \"isolated\" and put what the child needs in the brief.");
     }
     const brief = isBrief(text, cfg);
+    // A brief counts as sent only if no check below blocks it: a blocked brief was never sent, and
+    // calling its corrected resend "already sent" told the orchestrator a task ran that never did.
+    let recordedKey = null;
+    const refuse = (rule, reason) => {
+      if (recordedKey) state.sentBriefs.delete(recordedKey);
+      return block(rule, reason);
+    };
     if (brief) {
       state.sentBriefs = state.sentBriefs || new Map();
       const key = `${spawn ? "spawn:" + (params.agentId || "") : params.sessionKey || ""}|${text.replace(/\s+/g, " ").trim().toLowerCase()}`;
@@ -622,12 +629,13 @@ function decide(event, ctx, state, rawConfig, log, now = Date.now()) {
         return block("duplicateBrief", "token-guard: this exact brief was already sent to this target; not sending it again.");
       }
       state.sentBriefs.set(key, now);
+      recordedKey = key;
       for (const [k, t] of state.sentBriefs) if (now - t >= cfg.dedupeWindowMs) state.sentBriefs.delete(k);
     }
     const target = String(params.sessionKey || "");
     if (!spawn && brief && cfg.requireSpawnForBriefs && !isSubagentSession(target)) {
       const owner = target.startsWith("agent:") ? target.split(":")[1] : String(params.agentId || params.label || "the owner");
-      return block("briefToExistingChat",
+      return refuse("briefToExistingChat",
         `token-guard: a new task starts in a fresh session, not in ${target || owner}'s existing chat, which every call would re-read in full. ` +
         `Use sessions_spawn with agentId "${owner}", context "isolated", label "<project>: <short title>", and this brief as task ` +
         "(runTimeoutSeconds 3600 if it builds, deploys or waits on CI). sessions_send is only for short follow-ups " +
@@ -636,14 +644,14 @@ function decide(event, ctx, state, rawConfig, log, now = Date.now()) {
     if (text.length >= cfg.briefMinChars) {
       const missing = missingBriefFields(text, cfg);
       if (missing.length > 0) {
-        return block("briefFields",
+        return refuse("briefFields",
           `token-guard: this brief is missing ${missing.join(", ")}. Every brief of ${cfg.briefMinChars}+ characters needs ` +
           `one line each for ${cfg.requireBriefFields.join(", ")} (Items: the task_inbox ids). Add them and resend.`);
       }
     }
     const items = briefItems(text, state);
     if (items.length > cfg.maxItemsPerBrief) {
-      return block("tooManyItems",
+      return refuse("tooManyItems",
         `token-guard: ${items.length} inbox items in one brief; one session takes at most ${cfg.maxItemsPerBrief} small items. ` +
         "Split it: run task_inbox plan and start one session per batch.");
     }
@@ -651,7 +659,7 @@ function decide(event, ctx, state, rawConfig, log, now = Date.now()) {
       const big = items.filter((it) => it.size !== "small");
       const mixed = new Set(items.map((it) => `${it.project || ""}|${it.owner || ""}`)).size > 1;
       if (big.length > 0 || mixed) {
-        return block("mixedBatch",
+        return refuse("mixedBatch",
           (big.length > 0
             ? `token-guard: ${big.map((it) => `${it.id} (${it.size})`).join(", ")} must each get a fresh session of its own. `
             : "token-guard: these items belong to different projects or owners. ") +
@@ -663,7 +671,20 @@ function decide(event, ctx, state, rawConfig, log, now = Date.now()) {
   return undefined;
 }
 
+// A spawn the runtime refused was never sent: forget its brief so the same dispatch can be sent again.
+// The brief is recorded before the runtime runs the spawn (and the guard may add lines to it after),
+// so forget this target's briefs from the last two minutes rather than match the text.
+function forgetRefusedBrief(state, agentId, now = Date.now(), withinMs = 2 * 60000) {
+  let forgotten = 0;
+  if (!state || !state.sentBriefs || !agentId) return forgotten;
+  for (const [key, at] of state.sentBriefs) {
+    if (key.startsWith(`spawn:${agentId}|`) && now - at < withinMs) { state.sentBriefs.delete(key); forgotten += 1; }
+  }
+  return forgotten;
+}
+
 export {
+  forgetRefusedBrief,
   DEFAULT_CONFIG,
   mergeConfig,
   isSubagentSession,
