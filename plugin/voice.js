@@ -251,11 +251,13 @@ function auditText(_cfg, status, report) {
 // A dispatch the runtime refused (not the guard): the real error, so nobody has to guess the cause.
 // (On 2026-11-07 every dispatch failed for an hour on "account or native runtime is unavailable" while
 // the account had 88% of its window left; the orchestrator told the owner it was a usage limit.)
-function spawnErrorText(_cfg, agentId, error, limitedUntil) {
+function spawnErrorText(_cfg, agentId, error, limitedUntil, retryAfterSeconds) {
   const why = limitedUntil
     ? `The guard recorded a usage limit until ${new Date(limitedUntil).toISOString().slice(11, 16)} UTC.`
-    : "The guard has no usage limit recorded, so do not call it one: the operator checks it.";
-  return `⚠️ Dispatch to ${esc(nameOf(agentId) || agentId || "an agent")} failed: <code>${esc(String(error || "").slice(0, 240))}</code>\n${why}`;
+    : retryAfterSeconds
+      ? `This is OpenClaw's own Claude login check, not a usage limit: the guard has none recorded. The guard asked OpenClaw to check the login again and will wake the orchestrator to send it again in ${Math.max(1, Math.round(retryAfterSeconds / 60))} min.`
+      : "The guard has no usage limit recorded, so do not call it one: the operator checks it.";
+  return `⚠️ Dispatch to ${esc(agentId ? nameOf(_cfg, agentId) : "an agent")} failed: <code>${esc(String(error || "").slice(0, 240))}</code>\n${why}`;
 }
 
 function movedText(_cfg, project) {

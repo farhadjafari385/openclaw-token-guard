@@ -3,6 +3,7 @@ import { stallText, interruptedText, unactedText, wakeCapText, teamStuckText } f
 import os from "node:os";
 import path from "node:path";
 import crypto from "node:crypto";
+import { mergeRefusals } from "./refusal.js";
 
 // Job tracker: follows every task the orchestrator dispatches from spawn to end,
 // and turns silence into action. scanJobs() is pure (state in, actions out);
@@ -121,6 +122,7 @@ function mergeStates(a, b) {
   const asks = new Map();
   for (const ask of [...(b.ownerAsks || []), ...(a.ownerAsks || [])]) asks.set(`${ask.at}:${ask.topic}`, Object.assign({}, asks.get(`${ask.at}:${ask.topic}`), ask, { captured: Boolean(ask.captured || (asks.get(`${ask.at}:${ask.topic}`) || {}).captured) }));
   out.ownerAsks = [...asks.values()].sort((x, y) => x.at - y.at).slice(-50);
+  out.refusals = mergeRefusals(a.refusals, b.refusals);
   return out;
 }
 
