@@ -823,9 +823,14 @@ export default definePluginEntry({
       }
       const serious = issues.filter((i) => ["waiting", "incomplete", "missed", "stale"].includes(i.kind));
       store.data.pmAudit = store.data.pmAudit || { lastAt: 0 };
-      const due = now - (store.data.pmAudit.lastAt || 0) >= (boardCfg.auditEveryMinutes || 180) * 60000;
+      // After a failed run the audit is tried again in 30 minutes, not at the next 3-hour slot.
+      const every = (store.data.pmAudit.failed ? 30 : (boardCfg.auditEveryMinutes || 180)) * 60000;
+      const due = now - (store.data.pmAudit.lastAt || 0) >= every;
       if (!serious.length || !due || !api.runtime || !api.runtime.subagent || typeof api.runtime.subagent.run !== "function") return;
-      store.data.pmAudit.lastAt = now;
+      // The PM runs on Claude: during a Claude limit the run can only fail (it once posted "Board check
+      // (error): nothing to fix" and used up the 3-hour slot). Wait for the reset instead.
+      if ((store.data.claudeLimitedUntil || 0) > now) return;
+      store.data.pmAudit = { lastAt: now };
       store.touch();
       const sessionKey = `agent:${pm}:subagent:board-audit-${now.toString(36)}`;
       const snapshot = inboxItems.filter((it) => normStatus(it.status) !== "archived")
@@ -844,6 +849,17 @@ export default definePluginEntry({
         if (typeof api.runtime.subagent.getSessionMessages === "function") {
           const got = await api.runtime.subagent.getSessionMessages({ sessionKey, limit: 8 });
           text = lastAssistantText(got && got.messages);
+        }
+        if (res && res.status && res.status !== "ok") {
+          // A failed audit fixed nothing: no "nothing to fix" post, no heads-up, owner asks stay open.
+          // It is tried again in 30 minutes (after the reset, if a limit stopped it). The saved state
+          // keeps the newest lastAt, so the retry is a flag on this run, not an earlier time.
+          store.data.pmAudit = { lastAt: now, failed: true };
+          store.touch();
+          markLimited(res.error, "board-audit");
+          log("warn", "token-guard PM board audit did not finish", { status: res.status, error: String(res.error || "").slice(0, 160) });
+          if (typeof api.runtime.subagent.deleteSession === "function") await api.runtime.subagent.deleteSession({ sessionKey }).catch(() => null);
+          return;
         }
         post(pm, teamTopic, auditText(voice, res && res.status, text), { html: true });
         // The PM's findings reach the orchestrator at once (owner's order), not at its next wake.

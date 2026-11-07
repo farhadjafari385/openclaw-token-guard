@@ -189,3 +189,92 @@ test("one item flows through the team: queue, brief, checks, CI watch, next gate
     for (const s of services) if (s.stop) s.stop();
   }
 });
+
+test("the PM board audit waits out a Claude limit and never reports a failed run as 'nothing to fix'", async () => {
+  const root = harness();
+  const inbox = path.join(root, "inbox.jsonl");
+  process.env.OC_INBOX_FILE = inbox;
+  process.env.OC_INBOX_BIN = path.join(REPO, "bin", "oc-inbox");
+  // a To do item without a Done when: a serious board problem, so the audit is due
+  fs.writeFileSync(inbox, JSON.stringify({ kind: "add", id: "aa11bb22", project: "shop", title: "Checkout copy", owner: "writer", status: "todo", ts: new Date().toISOString() }) + "\n");
+
+  const telegram = [];
+  globalThis.fetch = async (url, opts = {}) => {
+    if (String(url).startsWith("https://api.telegram.org/")) {
+      telegram.push(JSON.parse(opts.body || "{}"));
+      return { ok: true, json: async () => ({ ok: true, result: { message_id: 2000 + telegram.length } }) };
+    }
+    return { ok: false, status: 404, json: async () => ({}) };
+  };
+  const LIMIT = "⚠️ You've hit your weekly limit. Try again later: reset in 5 hours.";
+  let auditResult = { status: "error", error: LIMIT };
+  let auditText = "";
+  const runs = [];
+  const handlers = {};
+  const services = [];
+  const api = {
+    pluginConfig: {
+      orchestratorAgent: "coordinator",
+      board: { enabled: true, requireItems: true, agent: "product", wip: 1, projectOrder: ["shop"], view: false },
+      topics: { enabled: false },
+      projects: { shop: { topic: 151, path: "/srv/shop" } },
+      mirror: { enabled: true, chatId: "-100", systemTopic: 160, defaultTopic: 160, projectTopics: { shop: 151 },
+        botTokenFiles: Object.fromEntries(["coordinator", "product"].map((a) => [a, path.join(root, "bot.token")])) },
+      jobs: { stateFile: path.join(root, "state", "jobs.json"), scanEverySeconds: 15, idleWakeSession: "agent:coordinator:explicit:team-ops" },
+      triage: { enabled: false },
+    },
+    logger: { info: () => {}, warn: () => {}, error: () => {}, debug: () => {} },
+    on: (name, fn) => { (handlers[name] = handlers[name] || []).push(fn); },
+    registerService: (s) => services.push(s),
+    registerTool: () => {},
+    runtime: { subagent: {
+      run: async (p) => { runs.push(p); return { runId: `r${runs.length}` }; },
+      waitForRun: async () => auditResult,
+      getSessionMessages: async ({ sessionKey }) => ({ messages: /board-audit/.test(sessionKey) && auditText ? [{ role: "assistant", content: auditText }] : [] }),
+      deleteSession: async () => ({}),
+    } },
+  };
+  const entry = (await import(pathToFileURL(path.join(root, "plugin", "index.js")).href)).default;
+  entry.register(api);
+  let tick;
+  const realSetInterval = globalThis.setInterval;
+  globalThis.setInterval = (fn) => { tick = fn; return { unref() {} }; };
+  for (const s of services) if (s.start) s.start();
+  globalThis.setInterval = realSetInterval;
+  const realNow = Date.now;
+  let skew = 11 * 60000;
+  Date.now = () => realNow() + skew;
+  const audits = () => runs.filter((p) => /:board-audit-/.test(p.sessionKey));
+  const headsUps = () => runs.filter((p) => /^\[PM heads-up\]/.test(p.message || ""));
+  const boardPosts = () => telegram.filter((m) => /Board check/.test(m.text || ""));
+  const state = () => JSON.parse(fs.readFileSync(path.join(root, "state", "jobs.json"), "utf8"));
+  try {
+    // 1. the audit runs and the provider refuses it on the limit
+    await tick();
+    await settle();
+    assert.equal(audits().length, 1);
+    assert.equal(boardPosts().length, 0, "a failed audit must not post 'Board check ... nothing to fix'");
+    assert.equal(headsUps().length, 0, "a failed audit must not wake the orchestrator");
+    const until = state().claudeLimitedUntil;
+    assert.ok(until > Date.now(), "the limit in the failed audit must be recorded");
+    // 2. during the limit: no new audit, even once the 30-minute retry is due
+    skew += 31 * 60000;
+    assert.ok(Date.now() < until);
+    await tick();
+    await settle();
+    assert.equal(audits().length, 1, "no audit while Claude is limited");
+    // 3. after the reset the audit runs again (it is not pushed back 3 hours) and reports
+    skew += Math.max(0, until - Date.now()) + 60000;
+    auditResult = { status: "ok" };
+    auditText = "Added a Done when to aa11bb22.";
+    await tick();
+    await settle();
+    assert.equal(audits().length, 2, "the audit must run again after the reset");
+    assert.equal(boardPosts().length, 1);
+    assert.match(boardPosts()[0].text, /Added a Done when/);
+    assert.equal(headsUps().length, 1);
+  } finally {
+    Date.now = realNow;
+    for (const s of services) if (s.stop) s.stop();
+  }
+});
