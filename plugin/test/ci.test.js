@@ -25,6 +25,9 @@ test("CI state: running until the pipeline ends; green only when everything pass
   assert.equal(ciState(gl, { status: "canceled" }), "failed");
   assert.equal(ciState({ kind: "gitlab-mr" }, { head_pipeline: { status: "success" } }), "success");
   assert.equal(ciState({ kind: "gitlab-mr" }, { head_pipeline: null }), "running");
+  // an MR GitLab answered for, with no pipeline at all: "none" (the watch waits a little, then lets go)
+  assert.equal(ciState({ kind: "gitlab-mr" }, { iid: 10, state: "opened", head_pipeline: null }), "none");
+  assert.equal(ciState({ kind: "gitlab-mr" }, { iid: 10, state: "opened", head_pipeline: { status: "running" } }), "running");
   const run = { kind: "github-run" };
   assert.equal(ciState(run, { status: "in_progress" }), "running");
   assert.equal(ciState(run, { status: "completed", conclusion: "success" }), "success");

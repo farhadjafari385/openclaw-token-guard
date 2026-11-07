@@ -653,3 +653,100 @@ test("a task whose run ended, then got a follow-up turn, is closed when quiet ev
     Date.now = realNow;
   }
 });
+
+test("a CI wait on an MR with no pipeline lets go of the item after a short wait; a spent triage budget hands over to the idle wake", async () => {
+  const root = harness();
+  process.env.OC_INBOX_FILE = path.join(root, "inbox.jsonl");
+  process.env.OC_INBOX_BIN = path.join(REPO, "bin", "oc-inbox");
+  const A = board(root, "add", "--project", "shop", "--title", "Revenue numbers", "--owner", "devops", "--done-when", "table posted", "--by", "system");
+  board(root, "add", "--project", "shop", "--title", "Next thing", "--owner", "writer", "--done-when", "done", "--by", "system");
+  board(root, "set", A, "--status", "in_progress", "--by", "system");
+  // the triage's budget for today is spent; its last run was just now and it is healthy
+  const day = new Date(Date.now() + 11 * 60000).toISOString().slice(0, 10);
+  fs.writeFileSync(path.join(root, "state", "jobs.json"), JSON.stringify({ version: 1, jobs: {}, triageHealthy: true,
+    triage: { lastAt: Date.now() + 11 * 60000 }, triageWakesByDay: { [day]: 24 } }));
+  const telegram = [];
+  globalThis.fetch = async (url, opts = {}) => {
+    const u = String(url);
+    if (u.startsWith("https://api.telegram.org/")) {
+      telegram.push(JSON.parse(opts.body || "{}"));
+      return { ok: true, json: async () => ({ ok: true, result: { message_id: 7000 + telegram.length } }) };
+    }
+    if (u.startsWith("https://gitlab.com/api/v4/projects/g%2Finfra/merge_requests/10")) return { ok: true, json: async () => ({ iid: 10, state: "opened", head_pipeline: null }) };
+    return { ok: false, status: 404, json: async () => ({}) };
+  };
+  const handlers = {};
+  const logs = [];
+  const services = [];
+  const runs = [];
+  const api = {
+    pluginConfig: {
+      orchestratorAgent: "coordinator",
+      board: { enabled: true, requireItems: true, agent: "product", wip: 1, view: false },
+      topics: { enabled: false },
+      mirror: { enabled: true, chatId: "-100", systemTopic: 160, defaultTopic: 160, minIntervalMs: 0,
+        botTokenFiles: { coordinator: path.join(root, "bot.token"), devops: path.join(root, "bot.token"), product: path.join(root, "bot.token") } },
+      jobs: { stateFile: path.join(root, "state", "jobs.json"), idleWakeSession: "agent:coordinator:explicit:team-ops", refusal: { enabled: false },
+        ci: { pollSeconds: 0, noPipelineMinutes: 10 }, gitlabTokenFile: path.join(root, "bot.token") },
+      triage: { enabled: true, maxWakesPerDay: 24 },
+    },
+    logger: { info: (m) => logs.push(m), warn: (m) => logs.push(m), error: (m) => logs.push(m), debug: () => {} },
+    on: (name, fn) => { (handlers[name] = handlers[name] || []).push(fn); },
+    registerService: (s) => services.push(s),
+    registerTool: () => {},
+    runtime: { subagent: {
+      run: async (p) => { runs.push(p); return { runId: `r${runs.length}` }; },
+      waitForRun: async () => ({ status: "ok" }),
+      getSessionMessages: async () => ({ messages: [] }),
+      deleteSession: async () => ({}),
+    } },
+  };
+  const entry = (await import(pathToFileURL(path.join(root, "plugin", "index.js")).href)).default;
+  entry.register(api);
+  let tick;
+  const realSetInterval = globalThis.setInterval;
+  globalThis.setInterval = (fn) => { tick = fn; return { unref() {} }; };
+  for (const s of services) if (s.start) s.start();
+  globalThis.setInterval = realSetInterval;
+  const realNow = Date.now;
+  let skew = 11 * 60000;
+  Date.now = () => realNow() + skew;
+  const call = (name, event, ctx) => { let out; for (const h of handlers[name] || []) out = h(event, ctx) ?? out; return out; };
+  const ORC = { agentId: "coordinator", sessionKey: "agent:coordinator:explicit:team-ops", runId: "run-n" };
+  const child = "agent:devops:subagent:n1";
+  const job = () => JSON.parse(fs.readFileSync(path.join(root, "state", "jobs.json"), "utf8")).jobs[child];
+  try {
+    // the worker opened an MR that needs review and reported "waiting" with the MR link
+    let r = call("before_tool_call", { toolName: "sessions_spawn", params: { agentId: "devops", task: brief(A), label: "shop: revenue numbers" } }, ORC);
+    assert.ok(!(r && r.block), `dispatch refused: ${r && r.blockReason}`);
+    call("subagent_spawned", { childSessionKey: child, agentId: "devops", label: "shop: revenue numbers" }, { requesterSessionKey: ORC.sessionKey });
+    call("agent_end", { messages: [{ role: "assistant", content: "RESULT: waiting\nThe MR needs review: https://gitlab.com/g/infra/-/merge_requests/10" }] }, { sessionKey: child, agentId: "devops" });
+    call("subagent_ended", { targetSessionKey: child, outcome: "ok", endedAt: Date.now() }, {});
+    assert.ok(await until(() => job() && job().waitFor), "no CI watch was registered");
+    // within the short wait the item is held: the next gate is refused as busy
+    skew += 3 * 60000;
+    tick();
+    await settle();
+    assert.equal(job().waitFor.done, undefined);
+    r = call("before_tool_call", { toolName: "sessions_spawn", params: { agentId: "reviewer", task: brief(A, "Model: sonnet-5\nEffort: low\nReview and merge."), label: "shop: review" } }, ORC);
+    assert.equal(r && r.block, true);
+    assert.match(r.blockReason, /already being worked on/);
+    // past it: the watch lets go and the orchestrator is told to dispatch the next gate
+    skew += 8 * 60000;
+    tick();
+    assert.ok(await until(() => job().waitFor.done), "the watch never let go of an MR with no pipeline");
+    assert.equal(job().waitFor.done.state, "no pipeline");
+    assert.ok(await until(() => runs.some((p) => /^\[ci\]/.test(p.message || "") && /no pipeline/.test(p.message) && /dispatch the next gate/.test(p.message))), "the orchestrator was not told");
+    r = call("before_tool_call", { toolName: "sessions_spawn", params: { agentId: "reviewer", task: brief(A, "Model: sonnet-5\nEffort: low\nReview and merge, take two."), label: "shop: review" } }, ORC);
+    assert.ok(!(r && r.block), `the next gate is still refused: ${r && r.blockReason}`);
+    // the triage's budget is spent: the plain idle wake now covers open work with nothing running
+    const idleWakes = () => runs.filter((p) => /^\[job-tracker\] There is open work/.test(p.message || ""));
+    call("subagent_spawned", { childSessionKey: "agent:reviewer:subagent:n2", agentId: "reviewer", label: "shop: review" }, { requesterSessionKey: ORC.sessionKey });
+    call("subagent_ended", { targetSessionKey: "agent:reviewer:subagent:n2", outcome: "ok", endedAt: Date.now() }, {});
+    skew += 40 * 60000;
+    tick();
+    assert.ok(await until(() => idleWakes().length === 1), "nothing woke the orchestrator once the triage budget was spent");
+  } finally {
+    Date.now = realNow;
+  }
+});

@@ -34,6 +34,8 @@ function ciState(link, body, checks) {
   if (!link || !body) return "running";
   if (link.kind === "gitlab-pipeline" || link.kind === "gitlab-mr") {
     const p = link.kind === "gitlab-mr" ? body.head_pipeline : body;
+    // An MR that exists but has no pipeline: nothing may ever run (the caller waits a little first).
+    if (link.kind === "gitlab-mr" && !p && body.iid !== undefined) return "none";
     if (!p || !p.status) return "running";
     if (GITLAB_RUNNING.has(p.status)) return "running";
     return p.status === "success" ? "success" : "failed"; // failed, canceled, skipped, manual
@@ -56,6 +58,6 @@ function failedParts(link, body, checks) {
   return [];
 }
 
-const DEFAULT_CI = { pollSeconds: 120, maxWaitMinutes: 150 };
+const DEFAULT_CI = { pollSeconds: 120, maxWaitMinutes: 150, noPipelineMinutes: 10 };
 
 export { parseCiLink, ciRequest, ciState, failedParts, DEFAULT_CI };
