@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { parseCiLink, ciRequest, ciState, failedParts } from "../ci.js";
+import { parseCiLink, ciRequest, ciState, failedParts, DEFAULT_CI } from "../ci.js";
 
 test("CI links in a report are found: GitLab pipeline or MR, GitHub run or pull request", () => {
   const gl = parseCiLink("RESULT: waiting\nPipeline: https://gitlab.com/group/sub/repo/-/pipelines/3034898023 (running)");
@@ -44,4 +44,10 @@ test("CI state: running until the pipeline ends; green only when everything pass
   const red = checks(["ci", "completed", "success"], ["deploy", "completed", "failure"]);
   assert.equal(ciState(pr, {}, red), "failed");
   assert.deepEqual(failedParts(pr, {}, red), ["deploy"]);
+});
+
+test("an MR with no pipeline holds the queue only a few minutes by default", () => {
+  // the queue waited 12 minutes on each MR in a repo whose jobs run only on master
+  assert.ok(DEFAULT_CI.noPipelineMinutes <= 3, `noPipelineMinutes is ${DEFAULT_CI.noPipelineMinutes}`);
+  assert.ok(DEFAULT_CI.noPipelineMinutes >= 2, "GitLab needs a moment to link a new pipeline");
 });

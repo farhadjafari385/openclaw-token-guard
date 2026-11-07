@@ -61,6 +61,9 @@ function failedParts(link, body, checks) {
   return [];
 }
 
-const DEFAULT_CI = { pollSeconds: 120, maxWaitMinutes: 150, noPipelineMinutes: 10 };
+// noPipelineMinutes counts from the end of the task that pushed: GitLab links a pipeline to the MR
+// within seconds of the push, and an MR in a repo whose jobs run only on master never gets one. A
+// 10-minute wait held the queue for 12 minutes on each such MR.
+const DEFAULT_CI = { pollSeconds: 120, maxWaitMinutes: 150, noPipelineMinutes: 3 };
 
 export { parseCiLink, ciRequest, ciState, failedParts, DEFAULT_CI };
