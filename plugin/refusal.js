@@ -34,7 +34,7 @@ function prune(data, now) {
 function recordRefusal(data, agentId, error, now) {
   data.refusals = data.refusals || {};
   prune(data, now);
-  const open = Object.values(data.refusals).find((r) => r.agentId === agentId && !r.wokeAt && !r.flaggedAt);
+  const open = Object.values(data.refusals).find((r) => r.agentId === agentId && !r.wokeAt && !r.flaggedAt && !r.sentAt);
   if (open) return null;
   const entry = { agentId, error: String(error || "").slice(0, 300), at: now };
   data.refusals[`${now}:${agentId}`] = entry;
@@ -43,8 +43,19 @@ function recordRefusal(data, agentId, error, now) {
 
 function dueRefusals(data, now, cfg) {
   return Object.entries(data.refusals || {})
-    .filter(([, r]) => r && !r.wokeAt && !r.flaggedAt && now - (r.at || 0) >= cfg.retryAfterSeconds * 1000)
+    .filter(([, r]) => r && !r.wokeAt && !r.flaggedAt && !r.sentAt && now - (r.at || 0) >= cfg.retryAfterSeconds * 1000)
     .sort((a, b) => a[1].at - b[1].at);
+}
+
+// The orchestrator often sends the refused dispatch again on its own within seconds, and it goes
+// through: that agent's open refusals are done, so no retry wake follows for a dispatch that already
+// runs. Returns how many it closed.
+function closeRefusals(data, agentId, now) {
+  let n = 0;
+  for (const r of Object.values(data.refusals || {})) {
+    if (r && r.agentId === agentId && !r.wokeAt && !r.flaggedAt && !r.sentAt) { r.sentAt = now; n += 1; }
+  }
+  return n;
 }
 
 function refusalsWithinHour(data, agentId, now) {
@@ -52,13 +63,13 @@ function refusalsWithinHour(data, agentId, now) {
 }
 
 // Two plugin copies share the state file: keep every refusal either copy saw, and once a copy has
-// woken the orchestrator (or flagged the operator) for one, it stays done.
+// woken the orchestrator (or flagged the operator, or seen the dispatch go through) for one, it stays done.
 function mergeRefusals(a, b) {
   const out = Object.assign({}, b || {});
   for (const [key, r] of Object.entries(a || {})) {
     const o = out[key] || {};
     out[key] = Object.assign({}, o, r);
-    for (const f of ["wokeAt", "flaggedAt"]) {
+    for (const f of ["wokeAt", "flaggedAt", "sentAt"]) {
       const v = Math.max(r[f] || 0, o[f] || 0);
       if (v) out[key][f] = v;
     }
@@ -78,5 +89,5 @@ function retryWakeText(name, at, tries, max) {
 }
 
 export {
-  DEFAULT_REFUSAL, mergeRefusalConfig, isLoginRefusal, recordRefusal, dueRefusals, refusalsWithinHour, mergeRefusals, retryWakeText,
+  DEFAULT_REFUSAL, mergeRefusalConfig, isLoginRefusal, recordRefusal, dueRefusals, closeRefusals, refusalsWithinHour, mergeRefusals, retryWakeText,
 };
