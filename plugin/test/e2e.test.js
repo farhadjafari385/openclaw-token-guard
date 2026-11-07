@@ -403,3 +403,60 @@ test("two plugin copies: a CI wait ended by one copy does not leave the item loc
     for (const s of cur.services) if (s.stop) s.stop();
   }
 });
+
+test("a dispatch the runtime refuses is logged and named in the team topic once, without a limit guess", async () => {
+  const root = harness();
+  process.env.OC_INBOX_FILE = path.join(root, "inbox.jsonl");
+  process.env.OC_INBOX_BIN = path.join(REPO, "bin", "oc-inbox");
+  const telegram = [];
+  globalThis.fetch = async (url, opts = {}) => {
+    if (String(url).startsWith("https://api.telegram.org/")) {
+      telegram.push(JSON.parse(opts.body || "{}"));
+      return { ok: true, json: async () => ({ ok: true, result: { message_id: 4000 + telegram.length } }) };
+    }
+    return { ok: false, status: 404, json: async () => ({}) };
+  };
+  const handlers = {};
+  const logs = [];
+  const api = {
+    pluginConfig: {
+      orchestratorAgent: "coordinator",
+      board: { enabled: true, requireItems: true, agent: "product", wip: 1, view: false },
+      topics: { enabled: false },
+      mirror: { enabled: true, chatId: "-100", systemTopic: 160, defaultTopic: 160, minIntervalMs: 0,
+        botTokenFiles: { coordinator: path.join(root, "bot.token") } },
+      jobs: { stateFile: path.join(root, "state", "jobs.json"), idleWakeSession: "agent:coordinator:explicit:team-ops" },
+      triage: { enabled: false },
+    },
+    logger: { info: (m, x) => logs.push([m, x]), warn: (m, x) => logs.push([m, x]), error: (m, x) => logs.push([m, x]), debug: () => {} },
+    on: (name, fn) => { (handlers[name] = handlers[name] || []).push(fn); },
+    registerService: () => {},
+    registerTool: () => {},
+    runtime: { subagent: { run: async () => ({ runId: "r" }) } },
+  };
+  const entry = (await import(pathToFileURL(path.join(root, "plugin", "index.js")).href)).default;
+  entry.register(api);
+  const call = (event) => { for (const h of handlers.after_tool_call || []) h(event, { agentId: "coordinator", sessionKey: "agent:coordinator:main" }); };
+  const refused = (agentId) => ({
+    toolName: "mcp__openclaw__sessions_spawn",
+    params: { agentId, task: "Project: shop\nItems: aa11bb22" },
+    result: { content: [{ type: "text", text: JSON.stringify({ status: "error", role: agentId,
+      error: `sessions_spawn model "anthropic/claude-sonnet-5-5" is not usable: The selected account or native runtime is unavailable for anthropic/claude-sonnet-5-5. Restore that account before spawning this model.` }) }] },
+  });
+  call(refused("qa"));
+  assert.ok(await until(() => telegram.some((m) => /Dispatch to .* failed/.test(m.text || ""))), "the refused dispatch was not named in the team topic");
+  const note = telegram.find((m) => /Dispatch to .* failed/.test(m.text || ""));
+  assert.equal(note.message_thread_id, 160);
+  assert.match(note.text, /native runtime is unavailable/);
+  assert.match(note.text, /no usage limit recorded/);
+  assert.ok(logs.some(([m]) => /dispatch failed/.test(m) && /"agentId":"qa"/.test(m)), "the health check reads this log line");
+  // the same failure again, for another agent: no second post within 30 minutes (the log still records it)
+  call(refused("reviewer"));
+  await settle();
+  assert.equal(telegram.filter((m) => /Dispatch to .* failed/.test(m.text || "")).length, 1);
+  assert.equal(logs.filter(([m]) => /dispatch failed/.test(m)).length, 2);
+  // the guard's own refusals are plain text: not reported as a runtime failure
+  call({ toolName: "sessions_spawn", params: { agentId: "qa" }, result: "token-guard: aa11bb22 is not next in the queue." });
+  await settle();
+  assert.equal(logs.filter(([m]) => /dispatch failed/.test(m)).length, 2);
+});
