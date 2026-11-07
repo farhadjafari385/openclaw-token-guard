@@ -248,6 +248,16 @@ function auditText(_cfg, status, report) {
   return `🧾 Board check${status && status !== "ok" && status !== "done" ? ` (${esc(status)})` : ""}: ${report ? mdToHtml(report, 1800) : "nothing to fix."}`;
 }
 
+// A dispatch the runtime refused (not the guard): the real error, so nobody has to guess the cause.
+// (On 2026-11-07 every dispatch failed for an hour on "account or native runtime is unavailable" while
+// the account had 88% of its window left; the orchestrator told the owner it was a usage limit.)
+function spawnErrorText(_cfg, agentId, error, limitedUntil) {
+  const why = limitedUntil
+    ? `The guard recorded a usage limit until ${new Date(limitedUntil).toISOString().slice(11, 16)} UTC.`
+    : "The guard has no usage limit recorded, so do not call it one: the operator checks it.";
+  return `⚠️ Dispatch to ${esc(nameOf(agentId) || agentId || "an agent")} failed: <code>${esc(String(error || "").slice(0, 240))}</code>\n${why}`;
+}
+
 function movedText(_cfg, project) {
   return `↪️ Moved to the <b>${esc(project || "team")}</b> topic.`;
 }
@@ -255,5 +265,5 @@ function movedText(_cfg, project) {
 export {
   esc, clip, nameOf, handleOf, ownerTag, titleOf, modelName, mdToHtml, htmlToPlain, splitReport,
   dispatchText, ackText, resultText, stallText, interruptedText, unactedText, wakeCapText, teamStuckText,
-  budgetText, guardText, limitText, approvalAskText, approvalReplyText, auditText, movedText, boardReplyText,
+  budgetText, guardText, limitText, approvalAskText, approvalReplyText, auditText, movedText, boardReplyText, spawnErrorText,
 };

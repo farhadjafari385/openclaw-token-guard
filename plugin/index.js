@@ -13,7 +13,7 @@ import {
 import { createMirror, topicFor, messageIdOf } from "./mirror.js";
 import {
   dispatchText, ackText, resultText, guardText, limitText, budgetText, approvalAskText, approvalReplyText,
-  auditText, movedText, mdToHtml, handleOf, boardReplyText,
+  auditText, movedText, mdToHtml, handleOf, boardReplyText, spawnErrorText,
 } from "./voice.js";
 import { inboxArgs, loadInboxItems, runInbox } from "./inbox.js";
 import { processBoot } from "./boot.js";
@@ -491,10 +491,20 @@ export default definePluginEntry({
         }
         return;
       }
-      if (event.toolName !== "sessions_spawn" || !ctx || ctx.agentId !== orchestrator) return;
+      if (bare !== "sessions_spawn" || !ctx || ctx.agentId !== orchestrator) return;
       let r = event.result;
       if (r && Array.isArray(r.content)) r = r.content.map((c) => c && c.text).join("\n");
       if (typeof r === "string") { try { r = JSON.parse(r.slice(r.indexOf("{"))); } catch { r = null; } }
+      // The runtime refused the dispatch (the guard's own blocks are plain text and never get here):
+      // log it so the health check sees it, and say the real error in the team topic once per 30 min.
+      if (r && r.status === "error" && r.error) {
+        const target = String((event.params && event.params.agentId) || r.role || "");
+        const error = String(r.error).replace(/\s+/g, " ").slice(0, 300);
+        log("warn", "token-guard: dispatch failed", { agentId: target, error });
+        const until = (store.data.claudeLimitedUntil || 0) > Date.now() ? store.data.claudeLimitedUntil : 0;
+        systemNote(`spawn-error:${error.replace(/"[^"]*"/g, "").slice(0, 80)}`, spawnErrorText(voice, target, error, until), { html: true });
+        return;
+      }
       const key = r && (r.childSessionKey || (r.details && r.details.childSessionKey));
       if (key) startJob(key, String((event.params && event.params.agentId) || ""), String((event.params && event.params.label) || ""), ctx.sessionKey, null);
     }));
