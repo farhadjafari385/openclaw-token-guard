@@ -19,6 +19,7 @@ const DEFAULT_JOBS = {
   stallMinutes: 30, // a running task with no tool activity (only judged once the guard has seen it work)
   defaultRunTimeoutSeconds: 3600, // when the spawn did not say
   lostAfterTimeoutMinutes: 15, // a "running" task this long past its timeout lost its end event
+  endedQuietMinutes: 10, // its run ended (follow-ups included) and no end event came: close it after this quiet
   restartGraceMinutes: 8, // agents need time to load after a restart
   idleCheckMinutes: 30, // open inbox work with nothing running
   idleOrcQuietMinutes: 20,
