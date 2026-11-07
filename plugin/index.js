@@ -761,7 +761,9 @@ export default definePluginEntry({
         idleWakeSession: jobsCfg.idleWakeSession,
         voice,
         pmAgent: pm,
-        triage: triageCfg.enabled && store.data.triageHealthy !== false, // the old idle wake covers a broken triage
+        // The old idle wake covers a broken triage, and one whose daily budget is spent: with the budget
+        // gone and the idle wake off, nothing woke the orchestrator for the rest of the day.
+        triage: triageCfg.enabled && store.data.triageHealthy !== false && !triageBudgetSpent(Date.now()),
         codexEnabled: useCodex,
       });
       if (boardCfg.enabled) {
@@ -867,7 +869,9 @@ export default definePluginEntry({
           state = "unreadable";
         }
         if (state === "running" && now - (w.since || now) < ciCfg.maxWaitMinutes * 60000) continue;
-        const outcome = state === "running" ? "still running" : state;
+        // No pipeline was created for the MR: there is nothing to wait for, so the item is not held.
+        if (state === "none" && now - (w.since || now) < ciCfg.noPipelineMinutes * 60000) continue;
+        const outcome = state === "running" ? "still running" : state === "none" ? "no pipeline" : state;
         w.done = { state: outcome, at: now };
         const verdict = outcome === "success" ? "done" : outcome === "failed" ? "failed" : "unknown";
         const plan = (job.items || []).filter((id) => board.has(id))
@@ -878,6 +882,7 @@ export default definePluginEntry({
         store.save();
         const moved = plan.map((m) => `${m.id} → ${m.to}`).join(", ") || "no board change";
         const todo = outcome === "success" ? "Dispatch the next gate on the same item."
+          : outcome === "no pipeline" ? "It has no pipeline, so there is nothing to wait for: dispatch the next gate on the same item now (for an open MR: review and merge)."
           : outcome === "failed" ? `Dispatch ${job.agentId} again on the same item to fix it${parts.length ? ` (failed: ${parts.join(", ")})` : ""}; give it the pipeline link.`
             : "Open the pipeline yourself and decide (it did not finish in time or could not be read).";
         log("info", "token-guard CI watch: pipeline finished", { url: w.url, outcome, moved });
@@ -990,6 +995,7 @@ export default definePluginEntry({
     // Every 10 minutes, when something needs a decision: a cheap Haiku call (no tools, light context)
     // decides whether the orchestrator must act, and at what effort; then the orchestrator is woken.
     const triageCfg = mergeTriageConfig(cfg.triage);
+    const triageBudgetSpent = (now) => ((store.data.triageWakesByDay || {})[new Date(now).toISOString().slice(0, 10)] || 0) >= triageCfg.maxWakesPerDay;
     const triageTick = async (inboxItems) => {
       const sub = api.runtime && api.runtime.subagent;
       if (!triageCfg.enabled || !sub || typeof sub.run !== "function") return;
