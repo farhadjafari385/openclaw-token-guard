@@ -566,10 +566,15 @@ export default definePluginEntry({
     }));
 
     api.on("subagent_ended", safe("subagent_ended", (event) => {
-      const key = event.targetSessionKey;
       if (event.error) markLimited(event.error, "task");
+      endJob(event.targetSessionKey, event.outcome, event.error, event.endedAt || Date.now());
+    }));
+    // A task ends: post the worker's result, move its items, follow its CI. Called by subagent_ended,
+    // and by the tick when the run ended but no end event came (the orchestrator sent the finished
+    // task a follow-up with sessions_send: those runs never send subagent_ended).
+    const endJob = (key, outcome, error, endedAt) => {
       knowJob(key);
-      const job = recordEnd(store.data, key, event.outcome, event.error, event.endedAt || Date.now());
+      const job = recordEnd(store.data, key, outcome, error, endedAt);
       if (!job) return;
       store.touch();
       const finish = () => {
@@ -603,7 +608,7 @@ export default definePluginEntry({
         .then((res) => { recordResultText(store.data, key, lastAssistantText(res && res.messages), jobsCfg); })
         .catch(() => {})
         .finally(finish);
-    }));
+    };
 
     // ---- topics: a reply that belongs in another topic is cancelled and reposted there ----
     const pointed = new Set();
@@ -739,6 +744,13 @@ export default definePluginEntry({
       if (!jobsCfg.enabled || !isActive()) return;
       if (Date.now() - BOOT_STARTED_AT < BOOT_GRACE_MS) return;
       store.refresh();
+      // The spawned run ended and the task has been quiet since, but no end event came: close it.
+      for (const job of Object.values(store.data.jobs)) {
+        if (job.status !== "running" || !job.runOutcome) continue;
+        if (Date.now() - (job.lastActivityAt || job.spawnedAt || 0) < jobsCfg.endedQuietMinutes * 60000) continue;
+        log("info", "token-guard: a task's run ended without an end event; closing it", { job: job.short, agentId: job.agentId });
+        endJob(job.key, job.runOutcome, "", Date.now());
+      }
       let inboxItems = [];
       try { inboxItems = [...loadInboxItems().values()]; } catch { inboxItems = []; }
       const actions = scanJobs(store.data, jobsCfg, Date.now(), {

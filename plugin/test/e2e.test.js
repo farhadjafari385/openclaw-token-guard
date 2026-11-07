@@ -579,3 +579,77 @@ test("a dispatch refused by OpenClaw's login check: the login is checked again a
     Date.now = realNow;
   }
 });
+
+test("a task whose run ended, then got a follow-up turn, is closed when quiet even without an end event", async () => {
+  const root = harness();
+  process.env.OC_INBOX_FILE = path.join(root, "inbox.jsonl");
+  process.env.OC_INBOX_BIN = path.join(REPO, "bin", "oc-inbox");
+  const telegram = [];
+  globalThis.fetch = async (url, opts = {}) => {
+    if (String(url).startsWith("https://api.telegram.org/")) {
+      telegram.push(JSON.parse(opts.body || "{}"));
+      return { ok: true, json: async () => ({ ok: true, result: { message_id: 6000 + telegram.length } }) };
+    }
+    return { ok: false, status: 404, json: async () => ({}) };
+  };
+  const handlers = {};
+  const logs = [];
+  const services = [];
+  const api = {
+    pluginConfig: {
+      orchestratorAgent: "coordinator",
+      board: { enabled: false },
+      topics: { enabled: false },
+      mirror: { enabled: true, chatId: "-100", systemTopic: 160, defaultTopic: 160, minIntervalMs: 0,
+        botTokenFiles: { coordinator: path.join(root, "bot.token"), writer: path.join(root, "bot.token") } },
+      jobs: { stateFile: path.join(root, "state", "jobs.json"), idleWakeSession: "agent:coordinator:explicit:team-ops", refusal: { enabled: false } },
+      triage: { enabled: false },
+    },
+    logger: { info: (m) => logs.push(m), warn: (m) => logs.push(m), error: (m) => logs.push(m), debug: () => {} },
+    on: (name, fn) => { (handlers[name] = handlers[name] || []).push(fn); },
+    registerService: (s) => services.push(s),
+    registerTool: () => {},
+    runtime: { subagent: { run: async () => ({ runId: "r" }), getSessionMessages: async () => ({ messages: [] }) } },
+  };
+  const entry = (await import(pathToFileURL(path.join(root, "plugin", "index.js")).href)).default;
+  entry.register(api);
+  let tick;
+  const realSetInterval = globalThis.setInterval;
+  globalThis.setInterval = (fn) => { tick = fn; return { unref() {} }; };
+  for (const s of services) if (s.start) s.start();
+  globalThis.setInterval = realSetInterval;
+  const realNow = Date.now;
+  let skew = 11 * 60000;
+  Date.now = () => realNow() + skew;
+  const call = (name, event, ctx) => { for (const h of handlers[name] || []) h(event, ctx); };
+  const child = "agent:writer:subagent:f1";
+  const job = () => JSON.parse(fs.readFileSync(path.join(root, "state", "jobs.json"), "utf8")).jobs[child];
+  try {
+    call("before_tool_call", { toolName: "sessions_spawn", params: { agentId: "writer", task: brief("ee55ff66"), label: "shop: follow-up" } },
+      { agentId: "coordinator", sessionKey: "agent:coordinator:explicit:team-ops", runId: "run-f" });
+    call("subagent_spawned", { childSessionKey: child, agentId: "writer", label: "shop: follow-up" }, { requesterSessionKey: "agent:coordinator:explicit:team-ops" });
+    assert.ok(await until(() => job() && job().status === "running"));
+    // the spawned run ends; the orchestrator then sends it a follow-up, which answers; no subagent_ended comes
+    call("subagent_progress", { childSessionKey: child, phase: "ended", outcome: "ok" }, {});
+    call("agent_end", { messages: [{ role: "assistant", content: [{ type: "text", text: "Follow-up done.\n\nRESULT: done\n- the price renders" }] }] }, { sessionKey: child, agentId: "writer" });
+    // still in its quiet margin: not closed
+    skew += 9 * 60000;
+    tick();
+    await settle();
+    assert.equal(job().status, "running");
+    // quiet for longer than the margin: closed like a normal end, and its result is posted
+    skew += 2 * 60000;
+    tick();
+    assert.ok(await until(() => job().status === "ended"), "the quiet task was not closed");
+    assert.equal(job().outcome, "ok");
+    assert.ok(logs.some((m) => /run ended without an end event/.test(m)));
+    assert.ok(await until(() => telegram.some((m) => /price renders/.test(m.text || ""))), "its result was not posted");
+    const posts = telegram.length;
+    // a late subagent_ended changes nothing and posts nothing twice
+    call("subagent_ended", { targetSessionKey: child, outcome: "ok", endedAt: Date.now() }, {});
+    await settle();
+    assert.equal(telegram.length, posts);
+  } finally {
+    Date.now = realNow;
+  }
+});
