@@ -195,3 +195,19 @@ test("mirror retries a failed send", async () => {
   assert.equal(await m.post({ agentId: "coordinator", topic: 5, text: "hi" }), 7);
   assert.equal(calls, 3);
 });
+
+test("a finished CI wait stays finished when a copy with an older version saves", async () => {
+  const { mergeStates } = await import("../jobs.js");
+  const base = { status: "ended", agentId: "writer", items: ["aa11bb22"], endedAt: 1000, spawnedAt: 500 };
+  const url = "https://gitlab.com/g/shop/-/merge_requests/5";
+  const stale = { jobs: { k: Object.assign({}, base, { waitFor: { kind: "gitlab-mr", url, since: 1100 } }) } };
+  const done = { jobs: { k: Object.assign({}, base, { waitFor: { kind: "gitlab-mr", url, since: 1100, checkedAt: 5000, done: { state: "failed", at: 5000 } } }) } };
+  for (const [a, b] of [[stale, done], [done, stale]]) {
+    const w = mergeStates(a, b).jobs.k.waitFor;
+    assert.deepEqual(w.done, { state: "failed", at: 5000 });
+    assert.equal(w.checkedAt, 5000);
+  }
+  // a different pipeline is a new wait: the newer job's wait is kept as it is
+  const other = { jobs: { k: Object.assign({}, base, { endedAt: 9000, waitFor: { kind: "gitlab-mr", url: url.replace("/5", "/6"), since: 9000 } }) } };
+  assert.equal(mergeStates(done, other).jobs.k.waitFor.done, undefined);
+});
