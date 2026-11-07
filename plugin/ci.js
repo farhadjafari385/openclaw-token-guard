@@ -38,7 +38,10 @@ function ciState(link, body, checks) {
     if (link.kind === "gitlab-mr" && !p && body.iid !== undefined) return "none";
     if (!p || !p.status) return "running";
     if (GITLAB_RUNNING.has(p.status)) return "running";
-    return p.status === "success" ? "success" : "failed"; // failed, canceled, skipped, manual
+    // "manual": every automatic job passed and only manual ones (a production deploy) are left. GitLab
+    // says "failed" when anything failed, even with manual jobs pending. It was counted as failed and a
+    // green master went back to the writer to "fix".
+    return p.status === "success" || p.status === "manual" ? "success" : "failed"; // failed, canceled, skipped
   }
   if (link.kind === "github-run") {
     if (body.status !== "completed") return "running";
