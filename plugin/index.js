@@ -23,7 +23,7 @@ import { parseCiLink, ciRequest, ciState, failedParts, DEFAULT_CI } from "./ci.j
 import { allowAgentWake, wakeMessage, DEFAULT_WAKE, WAKE_REASONS } from "./wake.js";
 import fs from "node:fs";
 import { execFile } from "node:child_process";
-import { mergeRefusalConfig, isLoginRefusal, recordRefusal, dueRefusals, refusalsWithinHour, retryWakeText } from "./refusal.js";
+import { mergeRefusalConfig, isLoginRefusal, recordRefusal, dueRefusals, closeRefusals, refusalsWithinHour, retryWakeText } from "./refusal.js";
 
 // No top-level await: OpenClaw loads plugin entries through require(), which
 // rejects ESM graphs that use it.
@@ -530,10 +530,22 @@ export default definePluginEntry({
         return;
       }
       const key = r && (r.childSessionKey || (r.details && r.details.childSessionKey));
-      if (key) startJob(key, String((event.params && event.params.agentId) || ""), String((event.params && event.params.label) || ""), ctx.sessionKey, null);
+      if (key) {
+        dispatchWent(String((event.params && event.params.agentId) || ""));
+        startJob(key, String((event.params && event.params.agentId) || ""), String((event.params && event.params.label) || ""), ctx.sessionKey, null);
+      }
     }));
 
+    // A dispatch to this agent went through: a refusal it still had open needs no retry wake.
+    const dispatchWent = (agentId) => {
+      if (!agentId || !closeRefusals(store.data, agentId, Date.now())) return;
+      log("info", "token-guard: a refused dispatch went through when sent again; no retry wake", { agentId });
+      store.touch();
+      store.save();
+    };
+
     api.on("subagent_spawned", safe("subagent_spawned", (event, ctx) => {
+      dispatchWent(event.agentId);
       startJob(event.childSessionKey, event.agentId, event.label, ctx && ctx.requesterSessionKey, event.requester && event.requester.threadId);
       const job = store.data.jobs[event.childSessionKey];
       if (job && event.resolvedModel && !job.model) { job.model = event.resolvedModel; store.touch(); }

@@ -575,6 +575,19 @@ test("a dispatch refused by OpenClaw's login check: the login is checked again a
     tick();
     await settle();
     assert.equal(telegram.filter((m) => /refused 3 times in an hour/.test(m.text || "")).length, 1);
+    // 6. refused, then the orchestrator sends it again at once and it goes through: no retry wake follows
+    const qaRefused = refused();
+    qaRefused.params = { agentId: "qa", task: "Project: shop" };
+    call(qaRefused);
+    assert.ok(await until(() => recheckCalls().some((c) => c[4] === JSON.stringify({ agentId: "qa" }))), "the qa login was not checked again");
+    call({ toolName: "mcp__openclaw__sessions_spawn", params: { agentId: "qa", task: "Project: shop", label: "shop: qa" },
+      result: { content: [{ type: "text", text: JSON.stringify({ status: "accepted", childSessionKey: "agent:qa:subagent:went-through" }) }] } });
+    assert.ok(logs.some((m) => /went through when sent again/.test(m) && /"agentId":"qa"/.test(m)), "the resend that went through was not seen");
+    skew += 121000;
+    tick();
+    await settle();
+    assert.equal(retryWakes().length, 2, "a retry wake for a dispatch that already went through");
+    assert.ok(!retryWakes().some((w) => /dispatch to qa/i.test(w.message)));
   } finally {
     Date.now = realNow;
   }
