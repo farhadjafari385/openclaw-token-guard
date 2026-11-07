@@ -425,7 +425,7 @@ test("a dispatch the runtime refuses is logged and named in the team topic once,
       topics: { enabled: false },
       mirror: { enabled: true, chatId: "-100", systemTopic: 160, defaultTopic: 160, minIntervalMs: 0,
         botTokenFiles: { coordinator: path.join(root, "bot.token") } },
-      jobs: { stateFile: path.join(root, "state", "jobs.json"), idleWakeSession: "agent:coordinator:explicit:team-ops" },
+      jobs: { stateFile: path.join(root, "state", "jobs.json"), idleWakeSession: "agent:coordinator:explicit:team-ops", refusal: { enabled: false } },
       triage: { enabled: false },
     },
     logger: { info: (m, x) => logs.push([m, x]), warn: (m, x) => logs.push([m, x]), error: (m, x) => logs.push([m, x]), debug: () => {} },
@@ -444,7 +444,7 @@ test("a dispatch the runtime refuses is logged and named in the team topic once,
       error: `sessions_spawn model "anthropic/claude-sonnet-5-5" is not usable: The selected account or native runtime is unavailable for anthropic/claude-sonnet-5-5. Restore that account before spawning this model.` }) }] },
   });
   call(refused("qa"));
-  assert.ok(await until(() => telegram.some((m) => /Dispatch to .* failed/.test(m.text || ""))), "the refused dispatch was not named in the team topic");
+  assert.ok(await until(() => telegram.some((m) => /Dispatch to qa failed/.test(m.text || ""))), "the refused dispatch was not named in the team topic");
   const note = telegram.find((m) => /Dispatch to .* failed/.test(m.text || ""));
   assert.equal(note.message_thread_id, 160);
   assert.match(note.text, /native runtime is unavailable/);
@@ -459,4 +459,123 @@ test("a dispatch the runtime refuses is logged and named in the team topic once,
   call({ toolName: "sessions_spawn", params: { agentId: "qa" }, result: "token-guard: aa11bb22 is not next in the queue." });
   await settle();
   assert.equal(logs.filter(([m]) => /dispatch failed/.test(m)).length, 2);
+});
+
+test("a dispatch refused by OpenClaw's login check: the login is checked again and the orchestrator sends it again", async () => {
+  const root = harness();
+  process.env.OC_INBOX_FILE = path.join(root, "inbox.jsonl");
+  process.env.OC_INBOX_BIN = path.join(REPO, "bin", "oc-inbox");
+  // a fake `openclaw` that records how it was called
+  const calls = path.join(root, "openclaw-calls.txt");
+  const fake = path.join(root, "fake-openclaw");
+  fs.writeFileSync(fake, `#!/usr/bin/env node\nrequire("fs").appendFileSync(${JSON.stringify(calls)}, JSON.stringify(process.argv.slice(2)) + "\\n");\nprocess.stdout.write("{}");\n`);
+  fs.chmodSync(fake, 0o755);
+  const recheckCalls = () => (fs.existsSync(calls) ? fs.readFileSync(calls, "utf8").trim().split("\n").filter(Boolean).map((l) => JSON.parse(l)) : []);
+  const telegram = [];
+  globalThis.fetch = async (url, opts = {}) => {
+    if (String(url).startsWith("https://api.telegram.org/")) {
+      telegram.push(JSON.parse(opts.body || "{}"));
+      return { ok: true, json: async () => ({ ok: true, result: { message_id: 5000 + telegram.length } }) };
+    }
+    return { ok: false, status: 404, json: async () => ({}) };
+  };
+  const handlers = {};
+  const logs = [];
+  const services = [];
+  const runs = [];
+  const api = {
+    pluginConfig: {
+      orchestratorAgent: "coordinator",
+      board: { enabled: false },
+      topics: { enabled: false },
+      mirror: { enabled: true, chatId: "-100", systemTopic: 160, defaultTopic: 160, minIntervalMs: 0,
+        botTokenFiles: { coordinator: path.join(root, "bot.token") }, agentNames: { writer: "Writer" } },
+      jobs: { stateFile: path.join(root, "state", "jobs.json"), idleWakeSession: "agent:coordinator:explicit:team-ops",
+        refusal: { command: fake, retryAfterSeconds: 120, maxPerHour: 2 } },
+      triage: { enabled: false },
+    },
+    logger: { info: (m) => logs.push(m), warn: (m) => logs.push(m), error: (m) => logs.push(m), debug: () => {} },
+    on: (name, fn) => { (handlers[name] = handlers[name] || []).push(fn); },
+    registerService: (s) => services.push(s),
+    registerTool: () => {},
+    runtime: { subagent: { run: async (p) => { runs.push(p); return { runId: `r${runs.length}` }; } } },
+  };
+  const entry = (await import(pathToFileURL(path.join(root, "plugin", "index.js")).href)).default;
+  entry.register(api);
+  let tick;
+  const realSetInterval = globalThis.setInterval;
+  globalThis.setInterval = (fn) => { tick = fn; return { unref() {} }; };
+  for (const s of services) if (s.start) s.start();
+  globalThis.setInterval = realSetInterval;
+  const realNow = Date.now;
+  let skew = 11 * 60000; // past the boot grace
+  Date.now = () => realNow() + skew;
+  const call = (event) => { for (const h of handlers.after_tool_call || []) h(event, { agentId: "coordinator", sessionKey: "agent:coordinator:explicit:team-ops" }); };
+  const refused = () => ({
+    toolName: "mcp__openclaw__sessions_spawn",
+    params: { agentId: "writer", task: "Project: shop" },
+    result: { content: [{ type: "text", text: JSON.stringify({ status: "error", error: `sessions_spawn model "anthropic/claude-sonnet-5-5" is not usable: The selected account or native runtime is unavailable for anthropic/claude-sonnet-5-5. Restore that account before spawning this model.` }) }] },
+  });
+  const retryWakes = () => runs.filter((r) => /\[dispatch\]/.test(r.message || ""));
+  const ORC = { agentId: "coordinator", sessionKey: "agent:coordinator:explicit:team-ops", runId: "run-9" };
+  const spawn = () => { let out; for (const h of handlers.before_tool_call || []) out = h({ toolName: "sessions_spawn", params: { agentId: "writer", task: brief("cc33dd44"), label: "shop: retry" } }, ORC) ?? out; return out; };
+  try {
+    // 0. the brief goes out (the guard records it) and the runtime refuses it
+    let r = spawn();
+    assert.ok(!(r && r.block), `first dispatch refused by the guard: ${r && r.blockReason}`);
+    // 1. refused: OpenClaw is asked at once to check the writer's login again, and the topic says what happens next
+    call(refused());
+    call(refused()); // the CLI reports the same spawn twice
+    assert.ok(await until(() => recheckCalls().length === 1), "OpenClaw was not asked to check the login again");
+    assert.deepEqual(recheckCalls()[0], ["gateway", "call", "models.list", "--params", JSON.stringify({ agentId: "writer" }), "--json"]);
+    assert.ok(await until(() => telegram.some((m) => /Dispatch to Writer failed/.test(m.text || ""))), `no note; posts: ${JSON.stringify(telegram.map((m) => m.text))}; logs: ${logs.slice(-5).join(" | ")}`);
+    const note = telegram.find((m) => /Dispatch to Writer failed/.test(m.text || ""));
+    assert.equal(note.message_thread_id, 160);
+    assert.match(note.text, /not a usage limit/);
+    assert.match(note.text, /send it again in 2 min/);
+    // 2. not before the wait
+    tick();
+    await settle();
+    assert.equal(retryWakes().length, 0);
+    // 3. after the wait: the login is checked again and the orchestrator is woken once to send it again
+    skew += 121000;
+    tick();
+    assert.ok(await until(() => retryWakes().length === 1), "the orchestrator was not woken to retry");
+    const wake = retryWakes()[0];
+    assert.equal(wake.sessionKey, "agent:coordinator:explicit:team-ops");
+    assert.equal(wake.deliver, false);
+    assert.match(wake.message, /dispatch to Writer at \d\d:\d\d UTC was refused by OpenClaw's own Claude login check/);
+    assert.match(wake.message, /not a usage limit/);
+    assert.match(wake.message, /retry 1 of 2/);
+    // the same brief again is allowed: the refused one was never sent
+    r = spawn();
+    assert.ok(!(r && r.block), `the resend was blocked: ${r && r.blockReason}`);
+    // a brief that did go out is still not sent twice
+    r = spawn();
+    assert.equal(r && r.block, true);
+    assert.match(r.blockReason, /already sent/);
+    assert.ok(await until(() => recheckCalls().length === 2), "the login was not checked again before the wake");
+    tick();
+    await settle();
+    assert.equal(retryWakes().length, 1, "one wake per refusal");
+    // 4. the retry is refused too: one more try
+    call(refused());
+    skew += 121000;
+    tick();
+    assert.ok(await until(() => retryWakes().length === 2));
+    assert.match(retryWakes()[1].message, /retry 2 of 2/);
+    // 5. refused a third time within the hour: no more wakes, the operator is told once
+    call(refused());
+    skew += 121000;
+    tick();
+    assert.ok(await until(() => telegram.some((m) => /refused 3 times in an hour/.test(m.text || ""))), "the operator was not told");
+    await settle();
+    assert.equal(retryWakes().length, 2);
+    assert.ok(logs.some((m) => /still refused by the Claude login check/.test(m)));
+    tick();
+    await settle();
+    assert.equal(telegram.filter((m) => /refused 3 times in an hour/.test(m.text || "")).length, 1);
+  } finally {
+    Date.now = realNow;
+  }
 });

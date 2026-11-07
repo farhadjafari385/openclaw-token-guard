@@ -1,7 +1,7 @@
 import crypto from "node:crypto";
 import { definePluginEntry } from "openclaw/plugin-sdk/plugin-entry";
 import { Type } from "typebox";
-import { createState, decide } from "./guard.js";
+import { createState, decide, forgetRefusedBrief } from "./guard.js";
 import { policyDecide, firstLine, itemsFromBrief, completeBrief, codexEnabled, CHECK_COMMAND } from "./policy.js";
 import { ACTIVE, isLimitBlock, normStatus, resultVerdict, nextAfterJob, queueState, renderBoard, renderOverview, auditBoard, parseApproval, looksLikeRequest } from "./board.js";
 import { correctTopic, isGeneral, projectOfTopic, projectsMentioned } from "./topics.js";
@@ -13,7 +13,7 @@ import {
 import { createMirror, topicFor, messageIdOf } from "./mirror.js";
 import {
   dispatchText, ackText, resultText, guardText, limitText, budgetText, approvalAskText, approvalReplyText,
-  auditText, movedText, mdToHtml, handleOf, boardReplyText, spawnErrorText,
+  auditText, movedText, mdToHtml, handleOf, boardReplyText, spawnErrorText, nameOf,
 } from "./voice.js";
 import { inboxArgs, loadInboxItems, runInbox } from "./inbox.js";
 import { processBoot } from "./boot.js";
@@ -22,6 +22,8 @@ import { mergeTriageConfig, triageSnapshot, triageSignature, TRIAGE_PROMPT, pars
 import { parseCiLink, ciRequest, ciState, failedParts, DEFAULT_CI } from "./ci.js";
 import { allowAgentWake, wakeMessage, DEFAULT_WAKE, WAKE_REASONS } from "./wake.js";
 import fs from "node:fs";
+import { execFile } from "node:child_process";
+import { mergeRefusalConfig, isLoginRefusal, recordRefusal, dueRefusals, refusalsWithinHour, retryWakeText } from "./refusal.js";
 
 // No top-level await: OpenClaw loads plugin entries through require(), which
 // rejects ESM graphs that use it.
@@ -51,6 +53,21 @@ export default definePluginEntry({
         if (fn) fn.call(api.logger, meta ? `${message} ${JSON.stringify(meta)}` : message);
       } catch {
         // logging must never break a tool call
+      }
+    };
+    // A dispatch refused by OpenClaw's Claude login check (see refusal.js): reading the agent's model
+    // list makes OpenClaw check the login again; the orchestrator is then woken to send it again.
+    const refusalCfg = mergeRefusalConfig(jobsCfg.refusal);
+    const recheckLogin = (agentId) => {
+      if (!refusalCfg.command) return;
+      try {
+        execFile(refusalCfg.command, ["gateway", "call", "models.list", "--params", JSON.stringify({ agentId }), "--json"],
+          { timeout: 120000, maxBuffer: 8 << 20, env: process.env }, (error) => {
+            if (error) log("warn", "token-guard could not ask OpenClaw to check the Claude login again", { agentId, error: String(error.message || error).slice(0, 200) });
+            else log("info", "token-guard asked OpenClaw to check the Claude login again", { agentId });
+          });
+      } catch (error) {
+        log("warn", "token-guard could not ask OpenClaw to check the Claude login again", { agentId, error: String(error && error.message).slice(0, 200) });
       }
     };
     const safe = (name, fn) => (...args) => {
@@ -501,8 +518,15 @@ export default definePluginEntry({
         const target = String((event.params && event.params.agentId) || r.role || "");
         const error = String(r.error).replace(/\s+/g, " ").slice(0, 300);
         log("warn", "token-guard: dispatch failed", { agentId: target, error });
+        forgetRefusedBrief(state, target);
         const until = (store.data.claudeLimitedUntil || 0) > Date.now() ? store.data.claudeLimitedUntil : 0;
-        systemNote(`spawn-error:${error.replace(/"[^"]*"/g, "").slice(0, 80)}`, spawnErrorText(voice, target, error, until), { html: true });
+        const retry = !until && refusalCfg.enabled && isLoginRefusal(error) && target;
+        if (retry && recordRefusal(store.data, target, error, Date.now())) {
+          recheckLogin(target);
+          store.touch();
+          store.save();
+        }
+        systemNote(`spawn-error:${error.replace(/"[^"]*"/g, "").slice(0, 80)}`, spawnErrorText(voice, target, error, until, retry ? refusalCfg.retryAfterSeconds : 0), { html: true });
         return;
       }
       const key = r && (r.childSessionKey || (r.details && r.details.childSessionKey));
@@ -734,6 +758,7 @@ export default definePluginEntry({
       }
       try { await triageTick(inboxItems); } catch (error) { log("warn", "token-guard triage failed", { error: String(error && error.message) }); }
       try { await ciTick(inboxItems); } catch (error) { log("warn", "token-guard CI watch failed", { error: String(error && error.message) }); }
+      try { await refusalTick(); } catch (error) { log("warn", "token-guard dispatch retry failed", { error: String(error && error.message) }); }
       try { writeQueue(inboxItems); } catch (error) { log("warn", "token-guard queue file failed", { error: String(error && error.message) }); }
       store.touch();
       store.save();
@@ -755,6 +780,33 @@ export default definePluginEntry({
             }
           }
         }
+      }
+    };
+    // ---- a dispatch refused by OpenClaw's login check: check again, then the orchestrator sends it again ----
+    const refusalTick = async () => {
+      if (!refusalCfg.enabled) return;
+      const now = Date.now();
+      for (const [, r] of dueRefusals(store.data, now, refusalCfg)) {
+        const name = nameOf(voice, r.agentId);
+        const tries = refusalsWithinHour(store.data, r.agentId, now);
+        if (tries > refusalCfg.maxPerHour) {
+          r.flaggedAt = now;
+          store.touch();
+          store.save();
+          log("warn", "token-guard: dispatches are still refused by the Claude login check", { agentId: r.agentId, refusals: tries });
+          systemNote(`refusal-stuck:${r.agentId}`, `🚩 Dispatches to ${name} were refused ${tries} times in an hour by OpenClaw's own Claude login check, not by a usage limit. I stopped retrying. Operator: run <code>claude auth status</code> on the server.`, { html: true });
+          continue;
+        }
+        r.wokeAt = now;
+        const day = new Date(now).toISOString().slice(0, 10);
+        store.data.wakesByDay[day] = (store.data.wakesByDay[day] || 0) + 1;
+        store.touch();
+        store.save();
+        recheckLogin(r.agentId);
+        if (!api.runtime || !api.runtime.subagent || typeof api.runtime.subagent.run !== "function") continue;
+        await api.runtime.subagent.run({ sessionKey: jobsCfg.idleWakeSession, deliver: false, message: retryWakeText(name, r.at, tries, refusalCfg.maxPerHour) })
+          .then(() => log("info", "token-guard woke the orchestrator to send a refused dispatch again", { agentId: r.agentId, retry: tries }))
+          .catch((error) => log("warn", "token-guard could not wake the orchestrator to retry a dispatch", { error: String(error && error.message) }));
       }
     };
     // ---- the CI watch: pipelines are followed by code, not by a model waiting in its session ----
