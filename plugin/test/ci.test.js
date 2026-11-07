@@ -23,6 +23,10 @@ test("CI state: running until the pipeline ends; green only when everything pass
   assert.equal(ciState(gl, { status: "success" }), "success");
   assert.equal(ciState(gl, { status: "failed" }), "failed");
   assert.equal(ciState(gl, { status: "canceled" }), "failed");
+  // automatic jobs green, a manual production deploy left: passed (seen live as a false "failed")
+  assert.equal(ciState(gl, { status: "manual" }), "success");
+  assert.equal(ciState({ kind: "gitlab-mr" }, { iid: 3, head_pipeline: { status: "manual" } }), "success");
+  assert.equal(ciState(gl, { status: "skipped" }), "failed");
   assert.equal(ciState({ kind: "gitlab-mr" }, { head_pipeline: { status: "success" } }), "success");
   assert.equal(ciState({ kind: "gitlab-mr" }, { head_pipeline: null }), "running");
   // an MR GitLab answered for, with no pipeline at all: "none" (the watch waits a little, then lets go)
