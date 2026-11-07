@@ -263,6 +263,25 @@ test("sessions per brief: only small items of one project and owner share a sess
   assert.equal(decide(spawn(["dddd0001", "dddd0002"]), COORD, state(), {}), undefined);
 });
 
+test("a brief the guard blocks is not counted as sent: its resend is judged again, not called a duplicate", () => {
+  const inbox = new Map([
+    ["aaaa0001", { id: "aaaa0001", project: "demo", owner: "writer", size: "small" }],
+    ["bbbb0001", { id: "bbbb0001", project: "demo", owner: "writer", size: "medium" }],
+  ]);
+  const s = Object.assign(createState(), { lookupInbox: () => inbox });
+  const spawn = (ids, label) => ({ toolName: "sessions_spawn", params: { agentId: "reviewer", label,
+    task: `Project: demo\nItems: ${ids.join(", ")}\nDone when: tests pass` } });
+  const first = decide(spawn(["aaaa0001", "bbbb0001"], "demo: review"), COORD, s, {});
+  assert.match(first.blockReason, /bbbb0001 \(medium\) must each get a fresh session/);
+  // the same task with another label: still the mixed batch, never "already sent"
+  const again = decide(spawn(["aaaa0001", "bbbb0001"], "demo: review again"), COORD, s, {});
+  assert.match(again.blockReason, /fresh session/);
+  assert.doesNotMatch(again.blockReason, /already sent/);
+  // the fixed brief goes out once; sending that one again is the duplicate
+  assert.equal(decide(spawn(["bbbb0001"], "demo: review"), COORD, s, {}), undefined);
+  assert.match(decide(spawn(["bbbb0001"], "demo: review"), COORD, s, {}).blockReason, /already sent/);
+});
+
 test("subagents list calls count as status checks; wait does not", () => {
   const s = createState();
   const list = { toolName: "subagents", params: { action: "list" } };
