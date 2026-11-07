@@ -76,10 +76,23 @@ function newerJob(a, b) {
   if (rank(a) !== rank(b)) win = rank(a) > rank(b) ? a : b;
   const other = win === a ? b : a;
   const missing = THREAD_FIELDS.filter((f) => !win[f] && other[f]);
-  if (!missing.length) return win;
+  const wait = mergeWait(win.waitFor, other.waitFor);
+  if (!missing.length && wait === win.waitFor) return win;
   const out = Object.assign({}, win);
   for (const f of missing) out[f] = other[f];
+  if (wait !== win.waitFor) out.waitFor = wait;
   return out;
+}
+
+// A CI wait only moves forward: once a copy has marked it done (or checked it), a copy holding an
+// older version must not undo that. (On 2026-11-07 a stale copy's save dropped "done", and the item
+// stayed locked as "already being worked on" with no task running.)
+function mergeWait(w, o) {
+  if (!w || !o || w.url !== o.url) return w || o;
+  const done = w.done || o.done;
+  const checkedAt = Math.max(w.checkedAt || 0, o.checkedAt || 0);
+  if (done === w.done && checkedAt === (w.checkedAt || 0)) return w;
+  return Object.assign({}, w, done ? { done } : {}, checkedAt ? { checkedAt } : {});
 }
 
 // Merge two states (two plugin generations, or memory and disk) without losing either's work.

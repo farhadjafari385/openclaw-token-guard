@@ -3,7 +3,7 @@ import { definePluginEntry } from "openclaw/plugin-sdk/plugin-entry";
 import { Type } from "typebox";
 import { createState, decide } from "./guard.js";
 import { policyDecide, firstLine, itemsFromBrief, completeBrief, codexEnabled, CHECK_COMMAND } from "./policy.js";
-import { isLimitBlock, normStatus, resultVerdict, nextAfterJob, queueState, renderBoard, renderOverview, auditBoard, parseApproval, looksLikeRequest } from "./board.js";
+import { ACTIVE, isLimitBlock, normStatus, resultVerdict, nextAfterJob, queueState, renderBoard, renderOverview, auditBoard, parseApproval, looksLikeRequest } from "./board.js";
 import { correctTopic, isGeneral, projectOfTopic, projectsMentioned } from "./topics.js";
 import { isLimitError, isLimitReply, allowLimitReply, limitResetAt } from "./limits.js";
 import {
@@ -290,9 +290,21 @@ export default definePluginEntry({
       }
     };
 
+    // Items a task is working on, or whose pipeline the CI watch is waiting for. Read from the shared
+    // state (another copy of the plugin may have ended the wait), and a CI wait holds its item only
+    // while the item is still in hand (In progress, Review, QA): moved to Blocked, To do or Done, it
+    // is free again.
+    const inHand = (id, board) => { const it = board.get(id); return !it || ACTIVE.has(normStatus(it.status)); };
     const runningItemIds = () => {
       const ids = new Set();
-      for (const j of Object.values(store.data.jobs)) if (j.status === "running" || (j.waitFor && !j.waitFor.done)) for (const id of j.items || []) ids.add(id);
+      const jobs = Object.values(fresh().jobs);
+      let board = null;
+      for (const j of jobs) {
+        if (j.status === "running") { for (const id of j.items || []) ids.add(id); continue; }
+        if (!j.waitFor || j.waitFor.done) continue;
+        if (!board) { try { board = loadInboxItems(); } catch { board = new Map(); } }
+        for (const id of j.items || []) if (inHand(id, board)) ids.add(id);
+      }
       return ids;
     };
     const queueCfg = { wip: Number.isFinite(Number((cfg.board || {}).wip)) ? Number(cfg.board.wip) : 1, projectOrder: (cfg.board || {}).projectOrder || [] };
@@ -753,7 +765,17 @@ export default definePluginEntry({
       const board = new Map(inboxItems.map((it) => [it.id, it]));
       for (const job of Object.values(store.data.jobs)) {
         const w = job.waitFor;
-        if (!w || w.done || now - (w.checkedAt || 0) < ciCfg.pollSeconds * 1000) continue;
+        if (!w || w.done) continue;
+        // The item was moved on by hand (Blocked, To do, Done): the watch ends without a post or a move.
+        const items = (job.items || []).filter((id) => board.has(id));
+        if (items.length && !items.some((id) => inHand(id, board))) {
+          w.done = { state: "left hand", at: now };
+          store.touch();
+          store.save();
+          log("info", "token-guard CI watch ended: the item is no longer in hand", { url: w.url, items: items.map((id) => `${id} ${normStatus(board.get(id).status)}`).join(", ") });
+          continue;
+        }
+        if (now - (w.checkedAt || 0) < ciCfg.pollSeconds * 1000) continue;
         w.checkedAt = now;
         store.touch();
         let state = "running";
