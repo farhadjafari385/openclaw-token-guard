@@ -79,10 +79,13 @@ function newerJob(a, b) {
   const other = win === a ? b : a;
   const missing = THREAD_FIELDS.filter((f) => !win[f] && other[f]);
   const wait = mergeWait(win.waitFor, other.waitFor);
-  if (!missing.length && wait === win.waitFor) return win;
+  // Counters only go up: a copy that missed a map query must not lock the task's code again.
+  const graphQueries = Math.max(win.graphQueries || 0, other.graphQueries || 0);
+  if (!missing.length && wait === win.waitFor && graphQueries === (win.graphQueries || 0)) return win;
   const out = Object.assign({}, win);
   for (const f of missing) out[f] = other[f];
   if (wait !== win.waitFor) out.waitFor = wait;
+  if (graphQueries) out.graphQueries = graphQueries;
   return out;
 }
 
@@ -239,6 +242,14 @@ function recordCall(data, sessionKey, cfg) {
     return job;
   }
   return null;
+}
+
+// A task queried its project's code map (graphify): searching and reading code is open from now on.
+function recordGraph(data, sessionKey) {
+  const job = data.jobs[sessionKey];
+  if (!job || job.status !== "running") return false;
+  job.graphQueries = (job.graphQueries || 0) + 1;
+  return true;
 }
 
 // A task ran one of its project's pipeline steps locally (lint, typecheck, tests, security, build).
@@ -502,6 +513,7 @@ export {
   recordUsage,
   recordCall,
   recordCheck,
+  recordGraph,
   recordResultText,
   finalAnswer,
   missingProof,

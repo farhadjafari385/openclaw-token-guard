@@ -257,3 +257,82 @@ test("secrets: every refusal about a credential file says how to store it", () =
   // Unrelated refusals stay short.
   assert.doesNotMatch(policyDecide(write(`${H}/.openclaw/openclaw.json`), DEVOPS, {}, {}).blockReason, /oc-secret-save/);
 });
+
+test("code map first: a task in a project with a built map queries it before it searches or reads code", async () => {
+  const fs = await import("node:fs");
+  const path = await import("node:path");
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "graphs-"));
+  fs.mkdirSync(`${tmp}/demo/graphify-out`, { recursive: true });
+  fs.writeFileSync(`${tmp}/demo/graphify-out/graph.json`, "{}");
+  const cfg = {
+    projects: { demo: { topic: 5, path: "/srv/demo" }, other: { topic: 6, path: "/srv/other" } },
+    graphs: { enabled: true, root: tmp, bin: "~/.openclaw/bin/graphify", budget: 1500, projects: ["demo", "other"] },
+  };
+  const W = { agentId: "writer", sessionKey: "agent:writer:subagent:g1" };
+  const ps = (job) => ({ jobFor: () => job });
+  const job = { project: "demo (/srv/demo)", status: "running" };
+  const read = (file_path) => ({ toolName: "Read", params: { file_path } });
+  // Searching or reading the project's code before the map: blocked, and told the exact command.
+  for (const ev of [
+    { toolName: "Grep", params: { pattern: "createPayment" } },
+    { toolName: "Glob", params: { pattern: "**/*.php" } },
+    { toolName: "Grep", params: { pattern: "x", path: "/srv/demo/backend" } },
+    read("/srv/demo/backend/src/app/Services/OxapayIpgService.php"),
+    exec("grep -rn createPayment src/"),
+    exec("rg createPayment"),
+    exec("cd /srv/demo/backend-worktrees/abc && grep -rn \"credit pack\" ."),
+    exec("find . -name '*.tsx' | head"),
+    exec("git grep -n OxapayIpgService"),
+    exec("sed -n 1,80p src/app/Http/Controllers/CreditPackController.php"),
+    exec("cat src/pages/landing/PricingPage.tsx"),
+    exec("tree -L 2"),
+    exec("rg -n checkout /srv/demo/frontend/src"),
+  ]) {
+    const r = policyDecide(ev, W, ps(job), cfg);
+    assert.equal(rule(r), "graphFirst", JSON.stringify(ev.params));
+    assert.match(r.blockReason, new RegExp(`graphify query ".+" --graph ${tmp}/demo/graphify-out/graph.json --budget 1500`));
+  }
+  // Everything else stays open: the map query itself, git, tests, other folders, output filters, proof files.
+  for (const ev of [
+    exec(`~/.openclaw/bin/graphify query "OxapayIpgService" --graph ${tmp}/demo/graphify-out/graph.json --budget 1500`),
+    exec("git status && git diff origin/master...HEAD --stat"),
+    exec("php artisan test --filter=BusinessPackCheckoutTest"),
+    exec("docker ps | grep api"),
+    exec("curl -s http://127.0.0.1:8000/api/health | grep -o ok"),
+    exec("cat /tmp/w8b44/full.log | tail -20"),
+    exec("find /tmp -name '*.log' -mmin -30"),
+    exec("grep -c item ~/.openclaw/inbox/inbox.jsonl"),
+    exec("ls -la"),
+    read("/srv/demo/proof/51200955/name.png"),
+    read(`${H}/.openclaw/secrets/telegram-x.token`),
+    { toolName: "Edit", params: { file_path: "/srv/demo/backend/src/a.php", old_string: "a", new_string: "b" } },
+  ]) assert.equal(rule(policyDecide(ev, W, ps(job), cfg)), null, JSON.stringify(ev.params));
+  // One query opens the task's code.
+  assert.equal(policyDecide(exec("rg createPayment"), W, ps({ ...job, graphQueries: 1 }), cfg), undefined);
+  // A project whose map is not built yet, a task with no project, and the orchestrator are never blocked.
+  assert.equal(policyDecide(exec("rg x"), W, ps({ project: "other (/srv/other)", status: "running" }), cfg), undefined);
+  assert.equal(policyDecide(exec("rg x"), W, ps({ project: "", status: "running" }), cfg), undefined);
+  assert.equal(rule(policyDecide({ toolName: "Grep", params: { pattern: "x" } }, COORD, ps(job), cfg)), null);
+  // Off unless the team config turns it on.
+  assert.equal(policyDecide(exec("rg x"), W, ps(job), { projects: cfg.projects }), undefined);
+});
+
+test("code map first: every brief for a project with a map carries the query command", async () => {
+  const fs = await import("node:fs");
+  const path = await import("node:path");
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "graphs-"));
+  fs.mkdirSync(`${tmp}/demo/graphify-out`, { recursive: true });
+  fs.writeFileSync(`${tmp}/demo/graphify-out/graph.json`, "{}");
+  const cfg = {
+    board: { requireItems: false },
+    projects: { demo: { topic: 5, path: "/srv/demo" }, plain: { topic: 7, path: "/srv/plain" } },
+    graphs: { enabled: true, root: tmp, bin: "~/.openclaw/bin/graphify", budget: 1500, projects: ["demo"] },
+  };
+  const brief = (project) => `Project: ${project}\nScope: x\nItems:\na1b2c3d4\nDone when: tests pass\nStop if: y`;
+  const spawn = (task) => ({ toolName: "sessions_spawn", params: { agentId: "writer", task } });
+  const task = policyDecide(spawn(brief("demo (/srv/demo)")), COORD, {}, cfg).params.task;
+  assert.match(task, new RegExp(`\\nCode map \\(required before you search or read code\\): ~/.openclaw/bin/graphify query "<class, function or short question>" --graph ${tmp}/demo/graphify-out/graph.json --budget 1500`));
+  // Not twice, and not for a project without a map.
+  assert.equal(policyDecide(spawn(task), COORD, {}, cfg).params.task.match(/Code map/g).length, 1);
+  assert.doesNotMatch(policyDecide(spawn(brief("plain (/srv/plain)")), COORD, {}, cfg).params.task, /Code map/);
+});

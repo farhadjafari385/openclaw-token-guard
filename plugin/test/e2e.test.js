@@ -79,6 +79,7 @@ test("one item flows through the team: queue, brief, checks, CI watch, next gate
       board: { enabled: true, requireItems: true, agent: "product", wip: 1, projectOrder: ["shop"], view: false },
       topics: { enabled: false },
       projects: { shop: { topic: 151, path: "/srv/shop" } },
+      graphs: { enabled: true, root: path.join(root, "graphs"), bin: "graphify", budget: 1500, projects: ["shop"] },
       mirror: { enabled: true, chatId: "-100", systemTopic: 160, defaultTopic: 160, projectTopics: { shop: 151 }, minIntervalMs: 0,
         botTokenFiles: Object.fromEntries(["coordinator", "writer", "reviewer", "product", "qa"].map((a) => [a, path.join(root, "bot.token")])) },
       jobs: { stateFile: path.join(root, "state", "jobs.json"), scanEverySeconds: 15, idleWakeSession: "agent:coordinator:explicit:team-ops",
@@ -96,6 +97,8 @@ test("one item flows through the team: queue, brief, checks, CI watch, next gate
       deleteSession: async () => ({}),
     } },
   };
+  fs.mkdirSync(path.join(root, "graphs", "shop", "graphify-out"), { recursive: true });
+  fs.writeFileSync(path.join(root, "graphs", "shop", "graphify-out", "graph.json"), "{}");
   const entry = (await import(pathToFileURL(path.join(root, "plugin", "index.js")).href)).default;
   entry.register(api);
   let tick;
@@ -124,6 +127,7 @@ test("one item flows through the team: queue, brief, checks, CI watch, next gate
     assert.ok(r && !r.block, `dispatch of the head refused: ${r && r.blockReason}`);
     assert.equal(r.params.model, "anthropic/claude-sonnet-5");
     assert.equal(r.params.thinking, "low");
+    assert.match(r.params.task, /Code map \(required before you search or read code\): graphify query .* --graph .*\/graphs\/shop\/graphify-out\/graph.json/);
     const child = "agent:writer:subagent:t1";
     call("after_tool_call", { toolName: "sessions_spawn", params: r.params, result: { childSessionKey: child } }, ORC);
     await settle();
@@ -131,6 +135,13 @@ test("one item flows through the team: queue, brief, checks, CI watch, next gate
     // 4. the worker may push only after running the project's checks
     const W = { agentId: "writer", sessionKey: child, runId: "w1" };
     const exec = (command) => call("before_tool_call", { toolName: "exec", params: { command } }, W);
+    // 4a. code map first: a search is refused until the task has queried the project's map once
+    r = exec("rg -n price src/");
+    assert.equal(r && r.block, true, "a search before the map query is refused");
+    assert.match(r.blockReason, /query the code map first: graphify query .* --graph .*\/graphs\/shop\/graphify-out\/graph.json/);
+    assert.ok(!(exec(`graphify query "checkout price" --graph ${root}/graphs/shop/graphify-out/graph.json --budget 1500`) || {}).block);
+    assert.ok(logs.some((l) => /queried its code map/.test(l)), "the map query is recorded");
+    assert.ok(!(exec("rg -n price src/") || {}).block, "searching is open after the map query");
     r = exec("git -C /srv/shop push -u origin agent/a");
     assert.equal(r && r.block, true);
     assert.match(r.blockReason, /pipeline steps locally/);

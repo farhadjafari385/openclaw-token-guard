@@ -1,3 +1,4 @@
+import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { DISPATCHABLE, normStatus } from "./board.js";
@@ -54,6 +55,8 @@ const DEFAULT_POLICY = {
   topics: { enabled: true, chatId: "", teamTopic: 160 },
   taskPaths: { enabled: true, roles: ["writer", "designer", "qa", "reviewer"] },
   projects: {}, // { name: { topic, path, aliases, strict } }
+  // Code maps (graphify): a task in one of these projects queries its map before it searches or reads code.
+  graphs: { enabled: false, root: "~/graphs", bin: "~/.openclaw/bin/graphify", budget: 1500, projects: [] },
   spawn: {
     enabled: true,
     cleanup: "delete",
@@ -367,6 +370,91 @@ function normaliseModel(model, allowed) {
 function briefSetting(text, field) {
   const m = new RegExp(`^[\\s>*#_\\-]*${field}\\s*:\\s*\\**\\s*([\\w./:-]+)`, "im").exec(String(text || ""));
   return m ? m[1].replace(/[.,;]+$/, "") : "";
+}
+
+// ---- code maps (graphify) ----
+
+// A query of the project's code map: the step that unlocks searching and reading code in a task.
+const GRAPH_COMMAND = /(?:^|[\s;&|(/"'])graphify\s+(?:query|explain|path|affected)\b/;
+const SEARCH_HEADS = new Set(["grep", "egrep", "fgrep", "rg", "ag", "ack", "find", "fd", "fdfind", "tree", "locate"]);
+const READ_HEADS = new Set(["cat", "head", "tail", "less", "more", "bat", "batcat", "nl", "sed", "awk"]);
+const PATTERN_FIRST = new Set(["grep", "egrep", "fgrep", "rg", "ag", "ack", "fd", "fdfind"]);
+const NOT_CODE = /\.(?:png|jpe?g|gif|webp|avif|pdf|log|txt|out|csv)$/i;
+const graphSeen = new Map();
+
+// The map of a project, if it has one and it is built (a missing map never blocks work).
+function graphFor(policy, projectLine) {
+  const g = policy.graphs || {};
+  if (!g.enabled) return null;
+  const name = projectName(policy, projectLine || "");
+  if (!name || !(g.projects || []).includes(name)) return null;
+  const display = `${String(g.root || "~/graphs").replace(/\/+$/, "")}/${name}/graphify-out/graph.json`;
+  const file = expandHome(display);
+  const hit = graphSeen.get(file);
+  const now = Date.now();
+  let exists = hit && now - hit.at < 60000 ? hit.exists : null;
+  if (exists === null) {
+    try { exists = fs.statSync(file).isFile(); } catch { exists = false; }
+    graphSeen.set(file, { exists, at: now });
+  }
+  return exists ? { name, display, bin: g.bin || "graphify", budget: Number(g.budget) || 1500 } : null;
+}
+
+function mapCommand(map) {
+  return `${map.bin} query "<class, function or short question>" --graph ${map.display} --budget ${map.budget}`;
+}
+
+// Where a path points: inside the project (true), elsewhere (false), or relative to the task's folder (null).
+function insideProject(token, root) {
+  const t = String(token || "").replace(/^["']|["']$/g, "");
+  if (!/^(?:\/|~|\$\{?HOME\}?)/.test(t)) return null;
+  const abs = path.resolve(expandHome(t));
+  return abs === root || abs.startsWith(root + "/");
+}
+
+// Searching or reading the project's code: what the map replaces.
+function exploresCode(policy, tool, params, root, agentId) {
+  if (tool === "Grep" || tool === "Glob" || tool === "grep" || tool === "glob") {
+    const where = params.path || params.cwd || "";
+    return !where || insideProject(where, root) !== false;
+  }
+  if (tool === "Read" || tool === "read" || tool === "read_file") {
+    const p = String(params.file_path || params.path || "");
+    if (!p || NOT_CODE.test(p) || /\/proof\//.test(p)) return false;
+    return insideProject(p, root) === true;
+  }
+  if (tool !== "exec") return false;
+  const command = stripSecretInput(typeof params.command === "string" ? params.command : "");
+  if (GRAPH_COMMAND.test(command)) return false;
+  for (const cmd of command.split(/&&|\|\||[;\n]/)) {
+    const stages = cmd.split("|");
+    for (let i = 0; i < stages.length; i += 1) {
+      const stage = stages[i].trim();
+      const head = headWord(stage);
+      const gitSearch = head === "git" && /\bgit\b(?:\s+-C\s+\S+)?\s+(?:grep|ls-files)\b/.test(stage);
+      const lsTree = head === "ls" && /\s-[a-zA-Z]*R/.test(stage);
+      const search = SEARCH_HEADS.has(head) || gitSearch || lsTree;
+      const read = READ_HEADS.has(head) && i === 0 && (head !== "sed" || /\s-[a-zA-Z]*n/.test(stage));
+      if (!search && !read) continue;
+      const recursive = /\s-[a-zA-Z]*[rR]|\s--recursive\b/.test(stage);
+      if (i > 0 && !recursive && PATTERN_FIRST.has(head)) continue; // filtering another command's output
+      let words = stage.split(/\s+/).slice(1);
+      if (head === "find") { // only the start folders, before the first expression
+        const k = words.findIndex((w) => /^[-(!\\]/.test(w));
+        if (k >= 0) words = words.slice(0, k);
+      }
+      words = words.filter((w) => w && !w.startsWith("-"));
+      if (PATTERN_FIRST.has(head) && !gitSearch) words.shift();
+      const paths = words.filter((w) => /[/.~]|^\$\{?HOME/.test(w) && !/^[<>]/.test(w));
+      const places = paths.map((w) => insideProject(w, root));
+      if (places.includes(true)) return true;
+      // A relative path is the task's own checkout: any search there, or reading a source file.
+      if (paths.some((w, k) => places[k] === null && (search || (!NOT_CODE.test(w) && /\.[A-Za-z0-9]+["']?$/.test(w))))) return true;
+      // No path: rg, find, tree and git grep search the current folder; plain grep without -r reads its input.
+      if (search && !paths.length && !(/grep$/.test(head) && !gitSearch && !recursive)) return true;
+    }
+  }
+  return false;
 }
 
 // Commands that run a project's own pipeline steps locally (lint, typecheck, tests, security, build).
@@ -689,6 +777,20 @@ function policyDecide(event, ctx, pstate, rawConfig, log, now = Date.now()) {
     }
   }
 
+  // 7b. Code map first: a task in a project with a map queries it before it searches or reads code.
+  // (Owner's order 2026-11-08: graphify is enforced. Reading and searching code is a third or more of what
+  // workers' tools return, and it stays in the session, re-read on every later call.)
+  if (subagent && job && !(job.graphQueries > 0) && policy.graphs && policy.graphs.enabled) {
+    const map = graphFor(policy, job.project || "");
+    const name = map && map.name;
+    const root = name && policy.projects[name] && policy.projects[name].path ? path.resolve(expandHome(policy.projects[name].path)) : "";
+    if (map && root && !root.includes("<") && exploresCode(policy, tool, params, root, agentId)) {
+      return block("graphFirst",
+        `token-guard: query the code map first: ${mapCommand(map)}. It returns the classes, functions, files and lines that matter ` +
+        "for a fraction of the tokens a search or file read costs. Then open only the files it names, and query again with other names instead of searching the repo.");
+    }
+  }
+
   // 8. Spawn policy: fresh isolated task sessions that are deleted when done, enough time to finish, allowed models only.
   if (policy.spawn.enabled && tool === "sessions_spawn" && orchestrator && !subagent) {
     const allowed = policy.spawn.allowedModels || [];
@@ -720,6 +822,11 @@ function policyDecide(event, ctx, pstate, rawConfig, log, now = Date.now()) {
         return block("unknownProject", `token-guard: the brief's Project line ("${line}") is not a project name. Use exactly one of: ${projectList(policy)}.`);
       }
       if (canon !== line.replace(/\(.*$/, "").trim()) task = String(params.task).replace(/^([\s>*#_\-]*Project\s*:?[ \t]*)[^(\n]*/im, `$1${canon} `);
+    }
+    // Every task in a project with a code map is told how to query it (the guard requires it first).
+    const map = graphFor(policy, firstLine(task, "Project"));
+    if (map && !GRAPH_COMMAND.test(String(task))) {
+      task = `${String(task).trimEnd()}\nCode map (required before you search or read code): ${mapCommand(map)}, then open only the files it names.`;
     }
     if (policy.board.enabled && policy.board.requireItems && pstate && typeof pstate.boardItems === "function") {
       const board = pstate.boardItems();
@@ -792,6 +899,9 @@ export {
   canonicalProject,
   briefSetting,
   CHECK_COMMAND,
+  GRAPH_COMMAND,
+  graphFor,
+  exploresCode,
   GIT_PUSH,
   completeBrief,
   similarOpenItem,

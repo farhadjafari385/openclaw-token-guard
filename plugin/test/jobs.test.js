@@ -211,3 +211,17 @@ test("a finished CI wait stays finished when a copy with an older version saves"
   const other = { jobs: { k: Object.assign({}, base, { endedAt: 9000, waitFor: { kind: "gitlab-mr", url: url.replace("/5", "/6"), since: 9000 } }) } };
   assert.equal(mergeStates(done, other).jobs.k.waitFor.done, undefined);
 });
+
+test("a map query is recorded on the running task and survives a stale plugin copy's save", async () => {
+  const { recordGraph, mergeStates } = await import("../jobs.js");
+  const key = "agent:writer:subagent:map1";
+  const a = { jobs: { [key]: { key, status: "running", spawnedAt: 1, lastActivityAt: 5 } } };
+  assert.equal(recordGraph(a, key), true);
+  assert.equal(a.jobs[key].graphQueries, 1);
+  assert.equal(recordGraph(a, "agent:writer:subagent:unknown"), false);
+  // Another copy saw later activity but not the query: the merge keeps the query.
+  const b = { jobs: { [key]: { key, status: "running", spawnedAt: 1, lastActivityAt: 9 } } };
+  assert.equal(mergeStates(b, a).jobs[key].graphQueries, 1);
+  assert.equal(mergeStates(a, b).jobs[key].graphQueries, 1);
+  assert.equal(mergeStates(a, b).jobs[key].lastActivityAt, 9);
+});
