@@ -206,8 +206,49 @@ function redirectTargets(command) {
   return out;
 }
 
-function writesProtected(policy, command, agentId, workdir) {
-  if (!mentionsProtected(policy, command, agentId, workdir)) return false;
+// The value given to oc-secret-save on a heredoc is data, never shell: it is dropped before any
+// check, so a password with ">" or "rm" in it is not read as a command.
+const SECRET_HEREDOC = /(\boc-secret-save\b[^\n]*?<<-?[ \t]*(['"]?)([A-Za-z_][A-Za-z0-9_]*)\2[^\n]*\n)[\s\S]*?\n[ \t]*\3[ \t]*(?=\n|$)/g;
+
+function stripSecretInput(command) {
+  return String(command).replace(SECRET_HEREDOC, (m, head, q, tag) => `${head}${tag}`);
+}
+
+// A path kept in a shell variable is still that path: `f=~/.openclaw/secrets/x; cat > "$f"` once
+// wrote into the protected secrets folder because only literal paths were checked.
+const ASSIGN = /(?:^|[\s;&|({])(?:export\s+|local\s+|readonly\s+|declare\s+(?:-[a-zA-Z]+\s+)?)?([A-Za-z_][A-Za-z0-9_]*)=("[^"]*"|'[^']*'|[^\s;&|)]*)/g;
+const FOR_IN = /\bfor\s+([A-Za-z_][A-Za-z0-9_]*)\s+in\s+([^;\n]*)/g;
+
+function expandPathVars(policy, command, agentId, workdir) {
+  const text = String(command);
+  const vars = {};
+  for (const re of [ASSIGN, FOR_IN]) {
+    for (const m of text.matchAll(re)) {
+      const value = m[2].replace(/^["']|["']$/g, "").trim();
+      // A command substitution (T="$(cat ~/.openclaw/secrets/x)") holds the file's content, not its path.
+      if (!value || /\$\(|`/.test(value)) continue;
+      // A protected folder counts too (D=~/.openclaw/secrets; echo x > "$D/new.token").
+      if (mentionsProtected(policy, value, agentId, workdir) || mentionsProtected(policy, value.replace(/\/?$/, "/x"), agentId, workdir)) vars[m[1]] = value;
+    }
+  }
+  if (!Object.keys(vars).length) return text;
+  return text.replace(/\$\{?([A-Za-z_][A-Za-z0-9_]*)\}?/g, (ref, n) => (n in vars ? vars[n] : ref));
+}
+
+const SECRET_HINT =
+  "To store a new credential (one the owner sent, or one you created), run `~/.openclaw/bin/oc-secret-save <name> <<'EOF'`, " +
+  "then the value on its own line, then `EOF`. It saves ~/.openclaw/secrets/<name> with mode 600 and never prints the value.";
+
+function secretHint(text) {
+  return /\.openclaw\/secrets\b|\.(?:token|pass|password|key|secret)\b|credential/i.test(String(text || "")) ? ` ${SECRET_HINT}` : "";
+}
+
+function writesProtected(policy, rawCommand, agentId, workdir) {
+  const command = expandPathVars(policy, stripSecretInput(rawCommand), agentId, workdir);
+  // `cd ~/.openclaw/secrets` names the protected folder itself, without a file under it.
+  const cdProtected = (segment) => headWord(segment) === "cd" &&
+    (mentionsProtected(policy, segment, agentId, workdir) || mentionsProtected(policy, segment.trim().replace(/\/?$/, "/x"), agentId, workdir));
+  if (!mentionsProtected(policy, command, agentId, workdir) && !rawParts(command).some(cdProtected)) return false;
   // Redirections into a protected path.
   for (const t of redirectTargets(command)) {
     if (isProtectedPath(policy, resolveToolPath(policy, agentId, t)) || MANAGED_BASENAMES.test(` ${t}`)) return true;
@@ -219,10 +260,12 @@ function writesProtected(policy, command, agentId, workdir) {
   for (const segment of parts) {
     const head = headWord(segment);
     const mentions = mentionsProtected(policy, segment, agentId, workdir);
-    if (head === "cd") { inProtectedDir = mentions; continue; }
+    if (head === "cd") { inProtectedDir = cdProtected(segment); continue; }
     const touches = mentions || inProtectedDir;
     if (!touches) continue;
     if (WRITE_HEADS.has(head)) return true;
+    // After `cd <protected dir>`, a relative redirect (cat > new.token) writes inside it.
+    if (inProtectedDir && redirectTargets(segment).some((t) => !/^[/~$]/.test(t))) return true;
     if (/\bsed\b[^|;&]*\s-[a-zA-Z]*i/.test(segment) || /\bperl\b[^|;&]*\s-[a-zA-Z]*i/.test(segment) || /\bawk\b[^|;&]*-i\s+inplace/.test(segment)) return true;
     if (head === "git" && /\bgit\b[^;&|]*\b(checkout|restore|reset|stash|apply|am|rm|mv|clean|pull|merge|rebase|commit|push)\b/.test(segment)) return true;
     if (/(?:^|\s)tee\b/.test(segment)) return true;
@@ -283,8 +326,9 @@ const ORC_MUTATIONS = [
   /\b(kill|pkill|killall)\s/,
 ];
 
-function orchestratorMutation(policy, command, agentId) {
+function orchestratorMutation(policy, rawCommand, agentId) {
   const ws = agentWorkspace(policy, agentId);
+  const command = expandPathVars(policy, stripSecretInput(rawCommand), agentId);
   for (const t of redirectTargets(command)) {
     const abs = resolveToolPath(policy, agentId, t);
     if (!(abs.startsWith("/tmp/") || abs.startsWith(ws + "/"))) return `writes to ${t}`;
@@ -497,11 +541,11 @@ function policyDecide(event, ctx, pstate, rawConfig, log, now = Date.now()) {
   if (policy.protect.enabled) {
     if (WRITE_TOOLS.has(tool)) {
       for (const p of toolWritePaths(tool, params)) {
-        if (isProtectedPath(policy, resolveToolPath(policy, agentId, p))) return block("protectedFile", `token-guard: ${p} is protected. ${RULES_MESSAGE}`);
+        if (isProtectedPath(policy, resolveToolPath(policy, agentId, p))) return block("protectedFile", `token-guard: ${p} is protected. ${RULES_MESSAGE}${secretHint(p)}`);
       }
     }
     if (tool === "exec") {
-      const command = typeof params.command === "string" ? params.command : "";
+      const command = stripSecretInput(typeof params.command === "string" ? params.command : "");
       const git = gitViolation(command);
       // The owner's order: every pipeline step runs locally before any push (lint, typecheck, security, tests).
       if (subagent && GIT_PUSH.test(command) && policy.requireChecksBeforePush !== false) {
@@ -513,7 +557,7 @@ function policyDecide(event, ctx, pstate, rawConfig, log, now = Date.now()) {
       if (git) return block("gitSafety", `token-guard: blocked: ${git}. Merges to main happen only through a reviewed merge request (the Team Lead merges when the pipeline is green).`);
       if (MUTATING_OPENCLAW.test(command)) return block("protectedConfig", `token-guard: changing OpenClaw config, plugins, crons, secrets, agents or models is not allowed for agents. ${RULES_MESSAGE}`);
       if (/(?:^|[\s;&|])chattr\s/.test(command)) return block("protectedFile", `token-guard: chattr is not allowed. ${RULES_MESSAGE}`);
-      if (writesProtected(policy, command, agentId, params.workdir || params.cwd)) return block("protectedFile", `token-guard: this command would change a protected file. ${RULES_MESSAGE}`);
+      if (writesProtected(policy, command, agentId, params.workdir || params.cwd)) return block("protectedFile", `token-guard: this command would change a protected file. ${RULES_MESSAGE}${secretHint(command)}`);
     }
   }
 
@@ -562,7 +606,7 @@ function policyDecide(event, ctx, pstate, rawConfig, log, now = Date.now()) {
       for (const p of toolWritePaths(tool, params)) {
         const abs = resolveToolPath(policy, agentId, p);
         if (!(abs.startsWith(ws + "/") || abs.startsWith("/tmp/"))) {
-          return block("orchestratorOnly", `token-guard: you are the orchestrator; you do not edit ${p}. Dispatch it to the owning specialist with sessions_spawn.`);
+          return block("orchestratorOnly", `token-guard: you are the orchestrator; you do not edit ${p}. Dispatch it to the owning specialist with sessions_spawn.${secretHint(p)}`);
         }
       }
     }
@@ -572,7 +616,7 @@ function policyDecide(event, ctx, pstate, rawConfig, log, now = Date.now()) {
       if (what) {
         return block("orchestratorOnly",
           `token-guard: you are the orchestrator; you do not run "${what}" yourself. Read-only checks are fine. ` +
-          "Dispatch the change to its owner with sessions_spawn (devops: servers, CI, DNS, deploys; writer: code; reviewer: merges).");
+          "Dispatch the change to its owner with sessions_spawn (devops: servers, CI, DNS, deploys; writer: code; reviewer: merges)." + secretHint(command));
       }
     }
   }
@@ -758,6 +802,8 @@ export {
   isProtectedPath,
   mentionsProtected,
   writesProtected,
+  stripSecretInput,
+  expandPathVars,
   orchestratorMutation,
   gitViolation,
   toolWritePaths,
