@@ -827,10 +827,14 @@ function policyDecide(event, ctx, pstate, rawConfig, log, now = Date.now()) {
       }
       if (canon !== line.replace(/\(.*$/, "").trim()) task = String(params.task).replace(/^([\s>*#_\-]*Project\s*:?[ \t]*)[^(\n]*/im, `$1${canon} `);
     }
-    // Every task in a project with a code map is told how to query it (the guard requires it first).
+    // Every task in a project with a code map is told how to query it (the guard requires it first). The
+    // guard writes that line itself: a map line in the brief is dropped (2026-11-08: a hub project's brief
+    // carried another project's map, so the reviewer queried the wrong project and read the repo instead).
     const map = graphFor(policy, firstLine(task, "Project"), String(params.agentId || ""));
-    if (map && !GRAPH_COMMAND.test(String(task))) {
-      task = `${String(task).trimEnd()}\nCode map (required before you search or read code): ${mapCommand(map)}, then open only the files it names.`;
+    if (policy.graphs && policy.graphs.enabled) {
+      const kept = String(task).split("\n").filter((l) => !/^[\s>*_-]*Code map\b/i.test(l) && !/graphify\s+\w+[^\n]*--graph\s/.test(l));
+      task = kept.join("\n");
+      if (map) task = `${task.trimEnd()}\nCode map (required before you search or read code): ${mapCommand(map)}, then open only the files it names.`;
     }
     if (policy.board.enabled && policy.board.requireItems && pstate && typeof pstate.boardItems === "function") {
       const board = pstate.boardItems();

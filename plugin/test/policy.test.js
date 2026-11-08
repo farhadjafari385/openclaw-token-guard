@@ -367,3 +367,35 @@ test("code map first: never for an agent with no shell, and docs are not code", 
   assert.match(policyDecide(spawn("writer"), COORD, {}, cfg).params.task, /Code map/);
   assert.doesNotMatch(policyDecide(spawn("growth"), COORD, {}, cfg).params.task, /Code map/);
 });
+
+test("code map: a acme-hub task gets its own map, never the ai map (strict alias 'acme')", async () => {
+  // Live 2026-11-08: "Project: acme-hub" matched ai's alias "acme" (\b took "-" as an end), and the
+  // brief carried the ai map the orchestrator had written in.
+  const fs = await import("node:fs");
+  const path = await import("node:path");
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "graphs-"));
+  for (const n of ["ai", "acme-hub"]) {
+    fs.mkdirSync(`${tmp}/${n}/graphify-out`, { recursive: true });
+    fs.writeFileSync(`${tmp}/${n}/graphify-out/graph.json`, "{}");
+  }
+  const cfg = {
+    board: { requireItems: false },
+    projects: {
+      ai: { topic: 153, path: "/srv/ai", aliases: ["acme", "acme.cloud", "acme.com"], strict: true },
+      "acme-hub": { topic: 154, path: "/srv/acme-hub" },
+    },
+    graphs: { enabled: true, root: tmp, bin: "graphify", budget: 1500, projects: ["ai", "acme-hub"], agents: ["reviewer", "writer"] },
+  };
+  const brief = `Project: acme-hub (/srv/acme-hub)\nScope: x\nItems:\na1b2c3d4\nDone when: y\nStop if: z\nCode map (required before you search or read code): graphify query "x" --graph ${tmp}/ai/graphify-out/graph.json --budget 1500`;
+  const task = policyDecide({ toolName: "sessions_spawn", params: { agentId: "reviewer", task: brief } }, COORD, {}, cfg).params.task;
+  assert.equal(task.match(/Code map/g).length, 1);
+  assert.match(task, new RegExp(`--graph ${tmp}/acme-hub/graphify-out/graph.json`));
+  assert.doesNotMatch(task, /\/ai\/graphify-out/);
+  const R = { agentId: "reviewer", sessionKey: "agent:reviewer:subagent:h" };
+  const r = policyDecide({ toolName: "Grep", params: { pattern: "x" } }, R, { jobFor: () => ({ project: "acme-hub (/srv/acme-hub)", status: "running" }) }, cfg);
+  assert.match(r.blockReason, /acme-hub\/graphify-out/);
+  // Task paths judge a acme-hub writer against its own folder.
+  const W = { agentId: "writer", sessionKey: "agent:writer:subagent:h" };
+  const write = { toolName: "Write", params: { file_path: "/srv/acme-hub/src/bot.php", content: "x" } };
+  assert.equal(policyDecide(write, W, { jobFor: () => ({ project: "acme-hub (/srv/acme-hub)", status: "running" }) }, cfg), undefined);
+});
