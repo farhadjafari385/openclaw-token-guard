@@ -220,3 +220,40 @@ test("a task pushes only after running its project's checks locally (owner's ord
   assert.equal(rule(policyDecide(exec("git status"), DEVOPS, { jobFor: () => ({ checksRun: 0 }) }, {})), null);
   assert.equal(rule(policyDecide(exec("git push origin agent/x"), DEVOPS, { jobFor: () => ({ checksRun: 0 }) }, { requireChecksBeforePush: false })), null);
 });
+
+test("secrets: a path in a shell variable or after cd is still protected; oc-secret-save is the one way in", () => {
+  // Live 2026-11-08: the orchestrator wrote a password into the secrets folder through a variable.
+  const viaVar = "umask 077; f=~/.openclaw/secrets/mailbox.pass; [ -e \"$f\" ] && echo exists || { cat > \"$f\" <<'EOF'\nvalue\nEOF\n} ; ls -la \"$f\"";
+  for (const who of [DEVOPS, COORD]) assert.equal(rule(policyDecide(exec(viaVar), who, {}, {})), "protectedFile");
+  for (const cmd of [
+    'F="$HOME/.openclaw/secrets/new.token"; printf %s abc > "$F"',
+    "export D=~/.openclaw/secrets; echo x > ${D}/new.token",
+    "for f in ~/.openclaw/secrets/*.token; do : > \"$f\"; done",
+    "cd ~/.openclaw/secrets && cat > new.token <<'EOF'\nv\nEOF",
+    "t=~/.openclaw/secrets/a.token; cp /tmp/x \"$t\"",
+  ]) assert.equal(rule(policyDecide(exec(cmd), DEVOPS, {}, {})), "protectedFile", cmd);
+  // Reading a secret into a variable and writing output elsewhere stays allowed.
+  for (const cmd of [
+    'T="$(cat ~/.openclaw/secrets/gitlab-main.token)"; out=/tmp/mr.json; curl -s -H "PRIVATE-TOKEN: $T" https://gitlab.com/api/v4/user > "$out"',
+    "f=~/.openclaw/secrets/gitlab-main.token; curl -s -K - <<<\"header = \\\"PRIVATE-TOKEN: $(cat $f)\\\"\" https://gitlab.com/api/v4/user > /tmp/u.json",
+    "cd ~/.openclaw/secrets && ls -la",
+  ]) assert.equal(policyDecide(exec(cmd), DEVOPS, {}, {}), undefined, cmd);
+  // The sanctioned helper works for workers and for the orchestrator, whatever the value contains.
+  const save = "~/.openclaw/bin/oc-secret-save telegram-x_bot.token <<'EOF'\n123:ab>cd; rm -rf ~/.openclaw/secrets | git push origin main\nEOF";
+  for (const who of [DEVOPS, COORD, WRITER_TOPIC]) assert.equal(policyDecide(exec(save), who, {}, {}), undefined, who.agentId);
+  // Only the heredoc body is skipped: a command after it is still checked.
+  assert.equal(rule(policyDecide(exec(`${save}\nrm ~/.openclaw/secrets/gitlab-main.token`), DEVOPS, {}, {})), "protectedFile");
+});
+
+test("secrets: every refusal about a credential file says how to store it", () => {
+  const write = (file_path) => ({ toolName: "Write", params: { file_path, content: "v" } });
+  // Live 2026-11-08: both refusals left the orchestrator with no way to keep the owner's bot token.
+  const a = policyDecide(write(`${H}/.openclaw/secrets/sales-bot.token`), COORD, {}, {});
+  assert.match(a.blockReason, /oc-secret-save <name> <<'EOF'/);
+  const b = policyDecide(write(`${H}/.sales-bot.token`), COORD, {}, {});
+  assert.equal(b.rule, "orchestratorOnly");
+  assert.match(b.blockReason, /oc-secret-save/);
+  assert.match(policyDecide(exec("echo v > ~/.openclaw/secrets/x.token"), DEVOPS, {}, {}).blockReason, /oc-secret-save/);
+  // Unrelated refusals stay short.
+  assert.doesNotMatch(policyDecide(write(`${H}/.openclaw/openclaw.json`), DEVOPS, {}, {}).blockReason, /oc-secret-save/);
+});
