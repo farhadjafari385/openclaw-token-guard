@@ -336,3 +336,34 @@ test("code map first: every brief for a project with a map carries the query com
   assert.equal(policyDecide(spawn(task), COORD, {}, cfg).params.task.match(/Code map/g).length, 1);
   assert.doesNotMatch(policyDecide(spawn(brief("plain (/srv/plain)")), COORD, {}, cfg).params.task, /Code map/);
 });
+
+test("code map first: never for an agent with no shell, and docs are not code", async () => {
+  // Live 2026-11-08: growth (no exec tool) was blocked from reading and could not run graphify.
+  const fs = await import("node:fs");
+  const path = await import("node:path");
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "graphs-"));
+  fs.mkdirSync(`${tmp}/demo/graphify-out`, { recursive: true });
+  fs.writeFileSync(`${tmp}/demo/graphify-out/graph.json`, "{}");
+  const cfg = {
+    board: { requireItems: false },
+    projects: { demo: { topic: 5, path: "/srv/demo" } },
+    graphs: { enabled: true, root: tmp, bin: "graphify", budget: 1500, projects: ["demo"], agents: ["writer", "product"] },
+  };
+  const job = { project: "demo (/srv/demo)", status: "running" };
+  const ps = { jobFor: () => job };
+  const read = (file_path) => ({ toolName: "Read", params: { file_path } });
+  const GROWTH = { agentId: "growth", sessionKey: "agent:growth:subagent:g" };
+  const PRODUCT = { agentId: "product", sessionKey: "agent:product:subagent:p" };
+  assert.equal(policyDecide(read("/srv/demo/backend/src/a.php"), GROWTH, ps, cfg), undefined);
+  assert.equal(policyDecide({ toolName: "Grep", params: { pattern: "x" } }, GROWTH, ps, cfg), undefined);
+  // Docs and proof are readable before the map; source files are not.
+  for (const f of ["/srv/demo/docs/growth/plan.md", "/srv/demo/README.md", "/srv/demo/backend/docs/api.txt", "/srv/demo/proof/x/report.json"]) {
+    assert.equal(policyDecide(read(f), PRODUCT, ps, cfg), undefined, f);
+  }
+  assert.equal(rule(policyDecide(read("/srv/demo/backend/src/a.php"), PRODUCT, ps, cfg)), "graphFirst");
+  // The brief line goes only to an agent that can run it.
+  const brief = "Project: demo (/srv/demo)\nScope: x\nItems:\na1b2c3d4\nDone when: y\nStop if: z";
+  const spawn = (agentId) => ({ toolName: "sessions_spawn", params: { agentId, task: brief } });
+  assert.match(policyDecide(spawn("writer"), COORD, {}, cfg).params.task, /Code map/);
+  assert.doesNotMatch(policyDecide(spawn("growth"), COORD, {}, cfg).params.task, /Code map/);
+});

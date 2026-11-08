@@ -56,7 +56,7 @@ const DEFAULT_POLICY = {
   taskPaths: { enabled: true, roles: ["writer", "designer", "qa", "reviewer"] },
   projects: {}, // { name: { topic, path, aliases, strict } }
   // Code maps (graphify): a task in one of these projects queries its map before it searches or reads code.
-  graphs: { enabled: false, root: "~/graphs", bin: "~/.openclaw/bin/graphify", budget: 1500, projects: [] },
+  graphs: { enabled: false, root: "~/graphs", bin: "~/.openclaw/bin/graphify", budget: 1500, projects: [], agents: [] }, // agents = those with a shell (empty = all)
   spawn: {
     enabled: true,
     cleanup: "delete",
@@ -379,13 +379,17 @@ const GRAPH_COMMAND = /(?:^|[\s;&|(/"'])graphify\s+(?:query|explain|path|affecte
 const SEARCH_HEADS = new Set(["grep", "egrep", "fgrep", "rg", "ag", "ack", "find", "fd", "fdfind", "tree", "locate"]);
 const READ_HEADS = new Set(["cat", "head", "tail", "less", "more", "bat", "batcat", "nl", "sed", "awk"]);
 const PATTERN_FIRST = new Set(["grep", "egrep", "fgrep", "rg", "ag", "ack", "fd", "fdfind"]);
-const NOT_CODE = /\.(?:png|jpe?g|gif|webp|avif|pdf|log|txt|out|csv)$/i;
+// Docs, data and images are not what the map replaces (the map holds code).
+const NOT_CODE = /\.(?:png|jpe?g|gif|webp|avif|pdf|log|txt|out|csv|md|mdx|rst|adoc)$/i;
 const graphSeen = new Map();
 
 // The map of a project, if it has one and it is built (a missing map never blocks work).
-function graphFor(policy, projectLine) {
+// agentId: only an agent with a shell can run graphify; one without (growth, social, strategy) is never
+// held to it (2026-11-08: growth was blocked from reading with no way to query the map).
+function graphFor(policy, projectLine, agentId) {
   const g = policy.graphs || {};
   if (!g.enabled) return null;
+  if (agentId && Array.isArray(g.agents) && g.agents.length && !g.agents.includes(agentId)) return null;
   const name = projectName(policy, projectLine || "");
   if (!name || !(g.projects || []).includes(name)) return null;
   const display = `${String(g.root || "~/graphs").replace(/\/+$/, "")}/${name}/graphify-out/graph.json`;
@@ -420,7 +424,7 @@ function exploresCode(policy, tool, params, root, agentId) {
   }
   if (tool === "Read" || tool === "read" || tool === "read_file") {
     const p = String(params.file_path || params.path || "");
-    if (!p || NOT_CODE.test(p) || /\/proof\//.test(p)) return false;
+    if (!p || NOT_CODE.test(p) || /\/(?:proof|docs)\//.test(p)) return false;
     return insideProject(p, root) === true;
   }
   if (tool !== "exec") return false;
@@ -781,7 +785,7 @@ function policyDecide(event, ctx, pstate, rawConfig, log, now = Date.now()) {
   // (Owner's order 2026-11-08: graphify is enforced. Reading and searching code is a third or more of what
   // workers' tools return, and it stays in the session, re-read on every later call.)
   if (subagent && job && !(job.graphQueries > 0) && policy.graphs && policy.graphs.enabled) {
-    const map = graphFor(policy, job.project || "");
+    const map = graphFor(policy, job.project || "", agentId);
     const name = map && map.name;
     const root = name && policy.projects[name] && policy.projects[name].path ? path.resolve(expandHome(policy.projects[name].path)) : "";
     if (map && root && !root.includes("<") && exploresCode(policy, tool, params, root, agentId)) {
@@ -824,7 +828,7 @@ function policyDecide(event, ctx, pstate, rawConfig, log, now = Date.now()) {
       if (canon !== line.replace(/\(.*$/, "").trim()) task = String(params.task).replace(/^([\s>*#_\-]*Project\s*:?[ \t]*)[^(\n]*/im, `$1${canon} `);
     }
     // Every task in a project with a code map is told how to query it (the guard requires it first).
-    const map = graphFor(policy, firstLine(task, "Project"));
+    const map = graphFor(policy, firstLine(task, "Project"), String(params.agentId || ""));
     if (map && !GRAPH_COMMAND.test(String(task))) {
       task = `${String(task).trimEnd()}\nCode map (required before you search or read code): ${mapCommand(map)}, then open only the files it names.`;
     }
