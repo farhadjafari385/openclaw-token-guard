@@ -2,12 +2,12 @@ import crypto from "node:crypto";
 import { definePluginEntry } from "openclaw/plugin-sdk/plugin-entry";
 import { Type } from "typebox";
 import { createState, decide, forgetRefusedBrief } from "./guard.js";
-import { policyDecide, firstLine, itemsFromBrief, completeBrief, codexEnabled, CHECK_COMMAND } from "./policy.js";
+import { policyDecide, firstLine, itemsFromBrief, completeBrief, codexEnabled, CHECK_COMMAND, GRAPH_COMMAND } from "./policy.js";
 import { ACTIVE, isLimitBlock, normStatus, resultVerdict, nextAfterJob, queueState, renderBoard, renderOverview, auditBoard, parseApproval, looksLikeRequest } from "./board.js";
 import { correctTopic, isGeneral, projectOfTopic, projectsMentioned } from "./topics.js";
 import { isLimitError, isLimitReply, allowLimitReply, limitResetAt } from "./limits.js";
 import {
-  createJobStore, mergeJobsConfig, recordSpawn, recordActivity, recordUsage, recordCall, recordCheck, recordResultText, finalAnswer, missingProof,
+  createJobStore, mergeJobsConfig, recordSpawn, recordActivity, recordUsage, recordCall, recordCheck, recordGraph, recordResultText, finalAnswer, missingProof,
   recordEnd, recordProgress, setClaudeLimited, setCodexLimited, scanJobs, lastAssistantText,
 } from "./jobs.js";
 import { createMirror, topicFor, messageIdOf } from "./mirror.js";
@@ -453,6 +453,10 @@ export default definePluginEntry({
           if (ctx && ctx.agentId === orchestrator) countOrcCall(ctx.runId);
           const bareName = String(event.toolName || "").split("__").pop();
           if (bareName === "exec" && CHECK_COMMAND.test(String((event.params && event.params.command) || ""))) recordCheck(store.data, ctx && ctx.sessionKey);
+          if (bareName === "exec" && GRAPH_COMMAND.test(String((event.params && event.params.command) || "")) && recordGraph(store.data, ctx && ctx.sessionKey)) {
+            log("info", "token-guard: the task queried its code map; searching and reading code is open", { sessionKey: ctx && ctx.sessionKey });
+            store.touch();
+          }
           const spent = recordCall(store.data, ctx && ctx.sessionKey, jobsCfg);
           if (spent) {
             store.save();
