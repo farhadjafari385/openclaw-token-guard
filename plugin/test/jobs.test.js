@@ -188,6 +188,21 @@ test("two plugin generations never lose each other's jobs", async () => {
   assert.deepEqual(Object.keys(s3.data.jobs).sort(), ["k1", "k2"]);
 });
 
+test("a failed state write leaves no temp file behind", async () => {
+  // A full disk once left 111 empty jobs.json.tmp-* files, one per save.
+  const { createJobStore } = await import("../jobs.js");
+  const { mkdtempSync, mkdirSync, writeFileSync, readdirSync } = await import("node:fs");
+  const { join } = await import("node:path");
+  const { tmpdir } = await import("node:os");
+  const dir = mkdtempSync(join(tmpdir(), "tg-jobs-"));
+  const file = join(dir, "jobs.json");
+  mkdirSync(file); writeFileSync(join(file, "x"), "");  // the rename onto it fails
+  const s = createJobStore(file); s.load();
+  recordSpawn(s.data, { childSessionKey: "k1", agentId: "a" }, "g", 1, CFG);
+  for (let i = 0; i < 3; i++) { s.touch(); s.save(); }
+  assert.deepEqual(readdirSync(dir), ["jobs.json"]);
+});
+
 test("mirror retries a failed send", async () => {
   let calls = 0;
   const fetchImpl = async () => { calls += 1; if (calls < 3) throw new Error("fetch failed"); return { ok: true, status: 200, json: async () => ({ result: { message_id: 7 } }) }; };

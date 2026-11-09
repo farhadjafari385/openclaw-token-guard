@@ -156,17 +156,19 @@ function createJobStore(file) {
     touch() { dirty = true; },
     save(force = false) {
       if (!dirty && !force) return;
+      const tmp = `${target}.tmp-${process.pid}-${Math.random().toString(36).slice(2, 8)}`;
       try {
         fs.mkdirSync(path.dirname(target), { recursive: true });
         const disk = readDisk();
         const merged = disk ? mergeStates(data, disk) : data;
-        const tmp = `${target}.tmp-${process.pid}-${Math.random().toString(36).slice(2, 8)}`;
         fs.writeFileSync(tmp, JSON.stringify(merged));
         fs.renameSync(tmp, target);
         if (merged !== data) { for (const k of Object.keys(data)) delete data[k]; Object.assign(data, merged); }
         dirty = false;
       } catch {
-        // state is best effort; the gateway must never fail because of it
+        // state is best effort; the gateway must never fail because of it. A failed write (a full
+        // disk) must not leave its temp file behind on every save.
+        try { fs.unlinkSync(tmp); } catch { /* never written */ }
       }
     },
   };
