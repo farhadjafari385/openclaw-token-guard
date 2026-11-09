@@ -80,7 +80,7 @@ message.
 **Budgets count tool calls.** The Claude CLI reports almost no token usage to plugins (a task that processed 6.4M
 tokens showed up as under 0.1M), so `jobs.budgetTokens` alone never stops a task. Every tool call does reach the
 guard, and each one re-reads the whole context, so the budgets count calls: `jobs.budgetCalls` per task (then it
-may only write its final answer) and `orchestratorMaxCallsPerRun` per orchestrator run (then it may only message).
+may only write its final answer; `jobs.budgetCallsByAgent` raises it for one agent, e.g. a browser agent) and `orchestratorMaxCallsPerRun` per orchestrator run (then it may only message).
 
 **Optional: a second provider.** To let new tasks run on Codex while Claude is limited, set
 `spawn.codexModel` (e.g. `"openai/gpt-6-astra"`) and add that model to `spawn.allowedModels`. A Codex limit is

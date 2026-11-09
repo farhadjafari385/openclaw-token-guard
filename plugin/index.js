@@ -7,7 +7,7 @@ import { ACTIVE, isLimitBlock, normStatus, resultVerdict, nextAfterJob, queueSta
 import { correctTopic, isGeneral, projectOfTopic, projectsMentioned } from "./topics.js";
 import { isLimitError, isLimitReply, allowLimitReply, limitResetAt } from "./limits.js";
 import {
-  createJobStore, mergeJobsConfig, recordSpawn, recordActivity, recordUsage, recordCall, recordCheck, recordGraph, recordResultText, finalAnswer, missingProof,
+  createJobStore, mergeJobsConfig, recordSpawn, recordActivity, recordUsage, recordCall, callBudget, recordCheck, recordGraph, recordResultText, finalAnswer, missingProof,
   recordEnd, recordProgress, setClaudeLimited, setCodexLimited, scanJobs, lastAssistantText,
 } from "./jobs.js";
 import { createMirror, topicFor, messageIdOf } from "./mirror.js";
@@ -460,7 +460,7 @@ export default definePluginEntry({
           const spent = recordCall(store.data, ctx && ctx.sessionKey, jobsCfg);
           if (spent) {
             store.save();
-            post(pm, spent.topic || "system", budgetText(voice, spent, `${jobsCfg.budgetCalls} tool calls`), { html: true, replyTo: spent.dispatchMsgId || null });
+            post(pm, spent.topic || "system", budgetText(voice, spent, `${callBudget(jobsCfg, spent.agentId)} tool calls`), { html: true, replyTo: spent.dispatchMsgId || null });
           }
           // A dispatch brief missing a required line is completed from its board items.
           let base = event;

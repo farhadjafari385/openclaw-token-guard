@@ -289,6 +289,22 @@ test("a task's budget counts its tool calls, since the Claude CLI reports almost
   assert.equal(mergeJobsConfig({}).budgetCalls, 100);
 });
 
+test("a browser agent gets its own call budget; the others keep the default", async () => {
+  const { emptyState, recordSpawn, recordCall, callBudget, mergeJobsConfig } = await import("../jobs.js");
+  const cfg = mergeJobsConfig({ budgetCalls: 3, budgetCallsByAgent: { growth: 5 } });
+  const d = emptyState();
+  const G = "agent:growth:subagent:g1";
+  recordSpawn(d, { childSessionKey: G, agentId: "growth", label: "demo: list the bot", topic: 151, requesterSessionKey: ORC }, "b", 0, cfg);
+  recordSpawn(d, { childSessionKey: KEY, agentId: "devops", label: "demo: fix CI", topic: 151, requesterSessionKey: ORC }, "b", 0, cfg);
+  for (let i = 0; i < 5; i++) assert.equal(recordCall(d, G, cfg), null); // 5 calls: still inside growth's 5
+  assert.equal(recordCall(d, G, cfg).overBudget, true); // the 6th is over
+  for (let i = 0; i < 3; i++) assert.equal(recordCall(d, KEY, cfg), null);
+  assert.equal(recordCall(d, KEY, cfg).overBudget, true); // devops keeps the default 3
+  assert.equal(callBudget(cfg, "growth"), 5);
+  assert.equal(callBudget(cfg, "devops"), 3);
+  assert.deepEqual(mergeJobsConfig({}).budgetCallsByAgent, {});
+});
+
 test("triage: the same board state does not wake the orchestrator again", async () => {
   const { triageSignature, DEFAULT_TRIAGE } = await import("../triage.js");
   const items = [{ id: "2fda6c5a", status: "todo", updated_ts: 1 }, { id: "11cec036", status: "review", updated_ts: 2 }, { id: "aaaa0000", status: "blocked" }];
