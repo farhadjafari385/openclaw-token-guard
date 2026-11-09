@@ -399,3 +399,38 @@ test("code map: a acme-hub task gets its own map, never the ai map (strict alias
   const write = { toolName: "Write", params: { file_path: "/srv/acme-hub/src/bot.php", content: "x" } };
   assert.equal(policyDecide(write, W, { jobFor: () => ({ project: "acme-hub (/srv/acme-hub)", status: "running" }) }, cfg), undefined);
 });
+
+test("done means a real user action worked: approving a bot, payment or site item needs a User path proof", () => {
+  // Live 2026-11-09: a Telegram bot was approved on "webhook has no errors"; every tool failed and 0 jobs had run.
+  const board = new Map([
+    ["aa11bb22", { id: "aa11bb22", project: "demo", title: "Persian AI Telegram bot + web checkout", status: "qa", note: "webhook has no error; 19 tools listed", history: [] }],
+    ["cc33dd44", { id: "cc33dd44", project: "demo", title: "Refactor the logging module", status: "qa", note: "tests pass", history: [] }],
+    ["ee55ff66", { id: "ee55ff66", project: "demo", title: "Checkout pays with the test gateway", status: "qa", note: "",
+      history: [{ to: "qa", note: "User path: bought the Starter pack as a new user → payment 4512 paid, 100 credits in the ledger" }] }],
+  ]);
+  const ps = { boardItems: () => board };
+  const inbox = (params) => ({ toolName: "task_inbox", params });
+  const r = policyDecide(inbox({ action: "approve", id: "aa11bb22" }), COORD, ps, {});
+  assert.equal(rule(r), "userPathProof");
+  assert.match(r.blockReason, /User path: <what was done as a user> → <the result/);
+  assert.equal(rule(policyDecide(inbox({ action: "set", id: "aa11bb22", status: "done" }), COORD, ps, {})), "userPathProof");
+  // The proof in the same call, or already on the item, lets it through; other items need none.
+  assert.equal(policyDecide(inbox({ action: "set", id: "aa11bb22", status: "done", note: "User path: sent a photo to the bot → enhanced photo back, job 77" }), COORD, ps, {}), undefined);
+  assert.equal(policyDecide(inbox({ action: "approve", id: "ee55ff66" }), COORD, ps, {}), undefined);
+  assert.equal(policyDecide(inbox({ action: "approve", id: "cc33dd44" }), COORD, ps, {}), undefined);
+  assert.equal(policyDecide(inbox({ action: "set", id: "aa11bb22", status: "review" }), COORD, ps, {}), undefined);
+});
+
+test("finish before adding: the PM adds nothing while the board holds too much open work; owner requests still go on", () => {
+  const board = new Map(Array.from({ length: 25 }, (_, k) => [`a${String(k).padStart(7, "0")}`, { id: `a${String(k).padStart(7, "0")}`, project: "demo", title: `open item ${k}`, status: k % 2 ? "todo" : "blocked" }]));
+  const ps = { boardItems: () => board };
+  const add = { toolName: "task_inbox", params: { action: "add", project: "demo", title: "A brand new idea from the backlog doc" } };
+  const PM = { agentId: "product", sessionKey: "agent:product:subagent:p" };
+  const cfg = { board: { maxOpen: 12 } };
+  const r = policyDecide(add, PM, ps, cfg);
+  assert.equal(rule(r), "finishFirst");
+  assert.match(r.blockReason, /12 open items \(limit 12\)/); // blocked items are not open work
+  assert.equal(policyDecide(add, COORD, ps, cfg), undefined);
+  assert.equal(policyDecide(add, PM, ps, { board: { maxOpen: 13 } }), undefined);
+  assert.equal(policyDecide(add, PM, ps, {}), undefined); // off unless set
+});
