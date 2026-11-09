@@ -685,10 +685,12 @@ test("a CI wait on an MR with no pipeline lets go of the item after a short wait
   const A = board(root, "add", "--project", "shop", "--title", "Revenue numbers", "--owner", "devops", "--done-when", "table posted", "--by", "system");
   board(root, "add", "--project", "shop", "--title", "Next thing", "--owner", "writer", "--done-when", "done", "--by", "system");
   board(root, "set", A, "--status", "in_progress", "--by", "system");
-  // the triage's budget for today is spent; its last run was just now and it is healthy
-  const day = new Date(Date.now() + 11 * 60000).toISOString().slice(0, 10);
+  // the triage's budget for today is spent; its last run was just now and it is healthy. The test's clock runs
+  // 62 minutes ahead by its end, so the budget is spent on that day too (run near midnight UTC it crossed into a
+  // fresh day and failed)
+  const dayAt = (min) => new Date(Date.now() + min * 60000).toISOString().slice(0, 10);
   fs.writeFileSync(path.join(root, "state", "jobs.json"), JSON.stringify({ version: 1, jobs: {}, triageHealthy: true,
-    triage: { lastAt: Date.now() + 11 * 60000 }, triageWakesByDay: { [day]: 24 } }));
+    triage: { lastAt: Date.now() + 11 * 60000 }, triageWakesByDay: { [dayAt(11)]: 24, [dayAt(62)]: 24 } }));
   const telegram = [];
   globalThis.fetch = async (url, opts = {}) => {
     const u = String(url);

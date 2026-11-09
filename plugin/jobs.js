@@ -30,6 +30,9 @@ const DEFAULT_JOBS = {
   // Tool calls a single task may make. The Claude CLI reports almost no usage to plugins (a 6.4M-token
   // task showed up as under 0.1M), so the token budget alone never fired; every tool call reaches the guard.
   budgetCalls: 100,
+  // Per-agent call budgets, e.g. { growth: 300 }: browser work takes 15-20 calls for one site (open, snapshot,
+  // click, type, check), so a browser agent stopped after one listing at 100 calls.
+  budgetCallsByAgent: {},
   keepEndedHours: 48,
   maxBriefChars: 6000,
   maxResultChars: 6000,
@@ -234,12 +237,19 @@ function recordUsage(data, sessionKey, usage, cfg) {
   return null;
 }
 
+// The tool calls one task of this agent may make.
+function callBudget(cfg, agentId) {
+  const own = cfg && cfg.budgetCallsByAgent && Number(cfg.budgetCallsByAgent[agentId]);
+  return own > 0 ? own : Number(cfg && cfg.budgetCalls) || 0;
+}
+
 // One tool call by a running task; returns the job when this call used up its budget.
 function recordCall(data, sessionKey, cfg) {
   const job = data.jobs[sessionKey];
   if (!job || job.status !== "running") return null;
   job.toolCalls = (job.toolCalls || 0) + 1;
-  if (!job.overBudget && cfg.budgetCalls > 0 && job.toolCalls > cfg.budgetCalls) {
+  const budget = callBudget(cfg, job.agentId);
+  if (!job.overBudget && budget > 0 && job.toolCalls > budget) {
     job.overBudget = true;
     return job;
   }
@@ -514,6 +524,7 @@ export {
   recordActivity,
   recordUsage,
   recordCall,
+  callBudget,
   recordCheck,
   recordGraph,
   recordResultText,
