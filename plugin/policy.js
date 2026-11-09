@@ -51,7 +51,7 @@ const DEFAULT_POLICY = {
   orchestratorOnly: { enabled: true },
   pins: { enabled: true },
   // agent = the PM, who may also edit the board and keeps the queue's order; wip = items in hand at once (0 = no queue)
-  board: { enabled: true, requireItems: true, agent: "product", wip: 1, projectOrder: [] },
+  board: { enabled: true, requireItems: true, agent: "product", wip: 1, projectOrder: [], maxOpen: 0 }, // maxOpen: the PM adds nothing while this many items are open (0 = no limit)
   topics: { enabled: true, chatId: "", teamTopic: 160 },
   taskPaths: { enabled: true, roles: ["writer", "designer", "qa", "reviewer"] },
   projects: {}, // { name: { topic, path, aliases, strict } }
@@ -370,6 +370,20 @@ function normaliseModel(model, allowed) {
 function briefSetting(text, field) {
   const m = new RegExp(`^[\\s>*#_\\-]*${field}\\s*:\\s*\\**\\s*([\\w./:-]+)`, "im").exec(String(text || ""));
   return m ? m[1].replace(/[.,;]+$/, "") : "";
+}
+
+// ---- done means a real user action worked ----
+
+const OPEN_WORK = new Set(["backlog", "todo", "in_progress", "review", "qa"]);
+const USER_FACING = /\b(?:bots?|telegram|payments?|checkout|purchase|paid|pay|webhook|stars|gateway|site|website|landing|pricing|store|storefront|go-live|live)\b/i;
+
+function needsUserPath(item) {
+  return USER_FACING.test(String(item.title || ""));
+}
+
+function hasUserPath(item, note) {
+  const notes = [note, item.note, ...((item.history || []).map((h) => h && h.note))];
+  return notes.some((n) => /\bUser path\s*:/i.test(String(n || "")));
 }
 
 // ---- code maps (graphify) ----
@@ -721,6 +735,20 @@ function policyDecide(event, ctx, pstate, rawConfig, log, now = Date.now()) {
       if (action === "approve" && !orchestrator) {
         return block("boardApproval", "token-guard: only the orchestrator approves finished work (the owner approves in Telegram).");
       }
+      // Done means a real user action worked: a bot, payment, checkout or site item needs a "User path:" proof
+      // (2026-11-09: a bot was approved on "webhook has no errors" while every tool failed and 0 jobs had run).
+      const doneMove = action === "approve" || (action === "set" && normStatus(String(params.status || "")) === "done");
+      if (doneMove && pstate && typeof pstate.boardItems === "function") {
+        const board = pstate.boardItems();
+        const ids = String(params.id || params.ids || "").match(/\b[0-9a-f]{8}\b/g) || [];
+        const missing = ids.map((id) => board.get(id)).filter((it) => it && needsUserPath(it) && !hasUserPath(it, params.note));
+        if (missing.length) {
+          return block("userPathProof",
+            `token-guard: ${missing.map((it) => it.id).join(", ")} is a bot, payment, checkout or site item: it is done only when a real user action ` +
+            "worked on production. Record it first with task_inbox set and a note \"User path: <what was done as a user> → <the result, with its job, " +
+            "payment or message id>\". A webhook without errors, pages answering 200 or tools listed are not proof.");
+        }
+      }
       if (!orchestrator && agentId !== policy.board.agent) {
         return block("boardWrite", "token-guard: only the orchestrator and the PM change the board. Put your status in your final answer: the board moves automatically when your task ends.");
       }
@@ -734,6 +762,17 @@ function policyDecide(event, ctx, pstate, rawConfig, log, now = Date.now()) {
       }
       if (action === "add") {
         const title = String(params.title || "");
+        // Finish before adding: the PM may not grow a board that already holds more open work than it can do.
+        // (237 items in and 90 done, 2026-11-04..09.) Owner requests, recorded by the orchestrator, always go on.
+        const cap = Number(policy.board.maxOpen) || 0;
+        if (cap > 0 && agentId === policy.board.agent && pstate && typeof pstate.boardItems === "function") {
+          const open = [...pstate.boardItems().values()].filter((it) => OPEN_WORK.has(normStatus(it.status))).length;
+          if (open >= cap) {
+            return block("finishFirst",
+              `token-guard: the board already has ${open} open items (limit ${cap}). Finish before adding: put this into the existing item ` +
+              "it belongs to (task_inbox set, with a note), or leave it out.");
+          }
+        }
         if (GATE_TITLE.test(title)) {
           return block("itemPerStep", "token-guard: do not add an item for a retry, a gate or a proof step. Keep the owner's original item and move it (task_inbox set: in_progress, review, qa) and dispatch the next agent on that same item id.");
         }
