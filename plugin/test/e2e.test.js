@@ -776,3 +776,97 @@ test("a CI wait on an MR with no pipeline lets go of the item after a short wait
     Date.now = realNow;
   }
 });
+
+test("the orchestrator's answer to a result goes to the task's topic, not the owner's private chat", async () => {
+  const root = harness();
+  process.env.OC_INBOX_FILE = path.join(root, "inbox.jsonl");
+  process.env.OC_INBOX_BIN = path.join(REPO, "bin", "oc-inbox");
+  const MAIN = "agent:coordinator:main"; // the owner's private chat with the orchestrator
+  const now = Date.now();
+  // a task dispatched from the owner's chat ended 1 minute ago; its result is post 900 in topic 151;
+  // the owner last wrote 10 minutes ago
+  const job = { key: "agent:social:subagent:s1", agentId: "social", label: "shop: 5 posts", status: "ended", topic: 151,
+    requesterSessionKey: MAIN, resultMsgId: 900, endedAt: now - 60000, spawnedAt: now - 3600000 };
+  fs.writeFileSync(path.join(root, "state", "jobs.json"), JSON.stringify({ version: 1, jobs: { [job.key]: job },
+    ownerMsgs: { 1: { id: 77, at: now - 600000, text: "finish them" } } }));
+  const telegram = [];
+  globalThis.fetch = async (url, opts = {}) => {
+    if (String(url).startsWith("https://api.telegram.org/")) {
+      telegram.push(JSON.parse(opts.body || "{}"));
+      return { ok: true, json: async () => ({ ok: true, result: { message_id: 8000 + telegram.length } }) };
+    }
+    return { ok: false, status: 404, json: async () => ({}) };
+  };
+  const handlers = {};
+  const api = {
+    pluginConfig: {
+      orchestratorAgent: "coordinator",
+      ownerId: "42",
+      board: { enabled: true, requireItems: false, agent: "product", view: false },
+      topics: { enabled: true, chatId: "-100", teamTopic: 160 },
+      mirror: { enabled: true, chatId: "-100", systemTopic: 160, defaultTopic: 160, projectTopics: { shop: 151 }, minIntervalMs: 0,
+        botTokenFiles: { coordinator: path.join(root, "bot.token"), social: path.join(root, "bot.token") } },
+      jobs: { stateFile: path.join(root, "state", "jobs.json"), idleWakeSession: "agent:coordinator:explicit:team-ops" },
+      triage: { enabled: false },
+    },
+    logger: { info: () => {}, warn: () => {}, error: () => {}, debug: () => {} },
+    on: (name, fn) => { (handlers[name] = handlers[name] || []).push(fn); },
+    registerService: () => {},
+    registerTool: () => {},
+    runtime: { subagent: { run: async () => ({ runId: "r" }), waitForRun: async () => ({ status: "ok" }), getSessionMessages: async () => ({ messages: [] }), deleteSession: async () => ({}) } },
+  };
+  const entry = (await import(pathToFileURL(path.join(root, "plugin", "index.js")).href)).default;
+  entry.register(api);
+  const send = (event, ctx) => { let out; for (const h of handlers.message_sending || []) out = h(event, ctx) ?? out; return out; };
+  const ORC = { channelId: "telegram", accountId: "orchestrator", sessionKey: MAIN };
+  const saved = () => JSON.parse(fs.readFileSync(path.join(root, "state", "jobs.json"), "utf8")).jobs[job.key];
+
+  // a reply to the owner's message stays in the owner's chat
+  assert.equal(send({ to: "42", content: "On it.", replyToId: "77" }, ORC), undefined);
+  // a send that does not name its session (OpenClaw's reply to an inbound message) stays
+  assert.equal(send({ to: "telegram:42", content: "Here is where things are." }, { channelId: "telegram", accountId: "orchestrator" }), undefined);
+  // another agent's message to the owner stays
+  assert.equal(send({ to: "42", content: "hi" }, { channelId: "telegram", accountId: "social", sessionKey: "agent:social:main" }), undefined);
+  assert.equal(saved().answeredAt, undefined);
+
+  // the orchestrator answering the newer result moves to topic 151, under the result
+  const r = send({ to: "telegram:42", content: "Thanks, one post is live; next: the other four." }, ORC);
+  assert.equal(r && r.cancel, true);
+  assert.match(r.cancelReason, /topic 151/);
+  assert.ok(await until(() => telegram.some((m) => m.message_thread_id === 151 && /one post is live/.test(m.text || ""))), "the answer was not reposted in topic 151");
+  const moved = telegram.find((m) => m.message_thread_id === 151);
+  assert.equal(String(moved.chat_id), "-100");
+  assert.equal(Number((moved.reply_parameters && moved.reply_parameters.message_id) || moved.reply_to_message_id), 900);
+  assert.ok(saved().answeredAt, "the result was not marked answered");
+
+  // once it is answered, the orchestrator's next message to the owner stays in the owner's chat
+  assert.equal(send({ to: "42", content: "Anything else?" }, ORC), undefined);
+});
+
+test("a result older than the owner's last message: the orchestrator's message is for the owner", async () => {
+  const root = harness();
+  process.env.OC_INBOX_FILE = path.join(root, "inbox.jsonl");
+  const MAIN = "agent:coordinator:main";
+  const now = Date.now();
+  const job = { key: "agent:social:subagent:s2", agentId: "social", label: "shop: 5 posts", status: "ended", topic: 151,
+    requesterSessionKey: MAIN, resultMsgId: 901, endedAt: now - 600000, spawnedAt: now - 3600000 };
+  fs.writeFileSync(path.join(root, "state", "jobs.json"), JSON.stringify({ version: 1, jobs: { [job.key]: job },
+    ownerMsgs: { 1: { id: 78, at: now - 60000, text: "status?" } } }));
+  globalThis.fetch = async () => ({ ok: true, json: async () => ({ ok: true, result: { message_id: 1 } }) });
+  const handlers = {};
+  const api = {
+    pluginConfig: { orchestratorAgent: "coordinator", ownerId: "42", board: { enabled: false }, topics: { enabled: true, chatId: "-100", teamTopic: 160 },
+      mirror: { enabled: true, chatId: "-100", systemTopic: 160, defaultTopic: 160, minIntervalMs: 0, botTokenFiles: { coordinator: path.join(root, "bot.token") } },
+      jobs: { stateFile: path.join(root, "state", "jobs.json") }, triage: { enabled: false } },
+    logger: { info: () => {}, warn: () => {}, error: () => {}, debug: () => {} },
+    on: (name, fn) => { (handlers[name] = handlers[name] || []).push(fn); },
+    registerService: () => {},
+    registerTool: () => {},
+    runtime: { subagent: { run: async () => ({ runId: "r" }), waitForRun: async () => ({ status: "ok" }), getSessionMessages: async () => ({ messages: [] }), deleteSession: async () => ({}) } },
+  };
+  const entry = (await import(pathToFileURL(path.join(root, "plugin", "index.js")).href)).default;
+  entry.register(api);
+  let out;
+  for (const h of handlers.message_sending || []) out = h({ to: "42", content: "Social has one post live; four to go." }, { channelId: "telegram", accountId: "orchestrator", sessionKey: MAIN }) ?? out;
+  assert.equal(out, undefined);
+});

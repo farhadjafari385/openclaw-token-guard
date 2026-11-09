@@ -640,24 +640,43 @@ export default definePluginEntry({
         return undefined;
       }
       if (!topicsCfg.enabled || !chatId || !ctx || ctx.channelId !== "telegram") return undefined;
-      if (!String(event.to || "").includes(chatId)) return undefined;
-      const current = isGeneral(event.threadId) ? null : Number(event.threadId);
+      const sessionKey = String((ctx && ctx.sessionKey) || "");
+      const fromOrc = sessionKey.startsWith(`agent:${orchestrator}:`);
+      // The owner's private chat with the orchestrator (a Telegram DM's chat id is the owner's user id).
+      const toOwner = !!ownerId && String(event.to || "").split(":").pop() === ownerId;
+      if (!String(event.to || "").includes(chatId) && !toOwner) return undefined;
+      const current = toOwner || isGeneral(event.threadId) ? null : Number(event.threadId);
       // The orchestrator answering a result: the answer belongs in that task's project topic, under the
       // worker's result, even when the task was dispatched from another topic's session.
-      const sessionKey = String((ctx && ctx.sessionKey) || "");
-      if (sessionKey.startsWith(`agent:${orchestrator}:`) && !event.replyToId) {
+      const pendingAnswer = (newerThan = 0) => {
         const now = Date.now();
-        const job = Object.values(fresh().jobs)
-          .filter((j) => j.requesterSessionKey === sessionKey && j.resultMsgId && !j.answeredAt && j.topic && Number(j.topic) !== current && now - (j.endedAt || 0) < 3 * 3600000)
+        return Object.values(fresh().jobs)
+          .filter((j) => j.requesterSessionKey === sessionKey && j.resultMsgId && !j.answeredAt && j.topic && Number(j.topic) !== current &&
+            now - (j.endedAt || 0) < 3 * 3600000 && (j.endedAt || 0) > newerThan)
           .sort((a, b) => (b.endedAt || 0) - (a.endedAt || 0))[0];
-        if (job) {
-          job.answeredAt = now;
-          store.touch();
-          store.save();
-          mirror.post({ accountId: ctx.accountId, topic: job.topic, text: mdToHtml(withMention(event.content, job.agentId), 3500), html: true, replyTo: job.resultMsgId }).catch(() => null);
-          log("info", "token-guard moved an answer to its task's topic", { from: current, to: job.topic });
-          return { cancel: true, cancelReason: `token-guard: answers a result in topic ${job.topic}; reposted there` };
-        }
+      };
+      const moveAnswer = (job) => {
+        job.answeredAt = Date.now();
+        store.touch();
+        store.save();
+        mirror.post({ accountId: ctx.accountId, topic: job.topic, text: mdToHtml(withMention(event.content, job.agentId), 3500), html: true, replyTo: job.resultMsgId }).catch(() => null);
+        log("info", "token-guard moved an answer to its task's topic", { from: toOwner ? "owner chat" : current, to: job.topic });
+        return { cancel: true, cancelReason: `token-guard: answers a result in topic ${job.topic}; reposted there` };
+      };
+      if (toOwner) {
+        // A task dispatched while talking to the owner reports back into the owner's chat, and the
+        // orchestrator's answer to that result went to the owner instead of the task's thread (and the
+        // result stayed "unanswered", so the guard woke it again). Answers to the owner stay: a reply to
+        // the owner's message, a send that does not name its session (OpenClaw's replies to an inbound
+        // message), and any message while no result is newer than the owner's last message.
+        if (event.replyToId || !fromOrc) return undefined;
+        const ownerAt = Number(((fresh().ownerMsgs || {})["1"] || {}).at) || 0;
+        const job = pendingAnswer(ownerAt);
+        return job ? moveAnswer(job) : undefined;
+      }
+      if (fromOrc && !event.replyToId) {
+        const job = pendingAnswer();
+        if (job) return moveAnswer(job);
       }
       const right = correctTopic({ threadId: event.threadId, text: event.content, projects, teamTopic });
       if (!right.topic || right.topic === current) return undefined;
