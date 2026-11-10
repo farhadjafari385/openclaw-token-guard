@@ -305,6 +305,26 @@ test("a browser agent gets its own call budget; the others keep the default", as
   assert.deepEqual(mergeJobsConfig({}).budgetCallsByAgent, {});
 });
 
+test("a task near its time limit is flagged once; a longer limit or no limit set keeps the right point", async () => {
+  const { emptyState, recordSpawn, recordTime, mergeJobsConfig } = await import("../jobs.js");
+  const cfg = mergeJobsConfig({});
+  assert.equal(cfg.wrapUpMinutes, 5);
+  const d = emptyState();
+  const G = "agent:growth:subagent:g2";
+  const T0 = Date.UTC(2026, 10, 10, 2, 15);
+  const min = 60000;
+  recordSpawn(d, { childSessionKey: KEY, agentId: "devops", label: "demo: fix CI", topic: 151, requesterSessionKey: ORC }, "b", T0, cfg);
+  recordSpawn(d, { childSessionKey: G, agentId: "growth", label: "demo: list the bot", topic: 151, requesterSessionKey: ORC, runTimeoutSeconds: 7200 }, "b", T0, cfg);
+  assert.equal(recordTime(d, KEY, cfg, T0 + 54 * min), null); // 6 min left of the default hour
+  assert.equal(recordTime(d, KEY, cfg, T0 + 55 * min).timeUp, true); // 5 min left: flagged
+  assert.equal(recordTime(d, KEY, cfg, T0 + 56 * min), null); // flagged once
+  assert.equal(d.jobs[KEY].timeUp, true);
+  assert.equal(recordTime(d, G, cfg, T0 + 56 * min), null); // a 2-hour task is nowhere near its limit
+  assert.equal(recordTime(d, G, cfg, T0 + 115 * min).timeUp, true);
+  assert.equal(recordTime(d, ORC, cfg, T0 + 999 * min), null); // not a task
+  assert.equal(recordTime(emptyState(), KEY, mergeJobsConfig({ wrapUpMinutes: 0 }), T0 + 999 * min), null); // switched off
+});
+
 test("triage: the same board state does not wake the orchestrator again", async () => {
   const { triageSignature, DEFAULT_TRIAGE } = await import("../triage.js");
   const items = [{ id: "2fda6c5a", status: "todo", updated_ts: 1 }, { id: "11cec036", status: "review", updated_ts: 2 }, { id: "aaaa0000", status: "blocked" }];

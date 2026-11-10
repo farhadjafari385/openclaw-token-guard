@@ -7,7 +7,7 @@ import { ACTIVE, isLimitBlock, normStatus, resultVerdict, nextAfterJob, queueSta
 import { correctTopic, isGeneral, projectOfTopic, projectsMentioned } from "./topics.js";
 import { isLimitError, isLimitReply, allowLimitReply, limitResetAt } from "./limits.js";
 import {
-  createJobStore, mergeJobsConfig, recordSpawn, recordActivity, recordUsage, recordCall, callBudget, recordCheck, recordGraph, recordResultText, finalAnswer, missingProof,
+  createJobStore, mergeJobsConfig, recordSpawn, recordActivity, recordUsage, recordCall, callBudget, recordTime, recordCheck, recordGraph, recordResultText, finalAnswer, missingProof,
   recordEnd, recordProgress, setClaudeLimited, setCodexLimited, scanJobs, lastAssistantText,
 } from "./jobs.js";
 import { createMirror, topicFor, messageIdOf } from "./mirror.js";
@@ -461,6 +461,11 @@ export default definePluginEntry({
           if (spent) {
             store.save();
             post(pm, spent.topic || "system", budgetText(voice, spent, `${callBudget(jobsCfg, spent.agentId)} tool calls`), { html: true, replyTo: spent.dispatchMsgId || null });
+          }
+          const late = recordTime(store.data, ctx && ctx.sessionKey, jobsCfg, now);
+          if (late) {
+            store.save();
+            log("info", "token-guard: a task is near its time limit; it may only write its final answer", { agentId: late.agentId, sessionKey: ctx && ctx.sessionKey, label: late.label });
           }
           // A dispatch brief missing a required line is completed from its board items.
           let base = event;
