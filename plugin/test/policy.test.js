@@ -151,6 +151,15 @@ test("a task over its tool-call budget is told how many calls it made", () => {
   assert.match(r.blockReason, /101 tool calls/);
 });
 
+test("a task near its time limit may only finish, and is told why", () => {
+  const ps = { jobFor: (k) => (k === DEVOPS.sessionKey ? { timeUp: true, toolCalls: 40 } : null) };
+  const r = policyDecide(exec("ls"), DEVOPS, ps, {});
+  assert.equal(rule(r), "taskTime");
+  assert.match(r.blockReason, /time limit/);
+  assert.match(r.blockReason, /RESULT/);
+  assert.equal(policyDecide(exec("ls"), WRITER_TOPIC, ps, {}), undefined);
+});
+
 test("one orchestrator run may make only so many tool calls; telling the owner stays allowed", () => {
   const RUN = Object.assign({ runId: "run-1" }, COORD);
   const calls = new Map([["run-1", 61], ["run-2", 60]]);

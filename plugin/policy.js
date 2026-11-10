@@ -624,10 +624,12 @@ function policyDecide(event, ctx, pstate, rawConfig, log, now = Date.now()) {
 
   // Per-task budget: a worker over budget may only finish with its final answer.
   const job = pstate && typeof pstate.jobFor === "function" ? pstate.jobFor(sessionKey) : null;
-  if (job && job.overBudget) {
+  // Near its time limit likewise: the runtime stops it there without a report.
+  if (job && (job.overBudget || job.timeUp)) {
     const used = job.toolCalls ? `${job.toolCalls} tool calls` : `${Math.round((job.usedTokens || 0) / 1e6)}M tokens`;
-    return block("taskBudget",
-      `token-guard: this task used its budget (${used}). Stop now and write your final answer: ` +
+    const why = job.overBudget ? `used its budget (${used})` : "is a few minutes from its time limit, where it is stopped with no report";
+    return block(job.overBudget ? "taskBudget" : "taskTime",
+      `token-guard: this task ${why}. Stop now and write your final answer: ` +
       "RESULT (done / partly done / blocked), what is finished with evidence, what is left, and the exact next step.");
   }
 

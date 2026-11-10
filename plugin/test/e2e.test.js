@@ -870,3 +870,67 @@ test("a result older than the owner's last message: the orchestrator's message i
   for (const h of handlers.message_sending || []) out = h({ to: "42", content: "Social has one post live; four to go." }, { channelId: "telegram", accountId: "orchestrator", sessionKey: MAIN }) ?? out;
   assert.equal(out, undefined);
 });
+
+test("a task five minutes from its time limit may only write its final answer, instead of being stopped with no report", async () => {
+  const root = harness();
+  process.env.OC_INBOX_FILE = path.join(root, "inbox.jsonl");
+  process.env.OC_INBOX_BIN = path.join(REPO, "bin", "oc-inbox");
+  globalThis.fetch = async (url) => {
+    if (String(url).startsWith("https://api.telegram.org/")) return { ok: true, json: async () => ({ ok: true, result: { message_id: 7000 } }) };
+    return { ok: false, status: 404, json: async () => ({}) };
+  };
+  const handlers = {};
+  const logs = [];
+  const services = [];
+  const api = {
+    pluginConfig: {
+      orchestratorAgent: "coordinator",
+      board: { enabled: false },
+      topics: { enabled: false },
+      mirror: { enabled: true, chatId: "-100", systemTopic: 160, defaultTopic: 160, minIntervalMs: 0,
+        botTokenFiles: { coordinator: path.join(root, "bot.token"), growth: path.join(root, "bot.token") } },
+      jobs: { stateFile: path.join(root, "state", "jobs.json"), idleWakeSession: "agent:coordinator:explicit:team-ops", refusal: { enabled: false } },
+      triage: { enabled: false },
+    },
+    logger: { info: (m) => logs.push(m), warn: (m) => logs.push(m), error: (m) => logs.push(m), debug: () => {} },
+    on: (name, fn) => { (handlers[name] = handlers[name] || []).push(fn); },
+    registerService: (s) => services.push(s),
+    registerTool: () => {},
+    runtime: { subagent: { run: async () => ({ runId: "r" }), getSessionMessages: async () => ({ messages: [] }) } },
+  };
+  const entry = (await import(pathToFileURL(path.join(root, "plugin", "index.js")).href)).default;
+  entry.register(api);
+  const realSetInterval = globalThis.setInterval;
+  globalThis.setInterval = () => ({ unref() {} });
+  for (const s of services) if (s.start) s.start();
+  globalThis.setInterval = realSetInterval;
+  const realNow = Date.now;
+  let skew = 11 * 60000;
+  Date.now = () => realNow() + skew;
+  let out;
+  const call = (name, event, ctx) => { out = undefined; for (const h of handlers[name] || []) out = h(event, ctx) ?? out; return out; };
+  const child = "agent:growth:subagent:t9";
+  const G = { agentId: "growth", sessionKey: child, runId: "g9" };
+  const job = () => JSON.parse(fs.readFileSync(path.join(root, "state", "jobs.json"), "utf8")).jobs[child];
+  const step = () => call("before_tool_call", { toolName: "browser", params: { action: "snapshot", profile: "laptop" } }, G);
+  try {
+    call("before_tool_call", { toolName: "sessions_spawn", params: { agentId: "growth", task: brief("aa11bb22"), label: "shop: list the bot" } },
+      { agentId: "coordinator", sessionKey: "agent:coordinator:explicit:team-ops", runId: "run-t" });
+    call("subagent_spawned", { childSessionKey: child, agentId: "growth", label: "shop: list the bot" }, { requesterSessionKey: "agent:coordinator:explicit:team-ops" });
+    assert.ok(await until(() => job() && job().status === "running"));
+    assert.equal(job().runTimeoutSeconds, 3600);
+    skew += 30 * 60000;
+    assert.ok(!(step() || {}).block, "a step half way through the hour is allowed");
+    skew += 26 * 60000; // 4 minutes left
+    const r = step();
+    assert.equal(r && r.block, true, "a step 4 minutes before the limit must be refused");
+    assert.match(r.blockReason, /time limit/);
+    assert.match(r.blockReason, /RESULT \(done \/ partly done \/ blocked\)/);
+    assert.equal(job().timeUp, true);
+    assert.equal(step().block, true);
+    assert.equal(logs.filter((m) => /near its time limit/.test(m)).length, 1, "logged once");
+  } finally {
+    await settle(); // let queued Telegram posts finish on the test's clock: the rate limit remembers that clock
+    Date.now = realNow;
+  }
+});

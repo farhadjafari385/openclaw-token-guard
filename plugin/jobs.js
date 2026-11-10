@@ -33,6 +33,9 @@ const DEFAULT_JOBS = {
   // Per-agent call budgets, e.g. { growth: 300 }: browser work takes 15-20 calls for one site (open, snapshot,
   // click, type, check), so a browser agent stopped after one listing at 100 calls.
   budgetCallsByAgent: {},
+  // A task this close to its time limit may only write its final answer: the runtime stops a task at its
+  // limit with no report, so the next task starts blind (a browser task was stopped at 60 min mid-form).
+  wrapUpMinutes: 5,
   keepEndedHours: 48,
   maxBriefChars: 6000,
   maxResultChars: 6000,
@@ -254,6 +257,17 @@ function recordCall(data, sessionKey, cfg) {
     return job;
   }
   return null;
+}
+
+// A running task that has reached its wrap-up point (wrapUpMinutes before its time limit); returns the job
+// the first time only, so the caller logs it once.
+function recordTime(data, sessionKey, cfg, now = Date.now()) {
+  const job = data.jobs[sessionKey];
+  if (!job || job.status !== "running" || job.timeUp || !(Number(cfg.wrapUpMinutes) > 0) || !job.spawnedAt) return null;
+  const limit = (Number(job.runTimeoutSeconds) || Number(cfg.defaultRunTimeoutSeconds) || 0) * 1000;
+  if (!limit || now < job.spawnedAt + limit - cfg.wrapUpMinutes * 60000) return null;
+  job.timeUp = true;
+  return job;
 }
 
 // A task queried its project's code map (graphify): searching and reading code is open from now on.
@@ -525,6 +539,7 @@ export {
   recordUsage,
   recordCall,
   callBudget,
+  recordTime,
   recordCheck,
   recordGraph,
   recordResultText,
