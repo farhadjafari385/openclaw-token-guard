@@ -934,3 +934,73 @@ test("a task five minutes from its time limit may only write its final answer, i
     Date.now = realNow;
   }
 });
+
+test("tasks per agent: a second task for an agent at its limit is refused, another agent's item starts, and it starts once the first ends", async () => {
+  const root = harness();
+  process.env.OC_INBOX_FILE = path.join(root, "inbox.jsonl");
+  process.env.OC_INBOX_BIN = path.join(REPO, "bin", "oc-inbox");
+  const add = (title, owner, rank) => {
+    const id = board(root, "add", "--project", "shop", "--title", title, "--owner", owner, "--done-when", "done", "--by", "system");
+    board(root, "set", id, "--status", "todo", "--by", "system");
+    board(root, "set", id, "--rank", String(rank), "--by", "system");
+    return id;
+  };
+  const A = add("Checkout shows the price", "writer", 1);
+  const B = add("Cart shows the total", "writer", 2);
+  const C = add("Checkout page layout", "designer", 3);
+  globalThis.fetch = async (url) => {
+    if (String(url).startsWith("https://api.telegram.org/")) return { ok: true, json: async () => ({ ok: true, result: { message_id: 7100 } }) };
+    return { ok: false, status: 404, json: async () => ({}) };
+  };
+  const handlers = {};
+  const services = [];
+  const tools = [];
+  const api = {
+    pluginConfig: {
+      orchestratorAgent: "coordinator",
+      board: { enabled: true, requireItems: true, agent: "product", wip: 10, projectOrder: ["shop"], view: false, maxTasksByAgent: { writer: 1, designer: 1 } },
+      topics: { enabled: false },
+      projects: { shop: { topic: 151, path: "/srv/shop" } },
+      mirror: { enabled: true, chatId: "-100", systemTopic: 160, defaultTopic: 160, projectTopics: { shop: 151 }, minIntervalMs: 0,
+        botTokenFiles: Object.fromEntries(["coordinator", "writer", "designer"].map((a) => [a, path.join(root, "bot.token")])) },
+      jobs: { stateFile: path.join(root, "state", "jobs.json"), idleWakeSession: "agent:coordinator:explicit:team-ops", refusal: { enabled: false } },
+      triage: { enabled: false },
+    },
+    logger: { info: () => {}, warn: () => {}, error: () => {}, debug: () => {} },
+    on: (name, fn) => { (handlers[name] = handlers[name] || []).push(fn); },
+    registerService: (s) => services.push(s),
+    registerTool: (t, o) => tools.push({ t, o }),
+    runtime: { subagent: { run: async () => ({ runId: "r" }), getSessionMessages: async () => ({ messages: [] }) } },
+  };
+  const entry = (await import(pathToFileURL(path.join(root, "plugin", "index.js")).href)).default;
+  entry.register(api);
+  const realSetInterval = globalThis.setInterval;
+  globalThis.setInterval = () => ({ unref() {} });
+  for (const s of services) if (s.start) s.start();
+  globalThis.setInterval = realSetInterval;
+  const realNow = Date.now;
+  const skew = 11 * 60000; // past the boot grace
+  Date.now = () => realNow() + skew;
+  const call = (name, event, ctx) => { let out; for (const h of handlers[name] || []) out = h(event, ctx) ?? out; return out; };
+  const ORC = { agentId: "coordinator", sessionKey: "agent:coordinator:explicit:team-ops", runId: "run-c" };
+  const spawn = (id, agentId, label) => call("before_tool_call", { toolName: "sessions_spawn", params: { agentId, task: brief(id), label } }, ORC);
+  const started = (r, child, agentId, label) => call("after_tool_call", { toolName: "sessions_spawn", params: Object.assign({ agentId, label }, r.params), result: { childSessionKey: child } }, ORC);
+  try {
+    let r = spawn(A, "writer", "shop: price");
+    assert.ok(r && !r.block, `the head of the queue was refused: ${r && r.blockReason}`);
+    started(r, "agent:writer:subagent:c1", "writer", "shop: price");
+    await settle();
+    r = spawn(B, "writer", "shop: total");
+    assert.equal(r && r.block, true, "a second writer task must wait");
+    assert.match(r.blockReason, /writer already runs 1 task, its limit/);
+    r = spawn(C, "designer", "shop: layout");
+    assert.ok(r && !r.block, `another agent's item was refused: ${r && r.blockReason}`);
+    call("subagent_ended", { targetSessionKey: "agent:writer:subagent:c1", outcome: "ok", endedAt: Date.now() }, {});
+    await settle();
+    r = spawn(B, "writer", "shop: total");
+    assert.ok(r && !r.block, `the writer's next item was refused after its task ended: ${r && r.blockReason}`);
+  } finally {
+    await settle();
+    Date.now = realNow;
+  }
+});

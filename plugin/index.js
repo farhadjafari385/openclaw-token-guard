@@ -324,7 +324,15 @@ export default definePluginEntry({
       }
       return ids;
     };
-    const queueCfg = { wip: Number.isFinite(Number((cfg.board || {}).wip)) ? Number(cfg.board.wip) : 1, projectOrder: (cfg.board || {}).projectOrder || [] };
+    const queueCfg = { wip: Number.isFinite(Number((cfg.board || {}).wip)) ? Number(cfg.board.wip) : 1, projectOrder: (cfg.board || {}).projectOrder || [],
+      maxTasksByAgent: (cfg.board || {}).maxTasksByAgent || {} };
+    // Running tasks per agent, from the shared state (another plugin copy may have started one).
+    const runningByAgent = () => {
+      const n = {};
+      for (const j of Object.values(fresh().jobs)) if (j && j.status === "running" && j.agentId) n[j.agentId] = (n[j.agentId] || 0) + 1;
+      return n;
+    };
+    const queueNow = (inboxItems) => queueState(inboxItems, Object.assign({}, queueCfg, { running: runningByAgent() }));
     const orcRunCalls = new Map(); // orchestrator run id -> tool calls so far
     const countOrcCall = (runId) => {
       if (!runId) return;
@@ -345,7 +353,8 @@ export default definePluginEntry({
         return job && job.status === "running" ? job : null;
       },
       runCalls: (runId) => (runId && orcRunCalls.get(runId)) || 0,
-      queue: () => queueState(loadInboxItems(), { wip: queueCfg.wip, projectOrder: queueCfg.projectOrder }),
+      queue: () => queueNow(loadInboxItems()),
+      runningTasks: (agentId) => runningByAgent()[agentId] || 0,
       onBlock: (rule, info) => {
         if (["protectedFile", "protectedConfig", "backChannel", "spawnByWorker", "sendByWorker", "orchestratorOnly", "modelPin"].includes(rule)) {
           systemNote(`${rule}:${info.agentId}`, guardText(voice, rule, info), { html: true });
@@ -939,7 +948,7 @@ export default definePluginEntry({
     // The queue for the team's UI and anyone reading the state: the item in hand and what comes next.
     let lastQueue = "";
     const writeQueue = (inboxItems) => {
-      const q = queueState(inboxItems, queueCfg);
+      const q = queueNow(inboxItems);
       const brief = (it) => ({ id: it.id, project: it.project, title: it.title, status: normStatus(it.status), owner: it.owner, rank: it.rank || null, priority: it.priority });
       const waits = Object.values(store.data.jobs).filter((j) => j.waitFor && !j.waitFor.done).map((j) => ({ items: j.items || [], url: j.waitFor.url, since: j.waitFor.since }));
       const out = JSON.stringify({ wip: q.wip, inHand: q.active.map(brief), next: q.next.map(brief), queue: q.queue.slice(0, 40).map(brief), ciWaits: waits }, null, 1);
@@ -948,9 +957,14 @@ export default definePluginEntry({
       fs.writeFileSync(String(jobsCfg.stateFile).replace(/^~/, home).replace(/[^/]+$/, "queue.json"), out);
     };
     const queueText = () => {
-      const q = queueState(loadInboxItems(), queueCfg);
+      const q = queueNow(loadInboxItems());
       const line = (it, i) => `${i + 1}. ${it.id} [${normStatus(it.status)}] ${it.project || "?"}: ${String(it.title || "").slice(0, 80)} (owner ${it.owner || "?"}${it.rank ? `, rank ${it.rank}` : ""}${it.priority && it.priority !== "normal" ? `, ${it.priority}` : ""})`;
+      const caps = queueCfg.maxTasksByAgent || {};
+      const run = runningByAgent();
+      const full = Object.keys(caps).filter((a) => Number(caps[a]) > 0 && (run[a] || 0) >= Number(caps[a]));
       return [`In hand (${q.active.length} of ${q.wip}):`, ...(q.active.length ? q.active.map(line) : ["- nothing"]),
+        ...(full.length ? [`At their limit of tasks at once (nothing new for them now): ${full.map((a) => `${a} ${run[a]}/${caps[a]}`).join(", ")}`] : []),
+        ...(Object.keys(caps).length ? ["Can start now:", ...(q.next.length ? q.next.map(line) : ["- nothing"])] : []),
         "Next in the queue:", ...(q.queue.length ? q.queue.slice(0, 15).map(line) : ["- To do is empty"])].join("\n");
     };
     const auditTick = async (inboxItems) => {

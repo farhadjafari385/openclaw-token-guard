@@ -51,7 +51,7 @@ const DEFAULT_POLICY = {
   orchestratorOnly: { enabled: true },
   pins: { enabled: true },
   // agent = the PM, who may also edit the board and keeps the queue's order; wip = items in hand at once (0 = no queue)
-  board: { enabled: true, requireItems: true, agent: "product", wip: 1, projectOrder: [], maxOpen: 0 }, // maxOpen: the PM adds nothing while this many items are open (0 = no limit)
+  board: { enabled: true, requireItems: true, agent: "product", wip: 1, projectOrder: [], maxOpen: 0, maxTasksByAgent: {} }, // maxOpen: the PM adds nothing while this many items are open (0 = no limit); maxTasksByAgent: { agent: tasks it may run at once } (unset = no per-agent limit)
   topics: { enabled: true, chatId: "", teamTopic: 160 },
   taskPaths: { enabled: true, roles: ["writer", "designer", "qa", "reviewer"] },
   projects: {}, // { name: { topic, path, aliases, strict } }
@@ -896,6 +896,15 @@ function policyDecide(event, ctx, pstate, rawConfig, log, now = Date.now()) {
       if (briefProject && itemProject && !itemProject.includes(briefProject) && !briefProject.includes(itemProject) && projectName(policy, itemProject) !== briefProject) {
         return block("projectMismatch", `token-guard: the brief says Project ${briefProject} but its items are ${itemProject}. Fix the brief or the items.`);
       }
+      // Tasks one agent may run at once (board.maxTasksByAgent): one more would wait on the same agent.
+      const target = String(params.agentId || "");
+      const cap = Number((policy.board.maxTasksByAgent || {})[target]) || 0;
+      if (cap > 0 && typeof pstate.runningTasks === "function") {
+        const n = pstate.runningTasks(target);
+        if (n >= cap) {
+          return block("agentBusy", `token-guard: ${target} already runs ${n} task${n === 1 ? "" : "s"}, its limit at once. Dispatch another agent's item now (task_inbox queue shows what can start); this one can start when one of ${target}'s tasks ends.`);
+        }
+      }
       // The queue: one item at a time, in the PM's order. The item in hand gets its next gate; a new
       // item starts only when nothing is in hand, and only the one at the head of the queue.
       if (typeof pstate.queue === "function" && Number(policy.board.wip) > 0) {
@@ -904,7 +913,8 @@ function policyDecide(event, ctx, pstate, rawConfig, log, now = Date.now()) {
         const fresh = ids.filter((id) => !inHand.has(id));
         const name = (it) => `${it.id} "${String(it.title || "").slice(0, 60)}" (${normStatus(it.status)})`;
         if (fresh.length && q.active.length >= q.wip) {
-          return block("queueBusy", `token-guard: one item at a time. ${q.active.map(name).join(", ")} is in hand: take it to Done (dispatch its next gate) or Blocked (with the reason) before anything new starts.`);
+          if (q.wip === 1) return block("queueBusy", `token-guard: one item at a time. ${q.active.map(name).join(", ")} is in hand: take it to Done (dispatch its next gate) or Blocked (with the reason) before anything new starts.`);
+          return block("queueBusy", `token-guard: the team has ${q.active.length} items in hand, its limit of ${q.wip}. Take one to Done (dispatch its next gate) or Blocked (with the reason) before anything new starts.`);
         }
         const allowed = new Set(q.next.map((it) => it.id));
         const early = fresh.filter((id) => !allowed.has(id));

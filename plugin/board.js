@@ -94,13 +94,25 @@ function queueOrder(items, projectOrder = []) {
     String(a.created_ts || "").localeCompare(String(b.created_ts || "")));
 }
 
-// The work in hand and what may start next: with `wip` items in hand nothing new starts.
-function queueState(items, { wip = 1, projectOrder = [] } = {}) {
+// The work in hand and what may start next: with `wip` items in hand nothing new starts. With
+// `maxTasksByAgent` ({ agent: n }), an item whose owner already runs n tasks (`running`: { agent: tasks })
+// is passed over, so the next item another agent can take is offered instead of the queue standing still.
+function queueState(items, { wip = 1, projectOrder = [], maxTasksByAgent = {}, running = {} } = {}) {
   const all = [...(items instanceof Map ? items.values() : items || [])];
   const active = all.filter((it) => ACTIVE.has(normStatus(it.status)));
   const queue = queueOrder(all, projectOrder);
   const free = wip > 0 ? Math.max(0, wip - active.length) : queue.length;
-  return { wip, active, queue, next: queue.slice(0, free) };
+  const taken = Object.assign({}, running);
+  const next = [];
+  for (const it of queue) {
+    if (next.length >= free) break;
+    const owner = String(it.owner || "");
+    const cap = Number((maxTasksByAgent || {})[owner]) || 0;
+    if (cap > 0 && (taken[owner] || 0) >= cap) continue;
+    next.push(it);
+    if (owner) taken[owner] = (taken[owner] || 0) + 1;
+  }
+  return { wip, active, queue, next };
 }
 
 const SHORT = {
