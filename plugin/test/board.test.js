@@ -188,6 +188,45 @@ test("policy: a dispatch is the next gate of the item in hand, or the head of th
   assert.equal(policyDecide(spawn("a1b2c3d4"), COORD, ps(free), Object.assign({}, CFG, { board: { wip: 0 } })).params.cleanup, "delete");
 });
 
+test("tasks per agent: an agent at its limit is passed over in the queue and refused at dispatch; others start", () => {
+  const items = new Map([
+    ["a1000001", { id: "a1000001", project: "demo", status: "todo", rank: 1, owner: "growth", title: "list on site 1" }],
+    ["a1000002", { id: "a1000002", project: "demo", status: "todo", rank: 2, owner: "growth", title: "list on site 2" }],
+    ["a1000003", { id: "a1000003", project: "demo", status: "todo", rank: 3, owner: "product", title: "spec A" }],
+    ["a1000004", { id: "a1000004", project: "demo", status: "todo", rank: 4, owner: "product", title: "spec B" }],
+    ["a1000005", { id: "a1000005", project: "demo", status: "todo", rank: 5, owner: "writer", title: "fix C" }],
+    ["a1000006", { id: "a1000006", project: "demo", status: "in_progress", owner: "growth", title: "list on site 0" }],
+  ]);
+  const caps = { growth: 1, product: 1, writer: 2 };
+  // growth runs its one task: its items are passed over; product gets one, not two; the writer's item comes next
+  let q = queueState(items, { wip: 10, maxTasksByAgent: caps, running: { growth: 1 } });
+  assert.deepEqual(q.next.map((i) => i.id), ["a1000003", "a1000005"]);
+  // the team-wide limit still counts: two in hand of 3 leaves one slot
+  q = queueState(items, { wip: 2, maxTasksByAgent: caps, running: { growth: 1 } });
+  assert.deepEqual(q.next.map((i) => i.id), ["a1000003"]);
+  // no per-agent limits: the old order
+  q = queueState(items, { wip: 3, running: { growth: 1 } });
+  assert.deepEqual(q.next.map((i) => i.id), ["a1000001", "a1000002"]);
+  const running = { growth: 1 };
+  const ps = { boardItems: () => items, runningItemIds: () => new Set(["a1000006"]), runningTasks: (a) => running[a] || 0,
+    queue: () => queueState(items, { wip: 10, maxTasksByAgent: caps, running }) };
+  const cfg = Object.assign({}, CFG, { board: { wip: 10, maxTasksByAgent: caps } });
+  const spawn = (id, agentId) => ({ toolName: "sessions_spawn", params: { agentId, task: `Project: demo (/srv/demo)\nScope: x\nItems:\n${id}\nDone when: tests pass\nStop if: y` } });
+  const busy = policyDecide(spawn("a1000001", "growth"), COORD, ps, cfg);
+  assert.equal(busy.rule, "agentBusy");
+  assert.match(busy.blockReason, /growth already runs 1 task, its limit/);
+  assert.equal(policyDecide(spawn("a1000003", "product"), COORD, ps, cfg).params.cleanup, "delete"); // another agent starts
+  assert.equal(policyDecide(spawn("a1000004", "product"), COORD, ps, cfg).rule, "queueOrder"); // product's second waits behind its first
+  running.product = 1;
+  assert.equal(policyDecide(spawn("a1000004", "product"), COORD, ps, cfg).rule, "agentBusy");
+  running.writer = 1;
+  assert.equal(policyDecide(spawn("a1000005", "writer"), COORD, ps, cfg).params.cleanup, "delete"); // writer may run 2
+  // the team-wide limit says how many are in hand, not "one at a time"
+  const busyTeam = (wip) => Object.assign({}, ps, { queue: () => ({ wip, active: Array.from({ length: wip }, (_, n) => ({ id: `b000000${n}`, status: "review" })), queue: [], next: [] }) });
+  assert.match(policyDecide(spawn("a1000003", "product"), COORD, busyTeam(3), Object.assign({}, CFG, { board: { wip: 3 } })).blockReason, /3 items in hand, its limit of 3/);
+  assert.match(policyDecide(spawn("a1000003", "product"), COORD, busyTeam(1), Object.assign({}, CFG, { board: { wip: 1 } })).blockReason, /one item at a time/);
+});
+
 test("a worker that pushed reports waiting: the item stays where it is until its pipeline ends", () => {
   assert.equal(resultVerdict("Pushed and opened the MR.\nRESULT: waiting for CI https://gitlab.com/g/p/-/pipelines/12"), "waiting");
   assert.equal(nextAfterJob("in_progress", "writer", "waiting"), "in_progress");
