@@ -12,6 +12,7 @@ const DEFAULT_CONFIG = {
   maxPollsPerRun: 4,
   subagentMaxPollsPerRun: 40,
   maxForegroundSleepSeconds: 20,
+  blockVmOnHost: true, // emulators and virtual machines may not start on the gateway's host (exec host "node" may)
   maxBackgroundSleepSeconds: 60,
   minLoopSleepSeconds: 5,
   maxRepeatCommand: 4,
@@ -75,6 +76,26 @@ const GATEWAY_CONTROL_REASON =
   "this cuts off your own run and every agent's session, and a stop leaves it down. If a restart is really needed " +
   "(e.g. to load a changed plugin), run `~/.openclaw/bin/oc-gateway-restart` once, as your LAST action, and end your turn; " +
   "it restarts the gateway safely from outside in 15 seconds. Agents come back after about 10 minutes.";
+
+// A virtual machine on the gateway's host. On 2026-11-11 an Android emulator a task started there took the
+// memory; the kernel killed the gateway, and the team answered nothing for 8 hours.
+const VM_START = [
+  /(^|[\s;&|/"'(])emulator\s+(-avd\b|@)/,
+  /(^|[\s;&|/"'(])qemu-system-[\w-]+/,
+  /\b(VBoxHeadless|virt-install)\b/,
+  /\b[Vv][Bb]ox[Mm]anage\s+startvm\b/,
+];
+const VM_REASON =
+  "token-guard: blocked starting an emulator or virtual machine on the gateway's host. It shares its memory with the " +
+  "gateway and every agent: on 2026-11-11 one made the kernel kill the gateway and the team answered nothing for 8 hours. " +
+  "Check an app without running it here (build, unit tests, lint, the APK's manifest and size), or run the emulator " +
+  "on the laptop node (exec host \"node\") when it is online.";
+
+// The whole command, quotes included: a launch usually sits inside `sg kvm -c "..."` or `bash -c "..."`.
+function startsVm(command) {
+  if (typeof command !== "string" || !command) return false;
+  return VM_START.some((re) => re.test(command));
+}
 
 function controlsGateway(command) {
   if (typeof command !== "string" || !command) return false;
@@ -529,6 +550,7 @@ function decide(event, ctx, state, rawConfig, log, now = Date.now()) {
   if (toolName === "exec") {
     const command = typeof params.command === "string" ? params.command : "";
     if (controlsGateway(command)) return block("gatewayControl", GATEWAY_CONTROL_REASON);
+    if (cfg.blockVmOnHost && String(params.host || "") !== "node" && startsVm(command)) return block("vmOnHost", VM_REASON);
     const background = params.background === true;
     const awaitResults = params.awaitResults === true;
 

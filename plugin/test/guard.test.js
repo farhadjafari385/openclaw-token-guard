@@ -372,3 +372,23 @@ test("loadInboxItems folds add and set events like oc-inbox", () => {
   assert.equal(items.get("aaaa0001").status, "backlog");
   assert.equal(loadInboxItems(join(tmpdir(), "missing-inbox.jsonl")).size, 0);
 });
+
+test("an emulator or virtual machine may not start on the gateway's host; the laptop node and stopping one are fine", () => {
+  const s = createState();
+  const started = [
+    'systemd-run --user --unit=hs-emu3 sg kvm -c "$ANDROID_HOME/emulator/emulator -avd hs -no-window -no-audio -memory 2048"',
+    "emulator @hs -no-window",
+    "nohup qemu-system-x86_64 -m 4096 disk.img &",
+    "VBoxManage startvm test --type headless",
+  ];
+  for (const c of started) {
+    const r = decide(exec(c), SUB, s, {});
+    assert.ok(blocked(r), c);
+    assert.match(r.blockReason, /emulator or virtual machine/);
+  }
+  assert.ok(!blocked(decide(exec("emulator -avd hs -no-window", { host: "node" }), SUB, s, {})), "the laptop node may");
+  for (const c of ['pkill -f "[e]mulator.*-avd hs"', "adb -s emulator-5554 shell getprop", "systemctl --user stop hs-emu3", "ls ~/android-sdk/emulator", "./gradlew assembleRelease"]) {
+    assert.ok(!blocked(decide(exec(c), SUB, s, {})), c);
+  }
+  assert.ok(!blocked(decide(exec(started[0]), SUB, createState(), { blockVmOnHost: false })), "can be switched off"); // fresh state: a repeat of a refused command is refused on its own
+});
