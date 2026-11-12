@@ -52,7 +52,7 @@ const DEFAULT_POLICY = {
   pins: { enabled: true },
   // agent = the PM, who may also edit the board and keeps the queue's order; wip = items in hand at once (0 = no queue)
   board: { enabled: true, requireItems: true, agent: "product", wip: 1, projectOrder: [], maxOpen: 0, maxTasksByAgent: {} }, // maxOpen: the PM adds nothing while this many items are open (0 = no limit); maxTasksByAgent: { agent: tasks it may run at once } (unset = no per-agent limit)
-  topics: { enabled: true, chatId: "", teamTopic: 160 },
+  topics: { enabled: true, chatId: "", teamTopic: 160, keepTopics: [] }, // keepTopics: posts there are never moved
   taskPaths: { enabled: true, roles: ["writer", "designer", "qa", "reviewer"] },
   projects: {}, // { name: { topic, path, aliases, strict } }
   // Code maps (graphify): a task in one of these projects queries its map before it searches or reads code.
@@ -795,7 +795,7 @@ function policyDecide(event, ctx, pstate, rawConfig, log, now = Date.now()) {
     if (chat.includes(String(policy.topics.chatId))) {
       const thread = params.threadId !== undefined ? params.threadId : params.messageThreadId;
       const text = String(params.message || params.content || params.text || "");
-      const right = correctTopic({ threadId: thread, text, projects: policy.projects, teamTopic: policy.topics.teamTopic });
+      const right = correctTopic({ threadId: thread, text, projects: policy.projects, teamTopic: policy.topics.teamTopic, keep: policy.topics.keepTopics });
       if (right.topic && String(right.topic) !== String(thread === undefined || thread === null ? "" : thread)) {
         const next = Object.assign({}, params, { threadId: String(right.topic) });
         delete next.messageThreadId;

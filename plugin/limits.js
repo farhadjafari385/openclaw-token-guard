@@ -106,4 +106,11 @@ function allowLimitReply(seen, dest, text, now = Date.now()) {
   return true;
 }
 
-export { isLimitError, isLimitReply, allowLimitReply, limitResetAt, tzOffsetMinutes, zonedToUtc, DEFAULT_LIMIT_MS };
+// OpenClaw's own notice when a run fails ("⚠️ OpenClaw couldn't finish this reply. For details, open Settings → Logs ...").
+// It names no cause: during a usage limit the owner cannot tell it from a broken system.
+function isRunFailureReply(text) {
+  const t = String(text || "").trim();
+  return t.length > 0 && t.length <= 400 && t.startsWith("⚠️") && /couldn.t finish this reply/i.test(t);
+}
+
+export { isLimitError, isLimitReply, isRunFailureReply, allowLimitReply, limitResetAt, tzOffsetMinutes, zonedToUtc, DEFAULT_LIMIT_MS };

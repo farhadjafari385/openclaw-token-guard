@@ -62,7 +62,10 @@ function isGeneral(threadId) {
 }
 
 // The topic a group message must go to, given where it is aimed and what it says.
-function correctTopic({ threadId, text, projects, teamTopic }) {
+// keep: topics whose posts stay where they are whatever project they name (the Postmortems topic: on 2026-11-12 three
+// postmortems naming the ai project were moved out of it, and the owner saw none there).
+function correctTopic({ threadId, text, projects, teamTopic, keep = [] }) {
+  if (!isGeneral(threadId) && (keep || []).map(Number).includes(Number(threadId))) return { topic: Number(threadId), project: projectOfTopic(projects, threadId) };
   const mentioned = projectsMentioned(text, projects);
   const team = Number(teamTopic) || null;
   if (mentioned.length === 1) {
