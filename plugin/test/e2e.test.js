@@ -1070,3 +1070,45 @@ test("a Claude limit recorded for two days is cleared once the orchestrator gets
     await settle();
   }
 });
+
+test("the orchestrator's closing text after its final message-tool reply is dropped, so the owner gets each answer once", async () => {
+  const root = harness();
+  process.env.OC_INBOX_FILE = path.join(root, "inbox.jsonl");
+  globalThis.fetch = async () => ({ ok: true, json: async () => ({ ok: true, result: { message_id: 1 } }) });
+  const handlers = {};
+  const logs = [];
+  const api = {
+    pluginConfig: { orchestratorAgent: "coordinator", ownerId: "42", board: { enabled: false }, topics: { enabled: true, chatId: "-100", teamTopic: 160 },
+      mirror: { enabled: false }, jobs: { stateFile: path.join(root, "state", "jobs.json") }, triage: { enabled: false } },
+    logger: { info: (m) => logs.push(m), warn: () => {}, error: () => {}, debug: () => {} },
+    on: (name, fn) => { (handlers[name] = handlers[name] || []).push(fn); },
+    registerService: () => {},
+    registerTool: () => {},
+    runtime: { subagent: { run: async () => ({ runId: "r" }), getSessionMessages: async () => ({ messages: [] }) } },
+  };
+  const entry = (await import(pathToFileURL(path.join(root, "plugin", "index.js")).href)).default;
+  entry.register(api);
+  const call = (name, event, ctx) => { let out; for (const h of handlers[name] || []) out = h(event, ctx) ?? out; return out; };
+  const MAIN = "agent:coordinator:main";
+  const sent = (runId, params, result = { ok: true }) => call("after_tool_call", { toolName: "mcp__openclaw__message", params, result }, { agentId: "coordinator", sessionKey: MAIN, runId });
+  const closing = (runId, text = "I sent you where everything stands: 1. the site returns 200 ...") =>
+    call("reply_payload_sending", { kind: "final", channel: "telegram", sessionKey: MAIN, runId, payload: { text } }, { sessionKey: MAIN, runId });
+
+  // 2026-11-12: each answer to the owner went out twice, the message-tool reply and then "I sent you ..." as a second message
+  sent("r1", { action: "send", message: "Here's where everything stands ...", final: "True" });
+  assert.deepEqual(closing("r1"), { cancel: true });
+  assert.ok(logs.some((m) => /dropped the orchestrator's closing text/.test(m)));
+  // a run that only sent an early note keeps its closing answer
+  sent("r2", { action: "send", message: "On it, checking GitLab now." });
+  assert.equal(closing("r2"), undefined);
+  // a final reply sent to another chat or topic does not answer this conversation
+  sent("r3", { action: "send", target: "-100", threadId: 151, message: "Dispatched.", final: true });
+  assert.equal(closing("r3"), undefined);
+  // a send that failed did not reach the owner
+  sent("r4", { action: "send", message: "Here it is", final: true }, { ok: false, error: "chat not found" });
+  assert.equal(closing("r4"), undefined);
+  // another run, and a worker's run, are left alone
+  assert.equal(closing("r9"), undefined);
+  call("after_tool_call", { toolName: "message", params: { action: "send", message: "x", final: true }, result: { ok: true } }, { agentId: "growth", sessionKey: "agent:growth:subagent:g", runId: "w1" });
+  assert.equal(call("reply_payload_sending", { kind: "final", sessionKey: "agent:growth:subagent:g", runId: "w1", payload: { text: "done" } }, { runId: "w1" }), undefined);
+});

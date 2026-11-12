@@ -236,6 +236,15 @@ export default definePluginEntry({
       if (!h.startsWith("@") || !t.trim() || t.includes(h)) return t;
       return `${h} ${t}`;
     };
+    // Runs in which the orchestrator sent its final reply with the message tool, to the conversation it answers.
+    const answeredByTool = new Map();
+    const isFinalReplySend = (p, event) => {
+      p = p || {};
+      if (String(p.action || "send") !== "send" || !/^(true|1)$/i.test(String(p.final))) return false;
+      if (p.target || p.to || p.chatId || p.channelId || p.threadId) return false; // sent elsewhere: its own text still answers here
+      if (event && event.error) return false;
+      return !/"(ok)"\s*:\s*false|"status"\s*:\s*"error"/.test(JSON.stringify((event && event.result) || ""));
+    };
     // An orchestrator post in a project topic answers the newest unanswered result there, and mentions its worker.
     const threadOrchestratorPost = (p) => {
       if (!p || p.replyTo || String(p.action || "send") !== "send") return null;
@@ -514,6 +523,13 @@ export default definePluginEntry({
     // The spawn result carries the child session key; use it when subagent_spawned is not emitted.
     api.on("after_tool_call", safe("after_tool_call", (event, ctx) => {
       const bare = String(event.toolName || "").split("__").pop();
+      if (bare === "message" && ctx && ctx.agentId === orchestrator && ctx.runId) {
+        if (isFinalReplySend(event.params, event)) {
+          answeredByTool.set(String(ctx.runId), Date.now());
+          if (answeredByTool.size > 200) answeredByTool.delete(answeredByTool.keys().next().value);
+        }
+        return;
+      }
       if (bare === "task_inbox") {
         const action = String((event.params && event.params.action) || "");
         if (["add", "set", "approve"].includes(action)) {
@@ -710,6 +726,16 @@ export default definePluginEntry({
     // ---- the orchestrator's own replies in a project topic answer the worker's result they follow ----
     api.on("reply_payload_sending", safe("reply_payload_sending", (event, ctx) => {
       const sessionKey = String((event && event.sessionKey) || (ctx && ctx.sessionKey) || "");
+      // It already answered in this run with the message tool, marked final: its closing text repeats that answer
+      // ("I sent you ..."), and the owner got every answer twice. OpenClaw drops it only when the words are the same.
+      const runId = String((event && event.runId) || (ctx && ctx.runId) || "");
+      if (runId && answeredByTool.has(runId) && sessionKey.startsWith(`agent:${orchestrator}:`) && (!event.kind || ["final", "block"].includes(event.kind))) {
+        const p = (event && event.payload) || {};
+        if (!p.mediaUrl && !(Array.isArray(p.mediaUrls) && p.mediaUrls.length)) {
+          log("info", "token-guard dropped the orchestrator's closing text: it already answered with the message tool", { sessionKey, text: String(p.text || "").slice(0, 80) });
+          return { cancel: true };
+        }
+      }
       if (!chatId || !sessionKey.startsWith(`agent:${orchestrator}:`) || !sessionKey.includes(chatId)) return undefined;
       if (event.channel && event.channel !== "telegram") return undefined;
       if (event.kind && !["final", "block"].includes(event.kind)) return undefined;
