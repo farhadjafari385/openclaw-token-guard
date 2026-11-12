@@ -1022,6 +1022,7 @@ test("a Claude limit recorded for two days is cleared once the orchestrator gets
   const handlers = {};
   const logs = [];
   const services = [];
+  const runs = [];
   const api = {
     pluginConfig: {
       orchestratorAgent: "coordinator",
@@ -1035,7 +1036,7 @@ test("a Claude limit recorded for two days is cleared once the orchestrator gets
     on: (name, fn) => { (handlers[name] = handlers[name] || []).push(fn); },
     registerService: (s) => services.push(s),
     registerTool: () => {},
-    runtime: { subagent: { run: async () => ({ runId: "r" }), getSessionMessages: async () => ({ messages: [] }) } },
+    runtime: { subagent: { run: async (p) => { runs.push(p); return { runId: "r" }; }, getSessionMessages: async () => ({ messages: [] }) } },
   };
   const entry = (await import(pathToFileURL(path.join(root, "plugin", "index.js")).href)).default;
   entry.register(api);
@@ -1058,6 +1059,13 @@ test("a Claude limit recorded for two days is cleared once the orchestrator gets
     assert.ok(logs.some((m) => /limit is cleared/.test(m)));
     assert.ok(await until(() => telegram.some((m) => /recorded usage limit is cleared/.test(m.text || ""))), "the team topic is told");
     assert.equal(JSON.parse(fs.readFileSync(path.join(root, "state", "jobs.json"), "utf8")).claudeLimitedUntil, 0);
+    const wake = runs.find((r) => /^\[limit\]/.test(r.message || ""));
+    assert.ok(wake, "the orchestrator is woken to dispatch now");
+    assert.match(wake.message, /correct it in that same chat/);
+    assert.equal(runs.filter((r) => /^\[limit\]/.test(r.message || "")).length, 1, "once");
+    call("llm_output", { assistantTexts: ["Dispatching the next item."] }, ORC);
+    await settle();
+    assert.equal(runs.filter((r) => /^\[limit\]/.test(r.message || "")).length, 1, "no wake without a limit to clear");
   } finally {
     await settle();
   }
