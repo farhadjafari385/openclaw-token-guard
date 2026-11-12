@@ -5,14 +5,14 @@ import { createState, decide, forgetRefusedBrief } from "./guard.js";
 import { policyDecide, firstLine, itemsFromBrief, completeBrief, codexEnabled, CHECK_COMMAND, GRAPH_COMMAND } from "./policy.js";
 import { ACTIVE, isLimitBlock, normStatus, resultVerdict, nextAfterJob, queueState, renderBoard, renderOverview, auditBoard, parseApproval, looksLikeRequest } from "./board.js";
 import { correctTopic, isGeneral, projectOfTopic, projectsMentioned } from "./topics.js";
-import { isLimitError, isLimitReply, allowLimitReply, limitResetAt } from "./limits.js";
+import { isLimitError, isLimitReply, isRunFailureReply, allowLimitReply, limitResetAt } from "./limits.js";
 import {
   createJobStore, mergeJobsConfig, recordSpawn, recordActivity, recordUsage, recordCall, callBudget, recordTime, recordCheck, recordGraph, recordResultText, finalAnswer, missingProof,
   recordEnd, recordProgress, setClaudeLimited, clearClaudeLimited, setCodexLimited, scanJobs, lastAssistantText,
 } from "./jobs.js";
 import { createMirror, topicFor, messageIdOf } from "./mirror.js";
 import {
-  dispatchText, ackText, resultText, guardText, limitText, budgetText, approvalAskText, approvalReplyText,
+  dispatchText, ackText, resultText, guardText, limitText, limitHoldText, budgetText, approvalAskText, approvalReplyText,
   auditText, movedText, mdToHtml, handleOf, boardReplyText, spawnErrorText, nameOf,
 } from "./voice.js";
 import { inboxArgs, loadInboxItems, runInbox } from "./inbox.js";
@@ -35,6 +35,8 @@ state.lookupInbox = () => loadInboxItems();
 const BOOT = processBoot();
 const LIMIT_CLEARED_WAKE = "[limit] Claude answers normally again, so the usage limit the guard had recorded is cleared and dispatches go through. " +
   "Dispatch the next items from the queue now. If you told the owner that agents are blocked by a limit, correct it in that same chat in one line.";
+const LIMIT_OWNER_WAKE = "[limit] Claude answers normally again. While the usage limit held, the owner wrote to you here and got only the " +
+  "limit notice. Answer each of those messages now, as a reply to it, in the order they came. Do not resend anything you already answered.";
 const BOOT_ID = BOOT.id;
 const BOOT_STARTED_AT = BOOT.startedAt;
 // OpenClaw may load the plugin in several generations and not always stop the old ones.
@@ -662,6 +664,21 @@ export default definePluginEntry({
     const pointed = new Set();
     const limitReplies = new Map(); // destination -> limit reset time
     api.on("message_sending", safe("message_sending", (event, ctx) => {
+      // While Claude's usage limit holds, OpenClaw answers every message with "⚠️ OpenClaw couldn't finish this reply ..."
+      // (2026-11-12: the owner got it three times in two minutes and read it as broken). Say what it is and until when;
+      // the orchestrator answers the owner's messages once the limit clears.
+      if (isRunFailureReply(event && event.content)) {
+        const s = fresh();
+        const until = (s.claudeLimitedUntil || 0) > Date.now() ? s.claudeLimitedUntil : 0;
+        if (!until) return undefined; // another failure: OpenClaw's own notice stands
+        if (ownerId && String(event.to || "").split(":").pop() === ownerId) {
+          store.data.ownerLimitNoticeAt = Date.now();
+          store.touch();
+          store.save();
+        }
+        log("info", "token-guard replaced OpenClaw's failed-reply notice with the usage-limit notice", { to: event.to, threadId: event.threadId });
+        return { content: limitHoldText(voice, until) };
+      }
       // At a usage limit every message gets the same error back; one per chat and topic says it.
       if (isLimitReply(event && event.content)) {
         const dest = `${(ctx && ctx.accountId) || ""}:${event.to || ""}:${event.threadId || ""}`;
@@ -710,7 +727,7 @@ export default definePluginEntry({
         const job = pendingAnswer();
         if (job) return moveAnswer(job);
       }
-      const right = correctTopic({ threadId: event.threadId, text: event.content, projects, teamTopic });
+      const right = correctTopic({ threadId: event.threadId, text: event.content, projects, teamTopic, keep: topicsCfg.keepTopics });
       if (!right.topic || right.topic === current) return undefined;
       mirror.post({ accountId: ctx.accountId, topic: right.topic, text: mdToHtml(event.content, 3500), html: true }).catch(() => null);
       const pointerKey = `${ctx.runId || ctx.sessionKey || ""}:${current}`;
@@ -818,6 +835,15 @@ export default definePluginEntry({
           api.runtime.subagent.run({ sessionKey: jobsCfg.idleWakeSession, deliver: false, message: LIMIT_CLEARED_WAKE })
             .then(() => log("info", "token-guard woke the orchestrator: the Claude limit is cleared"))
             .catch((error) => log("warn", "token-guard could not wake the orchestrator after clearing the limit", { error: String(error && error.message) }));
+          // The owner's messages that got only the limit notice are answered in the owner's own chat.
+          if ((store.data.ownerLimitNoticeAt || 0) > (store.data.ownerLimitAnsweredAt || 0)) {
+            store.data.ownerLimitAnsweredAt = Date.now();
+            store.touch();
+            store.save();
+            api.runtime.subagent.run({ sessionKey: `agent:${orchestrator}:main`, deliver: false, message: LIMIT_OWNER_WAKE })
+              .then(() => log("info", "token-guard woke the orchestrator to answer the owner's messages held by the limit"))
+              .catch((error) => log("warn", "token-guard could not wake the orchestrator for the owner's held messages", { error: String(error && error.message) }));
+          }
         }
       }
       const over = recordUsage(store.data, key, event && event.usage, jobsCfg);

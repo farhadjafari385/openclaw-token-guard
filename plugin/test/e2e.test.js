@@ -1071,6 +1071,73 @@ test("a Claude limit recorded for two days is cleared once the orchestrator gets
   }
 });
 
+test("during a Claude limit the owner gets the limit and its end instead of OpenClaw's bare failure, and is answered once it clears", async () => {
+  // 2026-11-12: three owner messages during a limit got "⚠️ OpenClaw couldn't finish this reply" and no answer after it.
+  const root = harness();
+  process.env.OC_INBOX_FILE = path.join(root, "inbox.jsonl");
+  process.env.OC_INBOX_BIN = path.join(REPO, "bin", "oc-inbox");
+  const T = Date.now();
+  fs.writeFileSync(path.join(root, "state", "jobs.json"), JSON.stringify({ version: 1, jobs: {}, claudeLimitedUntil: T + 80 * 60000,
+    claudeLimitText: "You've hit your session limit · resets 12:20pm (America/New_York)", claudeLimitedAt: T - 5 * 60000 }));
+  globalThis.fetch = async (url) => (String(url).startsWith("https://api.telegram.org/")
+    ? { ok: true, json: async () => ({ ok: true, result: { message_id: 7300 } }) } : { ok: false, status: 404, json: async () => ({}) });
+  const handlers = {};
+  const logs = [];
+  const services = [];
+  const runs = [];
+  const api = {
+    pluginConfig: {
+      orchestratorAgent: "coordinator", ownerId: "42",
+      board: { enabled: false },
+      topics: { enabled: false },
+      mirror: { enabled: true, chatId: "-100", systemTopic: 160, defaultTopic: 160, minIntervalMs: 0, botTokenFiles: { coordinator: path.join(root, "bot.token") } },
+      jobs: { stateFile: path.join(root, "state", "jobs.json"), idleWakeSession: "agent:coordinator:explicit:team-ops", refusal: { enabled: false } },
+      triage: { enabled: false },
+    },
+    logger: { info: (m) => logs.push(m), warn: (m) => logs.push(m), error: (m) => logs.push(m), debug: () => {} },
+    on: (name, fn) => { (handlers[name] = handlers[name] || []).push(fn); },
+    registerService: (s) => services.push(s),
+    registerTool: () => {},
+    runtime: { subagent: { run: async (p) => { runs.push(p); return { runId: "r" }; }, getSessionMessages: async () => ({ messages: [] }) } },
+  };
+  const entry = (await import(pathToFileURL(path.join(root, "plugin", "index.js")).href)).default;
+  entry.register(api);
+  const realSetInterval = globalThis.setInterval;
+  globalThis.setInterval = () => ({ unref() {} });
+  for (const s of services) if (s.start) s.start();
+  globalThis.setInterval = realSetInterval;
+  const call = (name, event, ctx) => { let out; for (const h of handlers[name] || []) out = h(event, ctx) ?? out; return out; };
+  const FAIL = "⚠️ OpenClaw couldn't finish this reply. For details, open Settings → Logs in the Control UI or run `openclaw logs --follow` in your terminal.";
+  const DM = { channelId: "telegram", accountId: "orchestrator", sessionKey: "agent:coordinator:main" };
+  try {
+    const out = call("message_sending", { to: "42", content: FAIL }, DM);
+    assert.ok(out && typeof out.content === "string", "the bare failure is rewritten");
+    assert.match(out.content, /usage limit is reached, so I can't answer until \d{2}:\d{2} UTC \(in about \d+ min\)/);
+    assert.match(out.content, /your message is kept/);
+    assert.ok(!out.cancel);
+    // every message during the limit gets it (silence reads as broken), and a limit-free failure is left alone
+    assert.match(call("message_sending", { to: "42", content: FAIL }, DM).content, /usage limit/);
+    // the limit clears: the team is woken to dispatch, and the owner's chat to answer the held messages
+    call("llm_output", { assistantTexts: ["I checked the board; two items are ready."] }, { agentId: "coordinator", sessionKey: "agent:coordinator:explicit:team-ops", runId: "x" });
+    await settle();
+    const ownerWake = runs.filter((r) => r.sessionKey === "agent:coordinator:main" && /owner wrote to you here/.test(r.message || ""));
+    assert.equal(ownerWake.length, 1, "the owner's chat is woken once");
+    assert.equal(ownerWake[0].deliver, false);
+    assert.ok(runs.some((r) => r.sessionKey === "agent:coordinator:explicit:team-ops" && /^\[limit\]/.test(r.message || "")));
+    // no limit now: OpenClaw's notice for another failure stands
+    assert.equal(call("message_sending", { to: "42", content: FAIL }, DM), undefined);
+  } finally {
+    await settle();
+  }
+});
+
+test("only OpenClaw's own bare failure notice is rewritten, never the orchestrator's words", async () => {
+  const { isRunFailureReply } = await import("../limits.js");
+  assert.ok(isRunFailureReply("⚠️ OpenClaw couldn't finish this reply. Check the conversation before trying again. For details, open Settings → Logs."));
+  assert.ok(!isRunFailureReply("I couldn't finish this reply because the page was down."), "the orchestrator's own words are not the notice");
+  assert.ok(!isRunFailureReply("⚠️ The task couldn't finish. Some actions may have completed; check their results before continuing."));
+});
+
 test("the orchestrator's closing text after its final message-tool reply is dropped, so the owner gets each answer once", async () => {
   const root = harness();
   process.env.OC_INBOX_FILE = path.join(root, "inbox.jsonl");

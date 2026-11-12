@@ -217,6 +217,15 @@ function limitText(_cfg, untilMs, provider = "claude", spawn = {}) {
   return `⚠️ Claude's usage limit is reached until ${until} UTC. New tasks run on ${esc(modelName(spawn.codexModel))} until then.`;
 }
 
+// Sent in place of OpenClaw's "couldn't finish this reply" while Claude's usage limit holds.
+function limitHoldText(_cfg, untilMs, now = Date.now()) {
+  const iso = new Date(untilMs).toISOString();
+  const until = iso.slice(0, 10) === new Date(now).toISOString().slice(0, 10) ? iso.slice(11, 16) : `${new Date(untilMs).toUTCString().slice(0, 11)} ${iso.slice(11, 16)}`;
+  const mins = Math.max(1, Math.round((untilMs - now) / 60000));
+  const left = mins < 120 ? `${mins} min` : `${Math.round(mins / 60)} h`;
+  return `⏸ Claude's usage limit is reached, so I can't answer until ${until} UTC (in about ${left}). Nothing is broken, and your message is kept: I answer it as soon as the limit resets.`;
+}
+
 // The orchestrator asks the owner to approve checked work (archiving needs both).
 function approvalAskText(cfg, items) {
   if (items.length === 1) {
@@ -266,6 +275,7 @@ function movedText(_cfg, project) {
 }
 
 export {
+  limitHoldText,
   esc, clip, nameOf, handleOf, ownerTag, titleOf, modelName, mdToHtml, htmlToPlain, splitReport,
   dispatchText, ackText, resultText, stallText, interruptedText, unactedText, wakeCapText, teamStuckText,
   budgetText, guardText, limitText, approvalAskText, approvalReplyText, auditText, movedText, boardReplyText, spawnErrorText,

@@ -117,6 +117,8 @@ function mergeStates(a, b) {
   // A limit cleared after it was recorded stays cleared, whichever copy still holds the old one.
   out.claudeLimitedUntil = out.claudeLimitClearedAt > out.claudeLimitedAt ? 0 : Math.max(a.claudeLimitedUntil || 0, b.claudeLimitedUntil || 0);
   out.codexLimitedUntil = Math.max(a.codexLimitedUntil || 0, b.codexLimitedUntil || 0);
+  out.ownerLimitNoticeAt = Math.max(a.ownerLimitNoticeAt || 0, b.ownerLimitNoticeAt || 0);
+  out.ownerLimitAnsweredAt = Math.max(a.ownerLimitAnsweredAt || 0, b.ownerLimitAnsweredAt || 0);
   out.claudeLimitText = (a.claudeLimitedUntil || 0) >= (b.claudeLimitedUntil || 0) ? a.claudeLimitText : b.claudeLimitText;
   out.orcActivity = Object.assign({}, b.orcActivity, a.orcActivity);
   for (const [k, v] of Object.entries(b.orcActivity || {})) out.orcActivity[k] = Math.max(v, out.orcActivity[k] || 0);

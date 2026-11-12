@@ -100,6 +100,20 @@ test("topics: a message goes to the topic of the one project it is about", () =>
   assert.equal(correctTopic({ threadId: 151, text: "demo and openclaw-ui both", projects: PROJECTS, teamTopic: 160 }).topic, 151);
 });
 
+test("topics: a postmortem stays in the Postmortems topic even when it names a project", () => {
+  // 2026-11-12: three postmortems about the ai project were moved out of the Postmortems topic.
+  assert.equal(correctTopic({ threadId: 2596, text: "Postmortem: ai checkout broke", projects: PROJECTS, teamTopic: 160, keep: [2596] }).topic, 2596);
+  assert.equal(correctTopic({ threadId: "2596", text: "Postmortem: demo deploy", projects: PROJECTS, teamTopic: 160, keep: ["2596"] }).topic, 2596);
+  assert.equal(correctTopic({ threadId: 160, text: "demo deploy done", projects: PROJECTS, teamTopic: 160, keep: [2596] }).topic, 151, "other topics still move");
+  assert.equal(correctTopic({ threadId: undefined, text: "hello team", projects: PROJECTS, teamTopic: 160, keep: [2596] }).topic, 160);
+  const post = { toolName: "message", params: { action: "send", target: "-100", threadId: "2596", message: "Postmortem: the demo deploy broke" } };
+  const orc = { agentId: "coordinator", sessionKey: "agent:coordinator:explicit:team-ops" };
+  const moved = policyDecide(post, orc, null, { topics: { chatId: "-100" }, projects: PROJECTS });
+  assert.equal(moved && moved.params && moved.params.threadId, String(PROJECTS.demo.topic), "without keepTopics it is moved (the bug)");
+  const kept = policyDecide(post, orc, null, { topics: { chatId: "-100", keepTopics: [2596] }, projects: PROJECTS });
+  assert.ok(!(kept && kept.params && kept.params.threadId), JSON.stringify(kept));
+});
+
 const COORD = { agentId: "coordinator", sessionKey: "agent:coordinator:telegram:group:-100:topic:151" };
 const CFG = { topics: { chatId: "-100" }, projects: PROJECTS };
 
