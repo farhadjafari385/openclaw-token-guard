@@ -112,7 +112,10 @@ function mergeStates(a, b) {
   for (const key of new Set([...Object.keys(a.jobs || {}), ...Object.keys(b.jobs || {})])) {
     out.jobs[key] = newerJob((a.jobs || {})[key], (b.jobs || {})[key]);
   }
-  out.claudeLimitedUntil = Math.max(a.claudeLimitedUntil || 0, b.claudeLimitedUntil || 0);
+  out.claudeLimitedAt = Math.max(a.claudeLimitedAt || 0, b.claudeLimitedAt || 0);
+  out.claudeLimitClearedAt = Math.max(a.claudeLimitClearedAt || 0, b.claudeLimitClearedAt || 0);
+  // A limit cleared after it was recorded stays cleared, whichever copy still holds the old one.
+  out.claudeLimitedUntil = out.claudeLimitClearedAt > out.claudeLimitedAt ? 0 : Math.max(a.claudeLimitedUntil || 0, b.claudeLimitedUntil || 0);
   out.codexLimitedUntil = Math.max(a.codexLimitedUntil || 0, b.codexLimitedUntil || 0);
   out.claudeLimitText = (a.claudeLimitedUntil || 0) >= (b.claudeLimitedUntil || 0) ? a.claudeLimitText : b.claudeLimitText;
   out.orcActivity = Object.assign({}, b.orcActivity, a.orcActivity);
@@ -345,13 +348,26 @@ function setCodexLimited(data, untilMs, text) {
   return false;
 }
 
-function setClaudeLimited(data, untilMs, text) {
+function setClaudeLimited(data, untilMs, text, now = Date.now()) {
   if (untilMs > (data.claudeLimitedUntil || 0)) {
     data.claudeLimitedUntil = untilMs;
     data.claudeLimitText = String(text || "").slice(0, 200);
+    data.claudeLimitedAt = now;
     return true;
   }
   return false;
+}
+
+// A model answered normally after the limit was recorded, so the limit is gone (usage was added, the plan changed,
+// or it covered fewer models than its text said). On 2026-11-12 one task's "weekly limit · resets Nov 13, 9pm" held
+// every dispatch for two days while every model answered. Answers within `graceMs` of the limit may have been in
+// flight when it hit. Returns true when it cleared one.
+function clearClaudeLimited(data, now = Date.now(), graceMs = 60000) {
+  if (!((data.claudeLimitedUntil || 0) > now)) return false;
+  if (now - (data.claudeLimitedAt || 0) < graceMs) return false;
+  data.claudeLimitedUntil = 0;
+  data.claudeLimitClearedAt = now;
+  return true;
 }
 
 // ---- scan ----
@@ -548,6 +564,7 @@ export {
   recordEnd,
   recordProgress,
   setClaudeLimited,
+  clearClaudeLimited,
   setCodexLimited,
   scanJobs,
   lastAssistantText,
