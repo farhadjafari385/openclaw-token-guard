@@ -13,6 +13,7 @@ const DEFAULT_CONFIG = {
   subagentMaxPollsPerRun: 40,
   maxForegroundSleepSeconds: 20,
   blockVmOnHost: true, // emulators and virtual machines may not start on the gateway's host (exec host "node" may)
+  capGradleBuilds: true, // gradle/gradlew runs get --no-daemon, two workers and capped heaps
   maxBackgroundSleepSeconds: 60,
   minLoopSleepSeconds: 5,
   maxRepeatCommand: 4,
@@ -103,6 +104,18 @@ const VM_REASON =
 function startsVm(command) {
   if (typeof command !== "string" || !command) return false;
   return VM_START.some((re) => re.test(command));
+}
+
+// A Gradle build on the gateway's host: on 2026-11-12 an Android release build's Gradle daemon held 4.25 GB and stayed
+// after the build; the host filled its memory and swap, the gateway was swapped out and stalled, and new worker sessions
+// started without their tools. Every gradle/gradlew run gets no daemon, two workers and capped heaps, and its memory
+// is freed when it ends.
+const GRADLE_RUN = /(^|[\s;&|(/"'])(gradlew|gradle)(?=\s)/g;
+const GRADLE_CAPS = "--no-daemon --max-workers=2 -Dorg.gradle.jvmargs=-Xmx1536m -Dkotlin.daemon.jvm.options=-Xmx768m";
+
+function capGradle(command) {
+  if (typeof command !== "string" || !/(^|[\s;&|(/"'])(gradlew|gradle)\s/.test(command) || command.includes("--no-daemon")) return command;
+  return command.replace(GRADLE_RUN, `$1$2 ${GRADLE_CAPS}`);
 }
 
 function controlsGateway(command) {
@@ -601,6 +614,11 @@ function decide(event, ctx, state, rawConfig, log, now = Date.now()) {
           (subagent ? SUBAGENT_WAIT_HOWTO : WAIT_HOWTO));
       }
     }
+    const capped = cfg.capGradleBuilds ? capGradle(command) : command;
+    if (capped !== command && enforce) {
+      if (typeof log === "function") log("info", "token-guard capped a Gradle build's memory", { agentId, sessionKey });
+      return { params: Object.assign({}, params, { command: capped }) };
+    }
     return undefined;
   }
 
@@ -715,6 +733,7 @@ function forgetRefusedBrief(state, agentId, now = Date.now(), withinMs = 2 * 600
 }
 
 export {
+  capGradle,
   forgetRefusedBrief,
   DEFAULT_CONFIG,
   mergeConfig,
