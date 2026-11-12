@@ -33,6 +33,8 @@ state.lookupInbox = () => loadInboxItems();
 
 // Shared by every copy of the plugin in this process (see boot.js).
 const BOOT = processBoot();
+const LIMIT_CLEARED_WAKE = "[limit] Claude answers normally again, so the usage limit the guard had recorded is cleared and dispatches go through. " +
+  "Dispatch the next items from the queue now. If you told the owner that agents are blocked by a limit, correct it in that same chat in one line.";
 const BOOT_ID = BOOT.id;
 const BOOT_STARTED_AT = BOOT.startedAt;
 // OpenClaw may load the plugin in several generations and not always stop the old ones.
@@ -783,6 +785,14 @@ export default definePluginEntry({
         store.save();
         log("info", "token-guard: Claude answered normally after the recorded limit; the limit is cleared", { agentId: ctx && ctx.agentId });
         systemNote("claude-limit-cleared", "✅ Claude answers normally again, so the recorded usage limit is cleared and new tasks can start.", { html: true });
+        // Wake the orchestrator now: it may have told the owner work is blocked, and the next triage is minutes away.
+        const day = new Date().toISOString().slice(0, 10);
+        store.data.wakesByDay[day] = (store.data.wakesByDay[day] || 0) + 1;
+        if (api.runtime && api.runtime.subagent && typeof api.runtime.subagent.run === "function") {
+          api.runtime.subagent.run({ sessionKey: jobsCfg.idleWakeSession, deliver: false, message: LIMIT_CLEARED_WAKE })
+            .then(() => log("info", "token-guard woke the orchestrator: the Claude limit is cleared"))
+            .catch((error) => log("warn", "token-guard could not wake the orchestrator after clearing the limit", { error: String(error && error.message) }));
+        }
       }
       const over = recordUsage(store.data, key, event && event.usage, jobsCfg);
       if (over) {
