@@ -325,6 +325,24 @@ test("a task near its time limit is flagged once; a longer limit or no limit set
   assert.equal(recordTime(emptyState(), KEY, mergeJobsConfig({ wrapUpMinutes: 0 }), T0 + 999 * min), null); // switched off
 });
 
+test("a recorded Claude limit is cleared by a normal answer after it, and stays cleared across plugin copies", async () => {
+  const { emptyState, setClaudeLimited, clearClaudeLimited, mergeStates } = await import("../jobs.js");
+  const T0 = Date.UTC(2026, 10, 12, 0, 24);
+  const until = Date.UTC(2026, 10, 14, 2, 0); // "weekly limit · resets Nov 13, 9pm (America/New_York)"
+  const d = emptyState();
+  assert.equal(setClaudeLimited(d, until, "You've hit your weekly limit", T0), true);
+  assert.equal(clearClaudeLimited(d, T0 + 30000), false, "an answer in flight when it hit does not count");
+  const stale = JSON.parse(JSON.stringify(d)); // another plugin copy that still holds the limit
+  assert.equal(clearClaudeLimited(d, T0 + 10 * 60000), true);
+  assert.equal(d.claudeLimitedUntil, 0);
+  assert.equal(clearClaudeLimited(d, T0 + 11 * 60000), false, "nothing left to clear");
+  assert.equal(mergeStates(d, stale).claudeLimitedUntil, 0);
+  assert.equal(mergeStates(stale, d).claudeLimitedUntil, 0);
+  // a new limit recorded after the clearing holds again
+  setClaudeLimited(stale, until + 1000, "You've hit your session limit", T0 + 20 * 60000);
+  assert.equal(mergeStates(d, stale).claudeLimitedUntil, until + 1000);
+});
+
 test("triage: the same board state does not wake the orchestrator again", async () => {
   const { triageSignature, DEFAULT_TRIAGE } = await import("../triage.js");
   const items = [{ id: "2fda6c5a", status: "todo", updated_ts: 1 }, { id: "11cec036", status: "review", updated_ts: 2 }, { id: "aaaa0000", status: "blocked" }];

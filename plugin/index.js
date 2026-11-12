@@ -8,7 +8,7 @@ import { correctTopic, isGeneral, projectOfTopic, projectsMentioned } from "./to
 import { isLimitError, isLimitReply, allowLimitReply, limitResetAt } from "./limits.js";
 import {
   createJobStore, mergeJobsConfig, recordSpawn, recordActivity, recordUsage, recordCall, callBudget, recordTime, recordCheck, recordGraph, recordResultText, finalAnswer, missingProof,
-  recordEnd, recordProgress, setClaudeLimited, setCodexLimited, scanJobs, lastAssistantText,
+  recordEnd, recordProgress, setClaudeLimited, clearClaudeLimited, setCodexLimited, scanJobs, lastAssistantText,
 } from "./jobs.js";
 import { createMirror, topicFor, messageIdOf } from "./mirror.js";
 import {
@@ -777,6 +777,13 @@ export default definePluginEntry({
       if (key && recordActivity(store.data, key, ctx.agentId, orchestrator, Date.now())) store.touch(); // a model call is work too
       const texts = event && Array.isArray(event.assistantTexts) ? event.assistantTexts.filter((t) => typeof t === "string" && t.trim()) : [];
       if (job && texts.length && recordResultText(store.data, key, finalAnswer(texts), jobsCfg)) store.touch();
+      // A normal answer after a recorded Claude limit: the limit is gone, so tasks may start again.
+      if (texts.length && !texts.some((t) => isLimitReply(t) || isLimitError(t)) && clearClaudeLimited(store.data, Date.now())) {
+        store.touch();
+        store.save();
+        log("info", "token-guard: Claude answered normally after the recorded limit; the limit is cleared", { agentId: ctx && ctx.agentId });
+        systemNote("claude-limit-cleared", "✅ Claude answers normally again, so the recorded usage limit is cleared and new tasks can start.", { html: true });
+      }
       const over = recordUsage(store.data, key, event && event.usage, jobsCfg);
       if (over) {
         store.touch();

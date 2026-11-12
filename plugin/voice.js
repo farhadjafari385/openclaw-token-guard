@@ -206,7 +206,8 @@ function guardText(cfg, rule, info) {
 }
 
 function limitText(_cfg, untilMs, provider = "claude", spawn = {}) {
-  const until = new Date(untilMs).toISOString().slice(11, 16);
+  const iso = new Date(untilMs).toISOString();
+  const until = iso.slice(0, 10) === new Date().toISOString().slice(0, 10) ? iso.slice(11, 16) : `${new Date(untilMs).toUTCString().slice(0, 11)} ${iso.slice(11, 16)}`;
   if (provider === "codex") {
     return `⚠️ Codex's usage limit is reached until ${until} UTC. New tasks run on ${esc(modelName((spawn && spawn.claudeFallbackModel) || "anthropic/claude-sonnet-5"))} until then.`;
   }

@@ -933,7 +933,11 @@ function policyDecide(event, ctx, pstate, rawConfig, log, now = Date.now()) {
     }
     const claudeUntil = (pstate && pstate.claudeLimitedUntil) || 0;
     const codexUntil = (pstate && pstate.codexLimitedUntil) || 0;
-    const at = (ms) => new Date(ms).toISOString().slice(11, 16);
+    // The date too when it is not today: "until 02:00 UTC" read as already past when the limit ran two days.
+    const at = (ms) => {
+      const iso = new Date(ms).toISOString();
+      return iso.slice(0, 10) === new Date(now).toISOString().slice(0, 10) ? iso.slice(11, 16) : `${new Date(ms).toUTCString().slice(0, 11)} ${iso.slice(11, 16)}`;
+    };
     if (claudeUntil > now && !policy.spawn.codexModel) {
       return block("claudeLimited", `token-guard: Claude is at its usage limit until ${at(claudeUntil)} UTC and there is no fallback (Codex is off), so this task would fail at once. Do not dispatch now and leave its items in To do: the job tracker wakes you again once the limit has reset.`);
     }

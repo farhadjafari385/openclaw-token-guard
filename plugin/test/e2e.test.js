@@ -1004,3 +1004,61 @@ test("tasks per agent: a second task for an agent at its limit is refused, anoth
     Date.now = realNow;
   }
 });
+
+test("a Claude limit recorded for two days is cleared once the orchestrator gets a normal answer; its block shows the date", async () => {
+  const root = harness();
+  process.env.OC_INBOX_FILE = path.join(root, "inbox.jsonl");
+  process.env.OC_INBOX_BIN = path.join(REPO, "bin", "oc-inbox");
+  const realNow = Date.now;
+  const T = realNow();
+  const limitUntil = T + 47 * 3600000;
+  fs.writeFileSync(path.join(root, "state", "jobs.json"), JSON.stringify({ version: 1, jobs: {}, claudeLimitedUntil: limitUntil,
+    claudeLimitText: "You've hit your weekly limit · resets Nov 13, 9pm (America/New_York)", claudeLimitedAt: T - 2 * 3600000 }));
+  const telegram = [];
+  globalThis.fetch = async (url, opts = {}) => {
+    if (String(url).startsWith("https://api.telegram.org/")) { telegram.push(JSON.parse(opts.body || "{}")); return { ok: true, json: async () => ({ ok: true, result: { message_id: 7200 } }) }; }
+    return { ok: false, status: 404, json: async () => ({}) };
+  };
+  const handlers = {};
+  const logs = [];
+  const services = [];
+  const api = {
+    pluginConfig: {
+      orchestratorAgent: "coordinator",
+      board: { enabled: false },
+      topics: { enabled: false },
+      mirror: { enabled: true, chatId: "-100", systemTopic: 160, defaultTopic: 160, minIntervalMs: 0, botTokenFiles: { coordinator: path.join(root, "bot.token") } },
+      jobs: { stateFile: path.join(root, "state", "jobs.json"), idleWakeSession: "agent:coordinator:explicit:team-ops", refusal: { enabled: false } },
+      triage: { enabled: false },
+    },
+    logger: { info: (m) => logs.push(m), warn: (m) => logs.push(m), error: (m) => logs.push(m), debug: () => {} },
+    on: (name, fn) => { (handlers[name] = handlers[name] || []).push(fn); },
+    registerService: (s) => services.push(s),
+    registerTool: () => {},
+    runtime: { subagent: { run: async () => ({ runId: "r" }), getSessionMessages: async () => ({ messages: [] }) } },
+  };
+  const entry = (await import(pathToFileURL(path.join(root, "plugin", "index.js")).href)).default;
+  entry.register(api);
+  const realSetInterval = globalThis.setInterval;
+  globalThis.setInterval = () => ({ unref() {} });
+  for (const s of services) if (s.start) s.start();
+  globalThis.setInterval = realSetInterval;
+  const ORC = { agentId: "coordinator", sessionKey: "agent:coordinator:explicit:team-ops", runId: "run-l" };
+  const call = (name, event, ctx) => { let out; for (const h of handlers[name] || []) out = h(event, ctx) ?? out; return out; };
+  const spawn = () => call("before_tool_call", { toolName: "sessions_spawn", params: { agentId: "writer", task: brief("cc33dd44"), label: "shop: price" } }, ORC);
+  try {
+    let r = spawn();
+    assert.equal(r && r.block, true);
+    assert.match(r.blockReason, /usage limit until \w{3}, \d{2} \w{3} \d{2}:\d{2} UTC/, "a limit two days away names the day");
+    // the orchestrator gets a normal answer from Claude
+    call("llm_output", { assistantTexts: ["I checked the board; two items are ready."] }, ORC);
+    await settle();
+    r = spawn();
+    assert.ok(!(r && r.block && /usage limit/.test(r.blockReason)), `still blocked by the old limit: ${r && r.blockReason}`);
+    assert.ok(logs.some((m) => /limit is cleared/.test(m)));
+    assert.ok(await until(() => telegram.some((m) => /recorded usage limit is cleared/.test(m.text || ""))), "the team topic is told");
+    assert.equal(JSON.parse(fs.readFileSync(path.join(root, "state", "jobs.json"), "utf8")).claudeLimitedUntil, 0);
+  } finally {
+    await settle();
+  }
+});
