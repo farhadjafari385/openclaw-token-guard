@@ -1,12 +1,67 @@
 #!/usr/bin/env bash
 # Restart the OpenClaw gateway safely from inside an agent.
-# An agent runs inside the gateway, so `systemctl --user restart` run directly
-# dies with the gateway it is restarting. This hands the restart to a transient
-# systemd timer outside the gateway, so it always completes, and it never stops
-# the gateway without starting it again.
-set -euo pipefail
-delay="${1:-15}"
+# An agent runs inside the gateway, so `systemctl --user restart` run directly dies with the gateway it is
+# restarting. This hands the restart to a transient systemd unit outside the gateway, and that unit restarts only
+# when it is safe:
+# - new tasks are held meanwhile (the maintenance flag, which the guard honours);
+# - running tasks finish first (a restart that cut three running tasks taught this);
+# - a gateway that started less than OC_STARTUP_QUIET_MIN (20) minutes ago finishes its start first (on a slow host
+#   a second restart during a start left agents locked);
+# - a deploy that is running does the restart itself, so this one steps aside.
+# It gives up after OC_RESTART_MAX_WAIT_MIN (90) minutes and never stops the gateway without starting it again.
+set -uo pipefail
+
+STATE="${OC_STATE_DIR:-$HOME/.openclaw/token-guard-state}"
+FLAG="$STATE/maintenance"
+
+running_tasks() {
+  python3 - "$STATE/jobs.json" <<'PY' 2>/dev/null || echo 0
+import json, sys
+d = json.load(open(sys.argv[1]))
+print(sum(1 for j in d.get("jobs", {}).values() if j.get("status") == "running"))
+PY
+}
+
+gateway_age() {
+  local pid
+  pid=$(systemctl --user show -p MainPID --value openclaw-gateway 2>/dev/null)
+  [ -n "$pid" ] && [ "$pid" != "0" ] && ps -o etimes= -p "$pid" 2>/dev/null | tr -d ' '
+}
+
+deploy_running() {
+  ps -eo args 2>/dev/null | grep -v grep | grep -qE '^(/bin/|/usr/bin/)?bash [^ ]*(team-deploy\.sh|run-deploy)( |$)'
+}
+
+if [ "${1:-}" = "--run" ]; then
+  max=$(( ${OC_RESTART_MAX_WAIT_MIN:-90} * 60 ))
+  quiet=$(( ${OC_STARTUP_QUIET_MIN:-20} * 60 ))
+  deadline=$(( $(date +%s) + max ))
+  mkdir -p "$STATE"
+  sleep "${OC_RESTART_FIRST_WAIT:-20}"   # the calling task ends its turn
+  while :; do
+    if deploy_running; then echo "oc-gateway-restart: a deploy is running and restarts the gateway itself; nothing to do"; exit 0; fi
+    touch "$FLAG"
+    n=$(running_tasks); age=$(gateway_age)
+    if [ "${n:-0}" -eq 0 ] && { [ -z "$age" ] || [ "$age" -ge "$quiet" ]; }; then break; fi
+    if [ "$(date +%s)" -ge "$deadline" ]; then
+      echo "oc-gateway-restart: gave up after ${OC_RESTART_MAX_WAIT_MIN:-90} min (running tasks: $n, gateway up ${age:-?} s); not restarting"
+      rm -f "$FLAG"
+      exit 1
+    fi
+    sleep 30
+  done
+  echo "oc-gateway-restart: no task running and the gateway's start is over: restarting"
+  systemctl --user restart openclaw-gateway.service
+  start=$(date +%s)
+  for _ in $(seq 1 60); do
+    journalctl --user -u openclaw-gateway.service --since "@$start" --no-pager 2>/dev/null | grep -q "http server listening" && break
+    sleep 15
+  done
+  rm -f "$FLAG"
+  echo "oc-gateway-restart: done"
+  exit 0
+fi
+
 unit="oc-gateway-restart-$(date +%s)"
-systemd-run --user --quiet --unit="$unit" --on-active="${delay}s" \
-  /usr/bin/systemctl --user restart openclaw-gateway.service
-echo "Gateway restart scheduled in ${delay}s (unit ${unit}). End your turn now; agents are back in about 10 minutes."
+systemd-run --user --quiet --collect --unit="$unit" "$(readlink -f "$0")" --run
+echo "Gateway restart scheduled (unit ${unit}). It holds new tasks, waits for the running ones to finish (and for a recent start to settle), then restarts once. End your turn now; agents are back about 10 minutes after the restart."

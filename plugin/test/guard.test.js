@@ -392,3 +392,17 @@ test("an emulator or virtual machine may not start on the gateway's host; the la
   }
   assert.ok(!blocked(decide(exec(started[0]), SUB, createState(), { blockVmOnHost: false })), "can be switched off"); // fresh state: a repeat of a refused command is refused on its own
 });
+
+test("a task may not rotate an access token through its API (the new value was lost twice)", () => {
+  const s = createState();
+  for (const c of [
+    'curl -sS -X POST -H "PRIVATE-TOKEN: $T" https://gitlab.com/api/v4/personal_access_tokens/self/rotate',
+    "curl -X POST https://gitlab.com/api/v4/personal_access_tokens/123/rotate -d expires_at=2027-01-01",
+    "curl -X POST https://gitlab.com/api/v4/projects/9/access_tokens/77/rotate",
+  ]) {
+    const r = decide(exec(c), SUB, s, {});
+    assert.ok(blocked(r), c);
+    assert.match(r.blockReason, /the operator rotates it/);
+  }
+  assert.ok(!blocked(decide(exec('curl -s -H "PRIVATE-TOKEN: $T" https://gitlab.com/api/v4/personal_access_tokens/self'), SUB, s, {})), "reading a token's details is fine");
+});

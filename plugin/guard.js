@@ -75,7 +75,15 @@ const GATEWAY_CONTROL_REASON =
   "token-guard: blocked a command that stops, restarts or kills the OpenClaw gateway. You run inside the gateway: " +
   "this cuts off your own run and every agent's session, and a stop leaves it down. If a restart is really needed " +
   "(e.g. to load a changed plugin), run `~/.openclaw/bin/oc-gateway-restart` once, as your LAST action, and end your turn; " +
-  "it restarts the gateway safely from outside in 15 seconds. Agents come back after about 10 minutes.";
+  "it holds new tasks, waits for the running ones to finish, then restarts the gateway safely from outside. Agents come back about 10 minutes after the restart.";
+
+// Rotating an access token through its API revokes the old one at once. Twice a task rotated the team's GitLab
+// token and lost the new value before saving it, and the whole team lost GitLab (2026-11-10, 2026-11-11).
+const TOKEN_ROTATE = [/personal_access_tokens\/(self|\d+)\/rotate/, /\/(group|project)_access_tokens\/\d+\/rotate/, /\/access_tokens\/\d+\/rotate/];
+const TOKEN_ROTATE_REASON =
+  "token-guard: blocked rotating an access token through its API. A rotation revokes the old token at once, and twice " +
+  "a task lost the new one before saving it, so the whole team lost GitLab. Do not rotate tokens: say in your RESULT which " +
+  "token leaked and where; the operator rotates it.";
 
 // A virtual machine on the gateway's host. On 2026-11-11 an Android emulator a task started there took the
 // memory; the kernel killed the gateway, and the team answered nothing for 8 hours.
@@ -551,6 +559,7 @@ function decide(event, ctx, state, rawConfig, log, now = Date.now()) {
     const command = typeof params.command === "string" ? params.command : "";
     if (controlsGateway(command)) return block("gatewayControl", GATEWAY_CONTROL_REASON);
     if (cfg.blockVmOnHost && String(params.host || "") !== "node" && startsVm(command)) return block("vmOnHost", VM_REASON);
+    if (TOKEN_ROTATE.some((re) => re.test(command))) return block("tokenRotate", TOKEN_ROTATE_REASON);
     const background = params.background === true;
     const awaitResults = params.awaitResults === true;
 
