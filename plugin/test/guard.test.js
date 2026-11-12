@@ -2,6 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import {
   DEFAULT_CONFIG,
+  capGradle,
   createState,
   decide,
   endRun,
@@ -405,4 +406,19 @@ test("a task may not rotate an access token through its API (the new value was l
     assert.match(r.blockReason, /the operator rotates it/);
   }
   assert.ok(!blocked(decide(exec('curl -s -H "PRIVATE-TOKEN: $T" https://gitlab.com/api/v4/personal_access_tokens/self'), SUB, s, {})), "reading a token's details is fine");
+});
+
+test("a Gradle build gets no daemon and capped memory; everything else is left alone", () => {
+  const caps = "--no-daemon --max-workers=2 -Dorg.gradle.jvmargs=-Xmx1536m -Dkotlin.daemon.jvm.options=-Xmx768m";
+  const s = createState();
+  const r = decide(exec("cd android && ./gradlew assembleRelease bundleRelease"), SUB, s, {});
+  assert.equal(r && r.block, undefined);
+  assert.equal(r.params.command, `cd android && ./gradlew ${caps} assembleRelease bundleRelease`);
+  assert.equal(capGradle('bash -c "gradle build"'), `bash -c "gradle ${caps} build"`);
+  // already capped, a path, a file name, or no Gradle at all: unchanged
+  for (const c of ["./gradlew --no-daemon assembleDebug", "ls ~/.gradle/caches", "cat build.gradle", "npm run build"]) {
+    assert.equal(capGradle(c), c, c);
+  }
+  assert.equal(decide(exec("ls ~/.gradle/caches"), SUB, createState(), {}), undefined);
+  assert.equal(decide(exec("./gradlew assembleRelease"), SUB, createState(), { capGradleBuilds: false }), undefined);
 });
