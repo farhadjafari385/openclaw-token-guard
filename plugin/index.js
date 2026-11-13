@@ -314,12 +314,16 @@ export default definePluginEntry({
     // while the item is still in hand (In progress, Review, QA): moved to Blocked, To do or Done, it
     // is free again.
     const inHand = (id, board) => { const it = board.get(id); return !it || ACTIVE.has(normStatus(it.status)); };
+    // A task over its budget or time may only write its final answer: it holds no item and no agent slot, so a
+    // fresh spawn for its item is accepted at once. (2026-11-13: a reviewer's job stayed "running" for half an
+    // hour after its time was up, and every re-dispatch of its item was refused as "already being worked on".)
+    const holdsWork = (j) => j && j.status === "running" && !j.overBudget && !j.timeUp;
     const runningItemIds = () => {
       const ids = new Set();
       const jobs = Object.values(fresh().jobs);
       let board = null;
       for (const j of jobs) {
-        if (j.status === "running") { for (const id of j.items || []) ids.add(id); continue; }
+        if (j.status === "running") { if (holdsWork(j)) for (const id of j.items || []) ids.add(id); continue; }
         if (!j.waitFor || j.waitFor.done) continue;
         if (!board) { try { board = loadInboxItems(); } catch { board = new Map(); } }
         for (const id of j.items || []) if (inHand(id, board)) ids.add(id);
@@ -331,7 +335,7 @@ export default definePluginEntry({
     // Running tasks per agent, from the shared state (another plugin copy may have started one).
     const runningByAgent = () => {
       const n = {};
-      for (const j of Object.values(fresh().jobs)) if (j && j.status === "running" && j.agentId) n[j.agentId] = (n[j.agentId] || 0) + 1;
+      for (const j of Object.values(fresh().jobs)) if (holdsWork(j) && j.agentId) n[j.agentId] = (n[j.agentId] || 0) + 1;
       return n;
     };
     const queueNow = (inboxItems) => queueState(inboxItems, Object.assign({}, queueCfg, { running: runningByAgent() }));
@@ -354,6 +358,8 @@ export default definePluginEntry({
         const job = store.data.jobs[sessionKey];
         return job && job.status === "running" ? job : null;
       },
+      // Any job by its session key, running or not (a follow-up must not go into a spent session).
+      jobOf: (sessionKey) => fresh().jobs[sessionKey] || null,
       runCalls: (runId) => (runId && orcRunCalls.get(runId)) || 0,
       queue: () => queueNow(loadInboxItems()),
       runningTasks: (agentId) => runningByAgent()[agentId] || 0,
@@ -590,11 +596,13 @@ export default definePluginEntry({
     }));
 
     // The child's run itself ending, with its real outcome (subagent_ended later says "deleted"
-    // when the finished session is cleaned up).
+    // when the finished session is cleaned up). The job ends here at once: its session can run nothing more
+    // (follow-ups go to a fresh session), and waiting for an end event held its item for 10+ minutes.
     api.on("subagent_progress", safe("subagent_progress", (event) => {
       const key = event && event.childSessionKey;
       if (!key || !knowJob(key)) return;
       if (recordProgress(store.data, key, event.phase, event.outcome, Date.now())) { store.touch(); store.save(); }
+      if (event.phase === "ended") endJob(key, event.outcome || "ok", "", Date.now());
     }));
 
     api.on("subagent_ended", safe("subagent_ended", (event) => {
@@ -609,6 +617,7 @@ export default definePluginEntry({
       const job = recordEnd(store.data, key, outcome, error, endedAt);
       if (!job) return;
       store.touch();
+      store.save(); // its item is free from now on (the dispatch check reads the saved state), not after its result is fetched
       const finish = () => {
         store.save();
         const cur = store.data.jobs[key] || job;
