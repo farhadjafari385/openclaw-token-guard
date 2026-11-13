@@ -64,7 +64,6 @@ const DEFAULT_POLICY = {
     defaultRunTimeoutSeconds: 3600,
     allowedModels: [
       "anthropic/claude-opus-5-5",
-      "anthropic/claude-sonnet-5",
       "anthropic/claude-sonnet-5-5",
       "anthropic/claude-haiku-5-5",
     ],
@@ -73,7 +72,7 @@ const DEFAULT_POLICY = {
     // (and add it to allowedModels) to move new tasks to Codex instead.
     codexModel: "",
     allowAcp: false, // sessions_spawn runtime "acp" (external harnesses such as the Codex CLI)
-    claudeFallbackModel: "anthropic/claude-sonnet-5", // when Codex is on and at its limit
+    claudeFallbackModel: "anthropic/claude-sonnet-5-5", // when Codex is on and at its limit
     limitedProviders: ["anthropic"],
   },
 };
@@ -356,13 +355,28 @@ function isClaudeModel(model, policy) {
   return (policy.spawn.limitedProviders || []).includes(provider);
 }
 
+// "claude-sonnet-5-5" -> { family: "sonnet", version: [5, 5] }; null for anything else.
+function modelVersion(model) {
+  const m = /(?:^|\/)(?:claude-)?(opus|sonnet|haiku|fable)-(\d+)(?:[-.](\d+))?(?:$|[^\w])/i.exec(String(model || ""));
+  return m ? { family: m[1].toLowerCase(), version: [Number(m[2]), Number(m[3] || 0)] } : null;
+}
+
 function normaliseModel(model, allowed) {
   const m = String(model || "").trim();
   if (!m) return "";
   if (allowed.includes(m)) return m;
-  // "claude-sonnet-5" and the short "sonnet-5" both name anthropic/claude-sonnet-5
+  // "claude-sonnet-5-5" and the short "sonnet-5-5" both name anthropic/claude-sonnet-5-5
   const hit = allowed.find((a) => a.split("/").pop() === m || a.endsWith("/" + m) || a.split("/").pop() === `claude-${m}`);
-  return hit || null;
+  if (hit) return hit;
+  // An old or retired version of an allowed family runs on the oldest allowed version at or above it (owner,
+  // 2026-11-13: "Sonnet 5.5 or higher; when a version is deprecated, use the next one"). Taking a version out of
+  // allowedModels is all it takes to move every request for it to the next.
+  const want = modelVersion(m);
+  if (!want) return null;
+  const up = allowed.map((a) => ({ a, v: modelVersion(a) }))
+    .filter((x) => x.v && x.v.family === want.family && (x.v.version[0] - want.version[0] || x.v.version[1] - want.version[1]) >= 0)
+    .sort((x, y) => x.v.version[0] - y.v.version[0] || x.v.version[1] - y.v.version[1]);
+  return up.length ? up[0].a : null;
 }
 
 // A brief's own setting line, "Model: <value>" or "Effort: <value>": the colon is required (so "Model

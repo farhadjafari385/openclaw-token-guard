@@ -57,7 +57,7 @@ test("shell writes to protected files are blocked; reads are allowed", () => {
 
 test("OpenClaw config, plugin, cron, secret and model changes are blocked; reads are fine", () => {
   for (const cmd of [
-    "openclaw config set agents.entries.coordinator.model.primary anthropic/claude-sonnet-5",
+    "openclaw config set agents.entries.coordinator.model.primary anthropic/claude-sonnet-5-5",
     "openclaw config patch --file /tmp/p.json", "openclaw plugins reload token-guard", "openclaw cron add --every 10m",
     "openclaw secrets store set X", "openclaw doctor --fix", "openclaw models set x", "sudo chattr -i ~/.openclaw/openclaw.json",
   ]) assert.equal(blocked(policyDecide(exec(cmd), DEVOPS, {}, {})), true, cmd);
@@ -101,11 +101,11 @@ test("the orchestrator cannot do specialist work; read-only checks are fine", ()
 
 test("spawn policy: delete when done, isolated, enough time, allowed models and thinking", () => {
   const spawn = (extra) => ({ toolName: "sessions_spawn", params: { agentId: "devops", task: "Project: demo (/srv/o)\nFix CI", ...extra } });
-  const r = policyDecide(spawn({ model: "claude-sonnet-5", thinking: "LOW", runTimeoutSeconds: 600 }), COORD, {}, {});
+  const r = policyDecide(spawn({ model: "claude-sonnet-5-5", thinking: "LOW", runTimeoutSeconds: 600 }), COORD, {}, {});
   assert.equal(r.params.cleanup, "delete");
   assert.equal(r.params.context, "isolated");
   assert.equal(r.params.runTimeoutSeconds, 3600);
-  assert.equal(r.params.model, "anthropic/claude-sonnet-5");
+  assert.equal(r.params.model, "anthropic/claude-sonnet-5-5");
   assert.equal(r.params.thinking, "low");
   assert.match(r.params.label, /^demo: /);
   assert.equal(policyDecide(spawn({ runTimeoutSeconds: 5400, label: "x" }), COORD, {}, {}).params.runTimeoutSeconds, 5400);
@@ -113,7 +113,7 @@ test("spawn policy: delete when done, isolated, enough time, allowed models and 
   assert.equal(rule(policyDecide(spawn({ thinking: "xhigh" }), COORD, {}, {})), "spawnThinking");
 });
 
-const CODEX_ON = { spawn: { codexModel: "openai/gpt-6-astra", allowedModels: ["anthropic/claude-opus-5-5", "anthropic/claude-sonnet-5", "anthropic/claude-sonnet-5-5", "anthropic/claude-haiku-5-5", "openai/gpt-6-astra"] } };
+const CODEX_ON = { spawn: { codexModel: "openai/gpt-6-astra", allowedModels: ["anthropic/claude-opus-5-5", "anthropic/claude-sonnet-5-5", "anthropic/claude-sonnet-5-5", "anthropic/claude-haiku-5-5", "openai/gpt-6-astra"] } };
 
 test("with Codex turned on (spawn.codexModel), new tasks go to Codex while Claude is limited", () => {
   const now = Date.now();
@@ -209,13 +209,13 @@ test("the brief's Model: and Effort: lines decide the task's model and thinking"
   r = policyDecide(spawn(brief("Model: haiku-5-5\nEffort: low"), { model: "anthropic/claude-opus-5-5", thinking: "high" }), COORD, {}, cfg);
   assert.deepEqual([r.params.model, r.params.thinking], ["anthropic/claude-haiku-5-5", "low"]); // the brief wins
   assert.equal(rule(policyDecide(spawn(brief("Model: openai/gpt-6\nEffort: low")), COORD, {}, cfg)), "spawnModel");
-  assert.equal(rule(policyDecide(spawn(brief("Model: sonnet-5\nEffort: xhigh")), COORD, {}, cfg)), "spawnThinking");
-  assert.equal(policyDecide(spawn(brief("Model: sonnet-5\nEffort: low")), COORD, {}, cfg).params.model, "anthropic/claude-sonnet-5");
+  assert.equal(rule(policyDecide(spawn(brief("Model: sonnet-5-5\nEffort: xhigh")), COORD, {}, cfg)), "spawnThinking");
+  assert.equal(policyDecide(spawn(brief("Model: sonnet-5-5\nEffort: low")), COORD, {}, cfg).params.model, "anthropic/claude-sonnet-5-5");
   assert.equal(policyDecide(spawn(brief("Model: claude-opus-5-5\nEffort: high")), COORD, {}, cfg).params.model, "anthropic/claude-opus-5-5");
   assert.equal(rule(policyDecide(spawn(brief("Model: 5\nEffort: low")), COORD, {}, cfg)), "spawnModel"); // not a model name
   // "Model routing ..." in the text is not a Model: line
-  r = policyDecide(spawn(brief("Model routing policy for wake-ups"), { model: "anthropic/claude-sonnet-5" }), COORD, {}, cfg);
-  assert.equal(r.params.model, "anthropic/claude-sonnet-5");
+  r = policyDecide(spawn(brief("Model routing policy for wake-ups"), { model: "anthropic/claude-sonnet-5-5" }), COORD, {}, cfg);
+  assert.equal(r.params.model, "anthropic/claude-sonnet-5-5");
 });
 
 test("a task pushes only after running its project's checks locally (owner's order)", () => {
@@ -442,4 +442,20 @@ test("finish before adding: the PM adds nothing while the board holds too much o
   assert.equal(policyDecide(add, COORD, ps, cfg), undefined);
   assert.equal(policyDecide(add, PM, ps, { board: { maxOpen: 13 } }), undefined);
   assert.equal(policyDecide(add, PM, ps, {}), undefined); // off unless set
+});
+
+test("an old or retired model version runs on the next allowed version of its family, never below Sonnet 5.5", () => {
+  // Owner 2026-11-13: "Sonnet 5.5 or higher; when the version is deprecated it should use the next version."
+  const spawn = (extra) => ({ toolName: "sessions_spawn", params: { agentId: "devops", task: "Project: demo (/srv/o)\nFix CI", ...extra } });
+  const run = (model, cfg = {}) => policyDecide(spawn({ model, thinking: "low", runTimeoutSeconds: 3600 }), COORD, {}, cfg);
+  assert.equal(run("anthropic/claude-sonnet-5").params.model, "anthropic/claude-sonnet-5-5");
+  assert.equal(run("sonnet-5").params.model, "anthropic/claude-sonnet-5-5");
+  assert.equal(run("claude-sonnet-5-5").params.model, "anthropic/claude-sonnet-5-5");
+  // Sonnet 5.5 retired: take it out of the list and its requests move on to the next version
+  const later = { spawn: { allowedModels: ["anthropic/claude-opus-5-5", "anthropic/claude-sonnet-6", "anthropic/claude-haiku-5-5"] } };
+  assert.equal(run("anthropic/claude-sonnet-5-5", later).params.model, "anthropic/claude-sonnet-6");
+  assert.equal(run("anthropic/claude-sonnet-5", later).params.model, "anthropic/claude-sonnet-6");
+  // never sideways into another family, and never down
+  assert.equal(run("anthropic/claude-sonnet-7", later).block, true);
+  assert.equal(run("anthropic/claude-fable-5-2").block, true);
 });

@@ -270,7 +270,7 @@ test("the project-name contract: only canonical names and their aliases; aliases
   assert.match(bad.blockReason, /Use exactly one of: shop, team/);
   // a brief's Project line follows the same contract
   const spawn = (project) => policyDecide({ toolName: "sessions_spawn", params: { agentId: "writer",
-    task: `Project: ${project} (/srv/shop)\nScope: x\nItems:\na1b2c3d4\nDone when: y\nStop if: z\nModel: sonnet-5\nEffort: low` } },
+    task: `Project: ${project} (/srv/shop)\nScope: x\nItems:\na1b2c3d4\nDone when: y\nStop if: z\nModel: sonnet-5-5\nEffort: low` } },
     ORCH, {}, Object.assign({ board: { requireItems: false } }, P));
   assert.match(spawn("shopsite").params.task, /^Project: shop \(\/srv\/shop\)/);
   assert.equal(spawn("Shop SEO").rule, "unknownProject");

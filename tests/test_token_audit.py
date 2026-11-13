@@ -45,7 +45,7 @@ class TestTokenAudit(unittest.TestCase):
                 "timestamp": ts,
                 "message": {
                     "id": "msg_1",
-                    "model": "claude-sonnet-5",
+                    "model": "claude-sonnet-5-5",
                     "usage": {
                         "input_tokens": 100,
                         "output_tokens": 50,
@@ -62,7 +62,7 @@ class TestTokenAudit(unittest.TestCase):
                 "timestamp": ts,
                 "message": {
                     "id": "msg_1",
-                    "model": "claude-sonnet-5",
+                    "model": "claude-sonnet-5-5",
                     "usage": {
                         "input_tokens": 100,
                         "output_tokens": 50,

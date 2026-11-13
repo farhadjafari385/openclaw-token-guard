@@ -60,7 +60,7 @@ class TestPlan(unittest.TestCase):
     def test_models_added_with_names_and_cap(self):
         models = self.ops(self.config())["models.providers.anthropic.models"]
         self.assertEqual(models["mode"], "set")
-        self.assertEqual([m["id"] for m in models["value"]], ["claude-sonnet-5", "claude-opus-5-5", "claude-haiku-5-5"])
+        self.assertEqual([m["id"] for m in models["value"]], ["claude-sonnet-5-5", "claude-opus-5-5", "claude-haiku-5-5"])
         self.assertTrue(all(m["contextTokens"] == 200000 and m["name"] for m in models["value"]))
 
     def test_existing_models_are_kept_and_replaced_in_full(self):
@@ -116,8 +116,8 @@ class TestPlan(unittest.TestCase):
 
     def test_fallback_added_to_default_and_every_agent_model(self):
         cfg = self.config()
-        cfg["agents"]["defaults"] = {"model": "anthropic/claude-opus-5-5", "subagents": {"model": "anthropic/claude-sonnet-5"}}
-        cfg["agents"]["entries"]["devops"]["model"] = {"primary": "anthropic/claude-sonnet-5", "fallbacks": ["x/y"]}
+        cfg["agents"]["defaults"] = {"model": "anthropic/claude-opus-5-5", "subagents": {"model": "anthropic/claude-sonnet-5-5"}}
+        cfg["agents"]["entries"]["devops"]["model"] = {"primary": "anthropic/claude-sonnet-5-5", "fallbacks": ["x/y"]}
         ops = self.ops(cfg, fallback_model=["openai/gpt-6-astra"])
         self.assertEqual(ops["agents.defaults.model"]["value"],
                          {"primary": "anthropic/claude-opus-5-5", "fallbacks": ["openai/gpt-6-astra"]})
