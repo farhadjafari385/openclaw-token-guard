@@ -693,6 +693,14 @@ function policyDecide(event, ctx, pstate, rawConfig, log, now = Date.now()) {
           "token-guard: work goes to a fresh task session with sessions_spawn, never into an agent's standing chat. " +
           "sessions_send is only for a short follow-up to one of your running tasks (its childSessionKey).");
       }
+      // A session whose run ended or whose budget or time is spent cannot run anything more: a follow-up
+      // there is lost (2026-11-13: a reviewer's spent session got follow-ups and the item deadlocked).
+      const child = pstate && typeof pstate.jobOf === "function" ? pstate.jobOf(target) : null;
+      if (child && (child.status !== "running" || child.overBudget || child.timeUp)) {
+        return block("sendToSpent",
+          "token-guard: that task's session is spent (its run ended, or it used its budget or time) and cannot run anything more. " +
+          "Send the follow-up as a fresh task with sessions_spawn (same item, the follow-up in the brief).");
+      }
     }
   }
 

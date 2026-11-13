@@ -604,7 +604,7 @@ test("a dispatch refused by OpenClaw's login check: the login is checked again a
   }
 });
 
-test("a task whose run ended, then got a follow-up turn, is closed when quiet even without an end event", async () => {
+test("a task whose run ended is closed at once, even without an end event, and its result is posted", async () => {
   const root = harness();
   process.env.OC_INBOX_FILE = path.join(root, "inbox.jsonl");
   process.env.OC_INBOX_BIN = path.join(REPO, "bin", "oc-inbox");
@@ -653,20 +653,11 @@ test("a task whose run ended, then got a follow-up turn, is closed when quiet ev
       { agentId: "coordinator", sessionKey: "agent:coordinator:explicit:team-ops", runId: "run-f" });
     call("subagent_spawned", { childSessionKey: child, agentId: "writer", label: "shop: follow-up" }, { requesterSessionKey: "agent:coordinator:explicit:team-ops" });
     assert.ok(await until(() => job() && job().status === "running"));
-    // the spawned run ends; the orchestrator then sends it a follow-up, which answers; no subagent_ended comes
+    // the spawned run answers and ends; no subagent_ended comes: closed at once like a normal end
+    call("agent_end", { messages: [{ role: "assistant", content: [{ type: "text", text: "Done.\n\nRESULT: done\n- the price renders" }] }] }, { sessionKey: child, agentId: "writer" });
     call("subagent_progress", { childSessionKey: child, phase: "ended", outcome: "ok" }, {});
-    call("agent_end", { messages: [{ role: "assistant", content: [{ type: "text", text: "Follow-up done.\n\nRESULT: done\n- the price renders" }] }] }, { sessionKey: child, agentId: "writer" });
-    // still in its quiet margin: not closed
-    skew += 9 * 60000;
-    tick();
-    await settle();
-    assert.equal(job().status, "running");
-    // quiet for longer than the margin: closed like a normal end, and its result is posted
-    skew += 2 * 60000;
-    tick();
-    assert.ok(await until(() => job().status === "ended"), "the quiet task was not closed");
+    assert.equal(job().status, "ended", "the task was not closed when its run ended");
     assert.equal(job().outcome, "ok");
-    assert.ok(logs.some((m) => /run ended without an end event/.test(m)));
     assert.ok(await until(() => telegram.some((m) => /price renders/.test(m.text || ""))), "its result was not posted");
     const posts = telegram.length;
     // a late subagent_ended changes nothing and posts nothing twice
@@ -1068,5 +1059,87 @@ test("a Claude limit recorded for two days is cleared once the orchestrator gets
     assert.equal(runs.filter((r) => /^\[limit\]/.test(r.message || "")).length, 1, "no wake without a limit to clear");
   } finally {
     await settle();
+  }
+});
+
+// 2026-11-13 (item 8ae2e657): a reviewer's job (b28291) stayed "running" after its time was up and after its run
+// ended, so a fresh dispatch for its item was refused as "already being worked on" for half an hour, and a
+// follow-up through sessions_send landed in the spent session, which can no longer run anything.
+test("a spent task releases its item at once: a fresh spawn is accepted, follow-ups go to a fresh session", async () => {
+  const root = harness();
+  process.env.OC_INBOX_FILE = path.join(root, "inbox.jsonl");
+  process.env.OC_INBOX_BIN = path.join(REPO, "bin", "oc-inbox");
+  const A = board(root, "add", "--project", "shop", "--title", "Review the checkout MR", "--owner", "reviewer", "--done-when", "merged", "--by", "system");
+  board(root, "set", A, "--status", "todo", "--by", "system");
+  globalThis.fetch = async (url, opts = {}) => (String(url).startsWith("https://api.telegram.org/")
+    ? { ok: true, json: async () => ({ ok: true, result: { message_id: 7000 } }) }
+    : { ok: false, status: 404, json: async () => ({}) });
+  const handlers = {};
+  const logs = [];
+  const services = [];
+  const api = {
+    pluginConfig: {
+      orchestratorAgent: "coordinator",
+      board: { enabled: true, requireItems: true, agent: "product", wip: 1, view: false },
+      topics: { enabled: false },
+      mirror: { enabled: true, chatId: "-100", systemTopic: 160, defaultTopic: 160, minIntervalMs: 0,
+        botTokenFiles: Object.fromEntries(["coordinator", "reviewer", "product"].map((a) => [a, path.join(root, "bot.token")])) },
+      jobs: { stateFile: path.join(root, "state", "jobs.json"), idleWakeSession: "agent:coordinator:explicit:team-ops", refusal: { enabled: false }, budgetCalls: 3 },
+      triage: { enabled: false },
+    },
+    logger: { info: (m) => logs.push(m), warn: (m) => logs.push(m), error: (m) => logs.push(m), debug: () => {} },
+    on: (name, fn) => { (handlers[name] = handlers[name] || []).push(fn); },
+    registerService: (s) => services.push(s),
+    registerTool: () => {},
+    runtime: { subagent: { run: async () => ({ runId: "r" }), getSessionMessages: async () => ({ messages: [] }), deleteSession: async () => ({}) } },
+  };
+  const entry = (await import(pathToFileURL(path.join(root, "plugin", "index.js")).href)).default;
+  entry.register(api);
+  const realSetInterval = globalThis.setInterval;
+  globalThis.setInterval = () => ({ unref() {} });
+  for (const s of services) if (s.start) s.start();
+  globalThis.setInterval = realSetInterval;
+  const realNow = Date.now;
+  let skew = 11 * 60000;
+  Date.now = () => realNow() + skew;
+  const call = (name, event, ctx) => { let out; for (const h of handlers[name] || []) out = h(event, ctx) ?? out; return out; };
+  const ORC = { agentId: "coordinator", sessionKey: "agent:coordinator:explicit:team-ops", runId: "run-s" };
+  const jobs = () => JSON.parse(fs.readFileSync(path.join(root, "state", "jobs.json"), "utf8")).jobs;
+  const spawn = (n) => call("before_tool_call", { toolName: "sessions_spawn", params: { agentId: "reviewer", task: brief(A, `Model: sonnet-5\nEffort: low\nTry ${n}.`), label: `shop: review ${n}` } }, ORC);
+  const start = (child, n) => {
+    const r = spawn(n);
+    assert.ok(!(r && r.block), `dispatch ${n} refused: ${r && r.blockReason}`);
+    call("subagent_spawned", { childSessionKey: child, agentId: "reviewer", label: `shop: review ${n}` }, { requesterSessionKey: ORC.sessionKey });
+  };
+  try {
+    // 1. the budget: the 4th tool call spends it; the item is free again at once
+    const c1 = "agent:reviewer:subagent:s1";
+    start(c1, 1);
+    let r = spawn("1b");
+    assert.match((r && r.blockReason) || "", /already being worked on/, "a working task must still hold its item");
+    for (let i = 0; i < 4; i++) call("before_tool_call", { toolName: "exec", params: { command: "git status" } }, { agentId: "reviewer", sessionKey: c1, runId: "c1" });
+    assert.equal(jobs()[c1].overBudget, true);
+    // a follow-up into the spent session is refused: it goes to a fresh session
+    r = call("before_tool_call", { toolName: "sessions_send", params: { sessionKey: c1, message: "also check the tests" } }, ORC);
+    assert.equal(r && r.block, true, "a follow-up into a spent session was let through");
+    assert.match(r.blockReason, /sessions_spawn/);
+    // 2. its run ends: the job is ended at once (no quiet wait), and a fresh spawn is accepted
+    call("subagent_progress", { childSessionKey: c1, phase: "ended", outcome: "ok" }, {});
+    assert.equal(jobs()[c1].status, "ended", "the job stayed running after its run ended");
+    start("agent:reviewer:subagent:s2", 2);
+    // 3. near the time limit: the item is released for a fresh spawn at once
+    skew += 56 * 60000;
+    call("before_tool_call", { toolName: "exec", params: { command: "ls" } }, { agentId: "reviewer", sessionKey: "agent:reviewer:subagent:s2", runId: "c2" });
+    assert.equal(jobs()["agent:reviewer:subagent:s2"].timeUp, true);
+    start("agent:reviewer:subagent:s3", 3);
+    // a run that times out is ended at once too
+    call("subagent_progress", { childSessionKey: "agent:reviewer:subagent:s2", phase: "ended", outcome: "timeout" }, {});
+    assert.equal(jobs()["agent:reviewer:subagent:s2"].status, "ended");
+    assert.equal(jobs()["agent:reviewer:subagent:s2"].outcome, "timeout");
+    // a follow-up to a task that is still working is fine
+    r = call("before_tool_call", { toolName: "sessions_send", params: { sessionKey: "agent:reviewer:subagent:s3", message: "one more thing" } }, ORC);
+    assert.ok(!(r && r.block), `a follow-up to a working task was refused: ${r && r.blockReason}`);
+  } finally {
+    Date.now = realNow;
   }
 });
