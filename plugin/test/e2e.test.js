@@ -37,7 +37,7 @@ const settle = () => new Promise((r) => setTimeout(r, 600)); // board moves run 
 // Wait (up to 10 s) for something asynchronous: a board move through the CLI, a post through the queue.
 const until = async (check, ms = 10000) => { const end = Date.now() + ms; while (!check() && Date.now() < end) await new Promise((r) => setTimeout(r, 100)); return check(); };
 
-const brief = (id, extra = "Model: sonnet-5\nEffort: low") =>
+const brief = (id, extra = "Model: sonnet-5-5\nEffort: low") =>
   `Project: shop (/srv/shop)\nScope: in: the checkout page only; out: everything else. ${"Context for the worker. ".repeat(20)}\n` +
   `Items:\n- ${id}\nDone when: the page renders the price and the tests pass\nStop if: it needs a production change\n${extra}`;
 
@@ -125,7 +125,7 @@ test("one item flows through the team: queue, brief, checks, CI watch, next gate
     // 3. the head of the queue starts, on the brief's model and effort
     r = spawn(brief(A));
     assert.ok(r && !r.block, `dispatch of the head refused: ${r && r.blockReason}`);
-    assert.equal(r.params.model, "anthropic/claude-sonnet-5");
+    assert.equal(r.params.model, "anthropic/claude-sonnet-5-5");
     assert.equal(r.params.thinking, "low");
     assert.match(r.params.task, /Code map \(required before you search or read code\): graphify query .* --graph .*\/graphs\/shop\/graphify-out\/graph.json/);
     const child = "agent:writer:subagent:t1";
@@ -360,7 +360,7 @@ test("two plugin copies: a CI wait ended by one copy does not leave the item loc
   let skew = 11 * 60000;
   Date.now = () => realNow() + skew;
   const ORC = { agentId: "coordinator", sessionKey: "agent:coordinator:telegram:group:-100:topic:151", runId: "run-1" };
-  const spawn = (id, n) => old.call("before_tool_call", { toolName: "sessions_spawn", params: { agentId: "writer", task: brief(id, `Model: sonnet-5\nEffort: low\nRun ${n}.`), label: `shop: ${n}` } }, ORC);
+  const spawn = (id, n) => old.call("before_tool_call", { toolName: "sessions_spawn", params: { agentId: "writer", task: brief(id, `Model: sonnet-5-5\nEffort: low\nRun ${n}.`), label: `shop: ${n}` } }, ORC);
   const pushAndWait = async (id, n, mr) => {
     const r = spawn(id, n);
     assert.ok(r && !r.block, `dispatch of ${id} refused: ${r && r.blockReason}`);
@@ -754,7 +754,7 @@ test("a CI wait on an MR with no pipeline lets go of the item after a short wait
     tick();
     await settle();
     assert.equal(job().waitFor.done, undefined);
-    r = call("before_tool_call", { toolName: "sessions_spawn", params: { agentId: "reviewer", task: brief(A, "Model: sonnet-5\nEffort: low\nReview and merge."), label: "shop: review" } }, ORC);
+    r = call("before_tool_call", { toolName: "sessions_spawn", params: { agentId: "reviewer", task: brief(A, "Model: sonnet-5-5\nEffort: low\nReview and merge."), label: "shop: review" } }, ORC);
     assert.equal(r && r.block, true);
     assert.match(r.blockReason, /already being worked on/);
     // past it: the watch lets go and the orchestrator is told to dispatch the next gate
@@ -763,7 +763,7 @@ test("a CI wait on an MR with no pipeline lets go of the item after a short wait
     assert.ok(await until(() => job().waitFor.done), "the watch never let go of an MR with no pipeline");
     assert.equal(job().waitFor.done.state, "no pipeline");
     assert.ok(await until(() => runs.some((p) => /^\[ci\]/.test(p.message || "") && /no pipeline/.test(p.message) && /dispatch the next gate/.test(p.message))), "the orchestrator was not told");
-    r = call("before_tool_call", { toolName: "sessions_spawn", params: { agentId: "reviewer", task: brief(A, "Model: sonnet-5\nEffort: low\nReview and merge, take two."), label: "shop: review" } }, ORC);
+    r = call("before_tool_call", { toolName: "sessions_spawn", params: { agentId: "reviewer", task: brief(A, "Model: sonnet-5-5\nEffort: low\nReview and merge, take two."), label: "shop: review" } }, ORC);
     assert.ok(!(r && r.block), `the next gate is still refused: ${r && r.blockReason}`);
     // the triage's budget is spent: the plain idle wake now covers open work with nothing running
     const idleWakes = () => runs.filter((p) => /^\[job-tracker\] There is open work/.test(p.message || ""));

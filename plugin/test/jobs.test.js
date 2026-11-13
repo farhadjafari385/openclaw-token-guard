@@ -148,10 +148,10 @@ test("mirror: topics, formatting, and posting through the right bot", async () =
   assert.equal(topicFor(cfg, "the openclaw-ui repo", null), 2715);
   assert.equal(topicFor(cfg, "unknown", 777), 777);
   assert.equal(topicFor(cfg, "unknown", null), 160);
-  const job = { agentId: "devops", label: "demo: fix CI", short: "abc123", model: "anthropic/claude-sonnet-5", thinking: "low", doneWhen: "pipeline green", outcome: "ok", spawnedAt: 0, endedAt: 5 * MIN, resultText: "RESULT: done" };
+  const job = { agentId: "devops", label: "demo: fix CI", short: "abc123", model: "anthropic/claude-sonnet-5-5", thinking: "low", doneWhen: "pipeline green", outcome: "ok", spawnedAt: 0, endedAt: 5 * MIN, resultText: "RESULT: done" };
   const voiceCfg = Object.assign({}, cfg, { agentHandles: { devops: "devops_bot", coordinator: "orc_bot" } });
   assert.equal(formatDispatch(voiceCfg, Object.assign({ key: "k", items: ["ab12cd34"] }, job)).split("\n").slice(1).join("\n"),
-    "<b>Fix CI</b>\nDone when: pipeline green\n<i>ab12cd34 · Sonnet 5 · low effort</i>");
+    "<b>Fix CI</b>\nDone when: pipeline green\n<i>ab12cd34 · Sonnet 5.5 · low effort</i>");
   assert.match(formatDispatch(voiceCfg, job), /^@devops_bot /);
   assert.match(formatResult(voiceCfg, job, "done", [{ id: "ab12cd34", to: "review" }]), /^@orc_bot ✅ Done \(5 min\)\.[\s\S]*<i>Board: ab12cd34 → Review<\/i>$/);
   const calls = [];

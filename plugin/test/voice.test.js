@@ -88,7 +88,7 @@ test("dispatch, acknowledgement and process notes read like a team", () => {
   assert.match(stallText(CFG, job, 31), /^@orc_bot no activity from @devops_bot on <b>Fix CI cache<\/b> for 31 min/);
   assert.equal(titleOf("ai: research vector DBs"), "Research vector DBs");
   assert.equal(modelName("openai/gpt-6-astra"), "GPT-6 Astra");
-  assert.equal(modelName("anthropic/claude-sonnet-5"), "Sonnet 5");
+  assert.equal(modelName("anthropic/claude-sonnet-5-5"), "Sonnet 5.5");
   assert.equal(handleOf(CFG, "writer"), "writer");
   assert.equal(handleOf(CFG, "devops"), "@devops_bot");
   assert.match(guardText(CFG, "protectedFile", { agentId: "devops", tool: "exec" }), /^🛡 Guard stopped @devops_bot: changing a protected file/);
