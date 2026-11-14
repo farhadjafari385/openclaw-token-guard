@@ -545,6 +545,30 @@ function lastAssistantText(messages) {
   return "";
 }
 
+// Tasks in a row on one item that moved nothing (2026-11-14: 631 tasks on 88 open items; a small item took 33, mostly
+// "blocked" and "partly", while 19 items were never started). Counted newest first, back to the last result that
+// made progress, within `windowMs`, and only since the item's last move whose note starts "Rescoped:" or
+// "Operator:" (the item was split or its blocker removed). A task cut off by a restart counts neither way.
+const PROGRESS_RESULTS = new Set(["done", "waiting", "pass", "passed", "merged", "approve", "approved", "changes"]);
+const STREAK_RESET = /^\s*(rescoped|operator)\b/i;
+function noProgressStreak(jobs, id, item, now = Date.now(), windowMs = 48 * 3600000) {
+  let since = now - windowMs;
+  for (const h of (item && item.history) || []) {
+    const t = Date.parse(h && h.ts);
+    if (STREAK_RESET.test(String((h && h.note) || "")) && Number.isFinite(t) && t > since) since = t;
+  }
+  const mine = (jobs || []).filter((j) => j && j.status !== "running" && (j.items || []).includes(id) && (j.spawnedAt || 0) > since)
+    .sort((a, b) => (b.spawnedAt || 0) - (a.spawnedAt || 0));
+  let n = 0;
+  for (const j of mine) {
+    if (j.outcome === "killed" || j.outcome === "lost") continue;
+    const m = /RESULT:\s*(\w+)/i.exec(String(j.resultText || ""));
+    if (m && PROGRESS_RESULTS.has(m[1].toLowerCase())) break;
+    n += 1;
+  }
+  return n;
+}
+
 export {
   DEFAULT_JOBS,
   mergeJobsConfig,
@@ -570,4 +594,5 @@ export {
   setCodexLimited,
   scanJobs,
   lastAssistantText,
+  noProgressStreak,
 };

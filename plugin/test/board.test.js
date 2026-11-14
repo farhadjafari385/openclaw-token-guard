@@ -277,3 +277,38 @@ test("the project-name contract: only canonical names and their aliases; aliases
   // without a projects list (a plain install) nothing is enforced
   assert.equal(policyDecide({ toolName: "task_inbox", params: { action: "add", project: "anything", title: "x y z" } }, ORCH, {}, {}), undefined);
 });
+
+// 2026-11-14: 631 tasks on 88 open items; a small item took 33 (mostly "blocked" and "partly"), 19 were never started.
+test("an item stuck in tasks that move nothing is refused and skipped in the queue until it is re-scoped", async () => {
+  const { noProgressStreak } = await import("../jobs.js");
+  const now = Date.parse("2026-11-14T15:00:00Z");
+  const job = (h, result, extra = {}) => Object.assign({ items: ["c0ffee01"], status: "ended", spawnedAt: now - h * 3600000, resultText: `x\n\nRESULT: ${result}\n- y` }, extra);
+  const item = { id: "c0ffee01", history: [] };
+  const jobs = [job(9, "done"), job(5, "blocked"), job(4, "partly"), job(3, "blocked", { outcome: "killed" }), job(2, "failed")];
+  assert.equal(noProgressStreak(jobs, "c0ffee01", item, now), 3, "three in a row after the last progress; the one cut off by a restart does not count");
+  assert.equal(noProgressStreak([...jobs, job(1, "waiting")], "c0ffee01", item, now), 0, "a pushed MR is progress");
+  assert.equal(noProgressStreak([...jobs, job(0.5, "blocked", { status: "running" })], "c0ffee01", item, now), 3, "a running task is not a result yet");
+  assert.equal(noProgressStreak(jobs, "c0ffee01", item, now + 50 * 3600000), 0, "old attempts age out");
+  const rescoped = { id: "c0ffee01", history: [{ ts: new Date(now - 2.5 * 3600000).toISOString(), to: "todo", note: "Rescoped: split into 3 small items" }] };
+  assert.equal(noProgressStreak(jobs, "c0ffee01", rescoped, now), 1, "only attempts after the re-scope count");
+  const operator = { id: "c0ffee01", history: [{ ts: new Date(now - 60000).toISOString(), to: "todo", note: "Operator: the browser is fixed" }] };
+  assert.equal(noProgressStreak(jobs, "c0ffee01", operator, now), 0);
+
+  const items = new Map([
+    ["c0ffee01", { id: "c0ffee01", project: "demo", status: "todo", rank: 1, owner: "writer", title: "stuck one", history: [] }],
+    ["c0ffee02", { id: "c0ffee02", project: "demo", status: "todo", rank: 2, owner: "writer", title: "never tried", history: [] }],
+  ]);
+  const stuck = (it) => noProgressStreak(jobs, it.id, it, now) >= 3;
+  assert.deepEqual(queueState(items, { wip: 10, stuck }).next.map((i) => i.id), ["c0ffee02"], "the queue moves on to work that can finish");
+  const ps = { boardItems: () => items, runningItemIds: () => new Set(), runningTasks: () => 0,
+    queue: () => queueState(items, { wip: 10, stuck }), noProgressStreak: (id, it) => noProgressStreak(jobs, id, it, now) };
+  const spawn = (id) => ({ toolName: "sessions_spawn", params: { agentId: "writer", task: `Project: demo (/srv/demo)\nScope: x\nItems:\n${id}\nDone when: tests pass\nStop if: y` } });
+  const cfg = Object.assign({}, CFG, { board: { wip: 10 } });
+  const r = policyDecide(spawn("c0ffee01"), COORD, ps, cfg);
+  assert.equal(r.rule, "loopBreak");
+  assert.match(r.blockReason, /3 tasks in a row that moved nothing/);
+  assert.match(r.blockReason, /split it into small items/);
+  assert.match(r.blockReason, /Rescoped:/);
+  assert.equal(policyDecide(spawn("c0ffee02"), COORD, ps, cfg).params.cleanup, "delete", "other work starts");
+  assert.equal(policyDecide(spawn("c0ffee01"), COORD, ps, Object.assign({}, CFG, { board: { wip: 10, maxNoProgress: 0 } })).rule, "queueOrder", "0 turns the check off");
+});

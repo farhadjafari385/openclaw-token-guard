@@ -8,7 +8,7 @@ import { correctTopic, isGeneral, projectOfTopic, projectsMentioned } from "./to
 import { isLimitError, isLimitReply, isRunFailureReply, allowLimitReply, limitResetAt } from "./limits.js";
 import {
   createJobStore, mergeJobsConfig, recordSpawn, recordActivity, recordUsage, recordCall, callBudget, recordTime, recordCheck, recordGraph, recordResultText, finalAnswer, missingProof,
-  recordEnd, recordProgress, setClaudeLimited, clearClaudeLimited, setCodexLimited, scanJobs, lastAssistantText,
+  recordEnd, recordProgress, setClaudeLimited, clearClaudeLimited, setCodexLimited, scanJobs, lastAssistantText, noProgressStreak,
 } from "./jobs.js";
 import { createMirror, topicFor, messageIdOf } from "./mirror.js";
 import { secretDecide, findSecret, redactDeep } from "./secrets.js";
@@ -350,7 +350,13 @@ export default definePluginEntry({
       for (const j of Object.values(fresh().jobs)) if (holdsWork(j) && j.agentId) n[j.agentId] = (n[j.agentId] || 0) + 1;
       return n;
     };
-    const queueNow = (inboxItems) => queueState(inboxItems, Object.assign({}, queueCfg, { running: runningByAgent() }));
+    const maxNoProgress = boardCfg.maxNoProgress === undefined ? 3 : Number(boardCfg.maxNoProgress) || 0;
+    const streakOf = (id, item, jobs) => noProgressStreak(jobs || Object.values(fresh().jobs), id, item, Date.now());
+    const queueNow = (inboxItems) => {
+      const jobs = maxNoProgress > 0 ? Object.values(fresh().jobs) : null; // read once for the whole queue
+      return queueState(inboxItems, Object.assign({}, queueCfg, { running: runningByAgent(),
+        stuck: jobs ? (it) => streakOf(it.id, it, jobs) >= maxNoProgress : null }));
+    };
     const orcRunCalls = new Map(); // orchestrator run id -> tool calls so far
     const countOrcCall = (runId) => {
       if (!runId) return;
@@ -375,6 +381,7 @@ export default definePluginEntry({
       runCalls: (runId) => (runId && orcRunCalls.get(runId)) || 0,
       queue: () => queueNow(loadInboxItems()),
       runningTasks: (agentId) => runningByAgent()[agentId] || 0,
+      noProgressStreak: (id, item) => streakOf(id, item),
       onBlock: (rule, info) => {
         if (["protectedFile", "protectedConfig", "backChannel", "spawnByWorker", "sendByWorker", "orchestratorOnly", "modelPin"].includes(rule)) {
           systemNote(`${rule}:${info.agentId}`, guardText(voice, rule, info), { html: true });
