@@ -31,6 +31,16 @@
       "enabled": {
         "type": "boolean"
       },
+      "secrets": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "enabled": { "type": "boolean" },
+          "dir": { "type": "string" },
+          "allowCommands": { "type": "array", "items": { "type": "string" } },
+          "scanPush": { "type": "boolean" }
+        }
+      },
       "dedupeWindowMs": {
         "type": "integer",
         "minimum": 0
