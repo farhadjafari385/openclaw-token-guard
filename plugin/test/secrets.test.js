@@ -45,6 +45,17 @@ test("refuses a Telegram message that carries a secret", () => {
   assert.equal(decide("message", { action: "send", message: "the key is in the secrets folder" }), undefined);
 });
 
+test("refuses an orchestrator brief that carries a password (2026-11-12: a site login went into two briefs posted to the team topic)", () => {
+  const ORC = { agentId: "coordinator", sessionKey: "agent:coordinator:explicit:team-ops" };
+  const brief = `Project: ai\nItems: aa11bb22\nLog in to the shop account with user acme_shop, password ${PASSWORD}, then post.`;
+  const r = secretDecide({ toolName: "sessions_spawn", params: { agentId: "social", task: brief } }, ORC, CFG);
+  assert.equal(r.block, true);
+  assert.equal(r.rule, "secretOutbound");
+  assert.doesNotMatch(r.blockReason, new RegExp(PASSWORD.replace(/[!#]/g, "\\$&")));
+  const named = "Project: ai\nItems: aa11bb22\nLog in to the shop account; the login is in the secrets file shop-logins (use it through a consumer that never prints it).";
+  assert.equal(secretDecide({ toolName: "sessions_spawn", params: { agentId: "social", task: named } }, ORC, CFG), undefined);
+});
+
 test("refuses a browser fill, type or evaluate that carries a secret", () => {
   const fill = decide("browser", { action: "act", profile: "laptop", request: { kind: "fill", fields: [{ ref: "e12", type: "textbox", value: PASSWORD }] } });
   assert.equal(fill.block, true);
