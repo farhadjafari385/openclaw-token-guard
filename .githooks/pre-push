@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Refuse to push secrets or the owner's private identifiers.
 # Secret patterns are built in; private identifiers come from a local file that is never committed:
+# Only commit:file:line is printed, never the matched text: the hook must not leak what it catches.
 #   ~/.config/openclaw-privacy-patterns  (one regex per line, # comments)
 set -u
 SECRET='ghp_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|glpat-[A-Za-z0-9_-]{10,}|sk-[A-Za-z0-9]{20,}|[0-9]{8,10}:AA[A-Za-z0-9_-]{30,}|BEGIN [A-Z ]*PRIVATE KEY|xox[bp]-[A-Za-z0-9-]+|AKIA[0-9A-Z]{16}'
@@ -12,8 +13,8 @@ while read -r local_ref local_sha remote_ref remote_sha; do
   [ "$local_sha" = "0000000000000000000000000000000000000000" ] && continue
   if [ "$remote_sha" = "0000000000000000000000000000000000000000" ]; then range="$local_sha"; else range="$remote_sha..$local_sha"; fi
   for c in $(git rev-list "$range"); do
-    if git grep -nI -E "$SECRET" "$c" -- . >/dev/null 2>&1; then echo "pre-push: secret-like value in $c:"; git grep -nI -E "$SECRET" "$c" -- . | cut -c1-120 | head -5; fail=1; fi
-    if [ -n "$PRIVATE" ] && git grep -nI -E "$PRIVATE" "$c" -- . >/dev/null 2>&1; then echo "pre-push: private identifier in $c:"; git grep -nI -E "$PRIVATE" "$c" -- . | cut -c1-120 | head -5; fail=1; fi
+    if git grep -nI -E "$SECRET" "$c" -- . >/dev/null 2>&1; then echo "pre-push: secret-like value in $c:"; git grep -nI -E "$SECRET" "$c" -- . | cut -d: -f1-3 | head -5; fail=1; fi
+    if [ -n "$PRIVATE" ] && git grep -nI -E "$PRIVATE" "$c" -- . >/dev/null 2>&1; then echo "pre-push: private identifier in $c:"; git grep -nI -E "$PRIVATE" "$c" -- . | cut -d: -f1-3 | head -5; fail=1; fi
     if git log -1 --format=%B "$c" | grep -qE "$SECRET${PRIVATE:+|$PRIVATE}"; then echo "pre-push: secret or private identifier in the message of $c"; fail=1; fi
   done
 done

@@ -11,6 +11,7 @@ import {
   recordEnd, recordProgress, setClaudeLimited, clearClaudeLimited, setCodexLimited, scanJobs, lastAssistantText,
 } from "./jobs.js";
 import { createMirror, topicFor, messageIdOf } from "./mirror.js";
+import { secretDecide, findSecret, redactDeep } from "./secrets.js";
 import {
   dispatchText, ackText, resultText, guardText, limitText, budgetText, approvalAskText, approvalReplyText,
   auditText, movedText, mdToHtml, handleOf, boardReplyText, spawnErrorText, nameOf,
@@ -484,6 +485,9 @@ export default definePluginEntry({
             const task = completeBrief(event.params.task, loadInboxItems());
             if (task !== event.params.task) base = Object.assign({}, event, { params: Object.assign({}, event.params, { task }) });
           }
+          // Secrets first, for every agent: nothing carries a secret out, nothing prints the secrets folder.
+          const sec = secretDecide(base, ctx, cfg, log);
+          if (sec && sec.block) return { block: true, blockReason: sec.blockReason };
           const pol = policyDecide(base, ctx, pstate, cfg, log, now);
           if (pol && pol.block) return { block: true, blockReason: pol.blockReason };
           const rewritten = pol && pol.params ? Object.assign({}, base, { params: pol.params }) : base;
@@ -641,6 +645,32 @@ export default definePluginEntry({
         .catch(() => {})
         .finally(finish);
     };
+
+    // ---- secrets: no message, reply or transcript keeps a secret value ----
+    api.on("message_sending", safe("message_sending:secrets", (event, ctx) => {
+      const hit = findSecret(event && event.content, cfg);
+      if (!hit) return undefined;
+      log("warn", "token-guard refused a message that contains a secret", { secret: hit.name, to: event.to, threadId: event.threadId, agentId: ctx && ctx.agentId });
+      return { cancel: true, cancelReason: `token-guard: the message contains a secret (${hit.name}); it was not sent` };
+    }), { priority: 100 });
+    api.on("reply_payload_sending", safe("reply_payload_sending:secrets", (event, ctx) => {
+      const payload = (event && event.payload) || {};
+      const hit = findSecret(JSON.stringify(payload), cfg);
+      if (!hit) return undefined;
+      log("warn", "token-guard refused a reply that contains a secret", { secret: hit.name, sessionKey: ctx && ctx.sessionKey });
+      return { cancel: true };
+    }), { priority: 100 });
+    // Sync hooks: a secret printed by a tool or written by a model is stored as [REDACTED:<name>].
+    api.on("tool_result_persist", safe("tool_result_persist:secrets", (event) => {
+      const message = event && event.message;
+      const out = redactDeep(message, cfg);
+      return out !== message ? { message: out } : undefined;
+    }), { priority: 100 });
+    api.on("before_message_write", safe("before_message_write:secrets", (event) => {
+      const message = event && event.message;
+      const out = redactDeep(message, cfg);
+      return out !== message ? { message: out } : undefined;
+    }), { priority: 100 });
 
     // ---- topics: a reply that belongs in another topic is cancelled and reposted there ----
     const pointed = new Set();
