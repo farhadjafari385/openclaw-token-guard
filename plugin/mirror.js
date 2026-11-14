@@ -23,6 +23,9 @@ const DEFAULT_MIRROR = {
   ownerName: "",
   pmAgent: "product",
   acks: true, // the worker's bot replies "On it" to its dispatch
+  // Results only: no dispatch post (the result names its task), and no "CI is running" interim result. 2026-11-14: the
+  // owner got ~860 team messages a day, three per task (dispatch, "On it", result), and could not see what was delivered.
+  resultsOnly: false,
 };
 
 function expandHome(p) {
