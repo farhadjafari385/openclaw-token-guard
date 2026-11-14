@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import os from "node:os";
 import { dispatchText, resultText, htmlToPlain, clip } from "./voice.js";
+import { redactText } from "./secrets.js";
 
 // Mirrors team activity into the Telegram group with the Bot API: dispatches,
 // acknowledgements, results and process notes, written as a threaded team
@@ -145,7 +146,8 @@ function createMirror({ cfg, log, fetchImpl = globalThis.fetch, readFile = (p) =
   // html: the text is Telegram HTML. replyTo: the message id this one answers (same topic).
   function post({ agentId, accountId, topic, text, html = false, replyTo = null }) {
     if (!text) return Promise.resolve(null);
-    const body = { text: clip(text, 4000), disable_web_page_preview: true };
+    // A worker's result is posted as written: a secret in it is replaced before it reaches Telegram.
+    const body = { text: clip(redactText(text), 4000), disable_web_page_preview: true };
     if (html) body.parse_mode = "HTML";
     const thread = resolveTopic(topic);
     if (thread && thread > 1) body.message_thread_id = thread;
@@ -156,7 +158,7 @@ function createMirror({ cfg, log, fetchImpl = globalThis.fetch, readFile = (p) =
   }
 
   function edit({ agentId, messageId, text }) {
-    return call(agentId || "coordinator", "editMessageText", { message_id: messageId, text: clip(text, 4000), disable_web_page_preview: true });
+    return call(agentId || "coordinator", "editMessageText", { message_id: messageId, text: clip(redactText(text), 4000), disable_web_page_preview: true });
   }
 
   function pin({ agentId, messageId }) {
