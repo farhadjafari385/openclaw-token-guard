@@ -8,7 +8,7 @@ import { correctTopic, isGeneral, projectOfTopic, projectsMentioned } from "./to
 import { isLimitError, isLimitReply, isRunFailureReply, allowLimitReply, limitResetAt } from "./limits.js";
 import {
   createJobStore, mergeJobsConfig, recordSpawn, recordActivity, recordUsage, recordCall, callBudget, recordTime, recordCheck, recordGraph, recordResultText, finalAnswer, missingProof,
-  recordEnd, recordProgress, setClaudeLimited, clearClaudeLimited, setCodexLimited, scanJobs, lastAssistantText, noProgressStreak,
+  recordEnd, recordProgress, setClaudeLimited, clearClaudeLimited, setCodexLimited, scanJobs, lastAssistantText, noProgressStreak, meterCliUsage,
 } from "./jobs.js";
 import { createMirror, topicFor, messageIdOf } from "./mirror.js";
 import { secretDecide, findSecret, redactDeep } from "./secrets.js";
@@ -917,6 +917,15 @@ export default definePluginEntry({
         log("info", "token-guard: a task's run ended without an end event; closing it", { job: job.short, agentId: job.agentId });
         endJob(job.key, job.runOutcome, "", Date.now());
       }
+      // The real token use of each running task, from its CLI session log (OpenClaw reports only a run's last call).
+      for (const job of Object.values(store.data.jobs)) {
+        if (job.status !== "running") continue;
+        let over = null;
+        try { over = meterCliUsage(store.data, job.key, jobsCfg, Date.now()); } catch (error) { log("warn", "token-guard could not read a task's CLI usage", { job: job.short, error: String(error && error.message) }); }
+        store.touch();
+        if (over) post(pm, over.topic || "system", budgetText(voice, over, `${Math.round(over.usedTokens / 1e6)}M tokens`), { html: true, replyTo: over.dispatchMsgId || null });
+      }
+      store.save();
       let inboxItems = [];
       try { inboxItems = [...loadInboxItems().values()]; } catch { inboxItems = []; }
       const actions = scanJobs(store.data, jobsCfg, Date.now(), {
