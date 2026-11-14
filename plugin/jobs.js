@@ -569,6 +569,99 @@ function noProgressStreak(jobs, id, item, now = Date.now(), windowMs = 48 * 3600
   return n;
 }
 
+// The real token use of a task. For Claude CLI runs OpenClaw tells plugins only the last model call of a run
+// (2026-11-14: a devops task with 33 tool calls was recorded at 71k tokens, about 1% of what it used; the team burned
+// 1.05B tokens a day, 95% re-reading context, while the guard saw 6-10M and its per-task budget never fired). The CLI's
+// own session log has every call's usage: this finds the task's log (its agent's folder, written since the spawn,
+// naming the task's item) and adds up what was appended since the last read.
+function cliProjectDirs(agentId, home = os.homedir()) {
+  const root = path.join(home, ".claude", "projects");
+  try {
+    return fs.readdirSync(root).filter((d) => d.endsWith(`-workspace-${agentId}`)).map((d) => path.join(root, d));
+  } catch { return []; }
+}
+
+function findCliLog(job, home = os.homedir()) {
+  const ids = job.items || [];
+  if (!ids.length || !job.agentId) return null;
+  const since = (job.spawnedAt || 0) - 120000;
+  for (const dir of cliProjectDirs(job.agentId, home)) {
+    let names = [];
+    try { names = fs.readdirSync(dir).filter((n) => n.endsWith(".jsonl")); } catch { continue; }
+    for (const n of names) {
+      const f = path.join(dir, n);
+      let st;
+      try { st = fs.statSync(f); } catch { continue; }
+      if (st.mtimeMs < since || (st.birthtimeMs > 0 && st.birthtimeMs < since)) continue;
+      let head = "";
+      try {
+        const fd = fs.openSync(f, "r");
+        const buf = Buffer.alloc(65536);
+        const got = fs.readSync(fd, buf, 0, buf.length, 0);
+        fs.closeSync(fd);
+        head = buf.slice(0, got).toString("utf8");
+      } catch { continue; }
+      if (ids.some((id) => head.includes(id))) return f;
+    }
+  }
+  return null;
+}
+
+// Tokens and model calls in the complete lines appended to `file` from `offset`; returns the new offset.
+function readCliUsage(file, offset = 0) {
+  let size;
+  try { size = fs.statSync(file).size; } catch { return { tokens: 0, calls: 0, offset }; }
+  if (size <= offset) return { tokens: 0, calls: 0, offset };
+  const fd = fs.openSync(file, "r");
+  const buf = Buffer.alloc(size - offset);
+  fs.readSync(fd, buf, 0, buf.length, offset);
+  fs.closeSync(fd);
+  const text = buf.toString("utf8");
+  const end = text.lastIndexOf("\n");
+  if (end < 0) return { tokens: 0, calls: 0, offset };
+  let tokens = 0;
+  let calls = 0;
+  for (const line of text.slice(0, end).split("\n")) {
+    if (!line.includes('"usage"')) continue;
+    try {
+      const u = JSON.parse(line).message.usage;
+      if (!u) continue;
+      tokens += (u.input_tokens || 0) + (u.cache_read_input_tokens || 0) + (u.cache_creation_input_tokens || 0) + (u.output_tokens || 0);
+      calls += 1;
+    } catch { /* not a usage line */ }
+  }
+  return { tokens, calls, offset: offset + Buffer.byteLength(text.slice(0, end + 1), "utf8") };
+}
+
+// Adds a running task's new CLI usage; returns the job when this pushed it over its token budget. The day's use per
+// agent is kept too (usageByDay), for the owner's numbers.
+function meterCliUsage(data, sessionKey, cfg, now = Date.now(), home = os.homedir()) {
+  const job = data.jobs[sessionKey];
+  if (!job || job.status !== "running") return null;
+  if (!job.cliLog) {
+    const f = findCliLog(job, home);
+    if (!f) return null;
+    job.cliLog = f;
+    job.cliOffset = 0;
+  }
+  const r = readCliUsage(job.cliLog, job.cliOffset || 0);
+  job.cliOffset = r.offset;
+  if (!r.tokens) return null;
+  job.cliTokens = (job.cliTokens || 0) + r.tokens;
+  job.cliCalls = (job.cliCalls || 0) + r.calls;
+  const day = new Date(now).toISOString().slice(0, 10);
+  data.usageByDay = data.usageByDay || {};
+  for (const d of Object.keys(data.usageByDay)) if (d < new Date(now - 14 * 86400000).toISOString().slice(0, 10)) delete data.usageByDay[d];
+  const today = (data.usageByDay[day] = data.usageByDay[day] || {});
+  today[job.agentId] = (today[job.agentId] || 0) + r.tokens;
+  if (job.cliTokens > (job.usedTokens || 0)) job.usedTokens = job.cliTokens;
+  if (!job.overBudget && cfg.budgetTokens > 0 && job.usedTokens > cfg.budgetTokens) {
+    job.overBudget = true;
+    return job;
+  }
+  return null;
+}
+
 export {
   DEFAULT_JOBS,
   mergeJobsConfig,
@@ -595,4 +688,7 @@ export {
   scanJobs,
   lastAssistantText,
   noProgressStreak,
+  findCliLog,
+  readCliUsage,
+  meterCliUsage,
 };

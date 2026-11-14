@@ -409,3 +409,34 @@ test("the queue reads the PM's rank and priority from the real board file (writt
   assert.equal(items.get("aaaaaaa2").priority, "low");
   assert.deepEqual(queueState(items, { wip: 1, projectOrder: ["shop", "game"] }).queue.map((i) => i.id), ["aaaaaaa3", "aaaaaaa1", "aaaaaaa2"]);
 });
+
+// 2026-11-14: OpenClaw reported only a run's last model call; a task with 33 tool calls showed 71k tokens (~1% of its
+// use) and the per-task budget never fired while the team burned 1.05B tokens a day. The meter reads the CLI's log.
+test("a task's real token use is read from its CLI session log, and its budget fires on it", async () => {
+  const { meterCliUsage } = await import("../jobs.js");
+  const os = await import("node:os");
+  const fs = (await import("node:fs")).default;
+  const path = (await import("node:path")).default;
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "tg-cli-"));
+  const dir = path.join(home, ".claude", "projects", "-home-x--openclaw-workspace-devops");
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(path.join(dir, "other.jsonl"), JSON.stringify({ type: "user", message: { content: "Items:\n- 99999999" } }) + "\n");
+  const log = path.join(dir, "a1.jsonl");
+  const use = (read) => JSON.stringify({ type: "assistant", message: { usage: { input_tokens: 10, cache_read_input_tokens: read, cache_creation_input_tokens: 0, output_tokens: 90 } } }) + "\n";
+  fs.writeFileSync(log, JSON.stringify({ type: "user", message: { content: "Project: shop\nItems:\n- c0ffee01\nDone when: x" } }) + "\n" + use(60000) + use(70000));
+  const now = Date.now();
+  const data = { jobs: { k: { key: "k", status: "running", agentId: "devops", items: ["c0ffee01"], spawnedAt: now - 60000, usedTokens: 71000 } } };
+  const cfg = { budgetTokens: 200000 };
+  assert.equal(meterCliUsage(data, "k", cfg, now, home), null);
+  assert.equal(data.jobs.k.cliLog, log, "found by its item, not the other task's log");
+  assert.equal(data.jobs.k.cliTokens, 130200);
+  assert.equal(data.jobs.k.usedTokens, 130200);
+  fs.appendFileSync(log, use(80000) + '{"partial":');  // an unfinished line is read next time
+  const over = meterCliUsage(data, "k", cfg, now, home);
+  assert.ok(over && over.overBudget, "the budget fires on the real use");
+  assert.equal(data.jobs.k.cliTokens, 210300);
+  assert.equal(data.jobs.k.cliCalls, 3);
+  assert.equal(data.usageByDay[new Date(now).toISOString().slice(0, 10)].devops, 210300);
+  assert.equal(meterCliUsage(data, "k", cfg, now, home), null, "nothing new, nothing counted twice");
+  assert.equal(data.jobs.k.cliTokens, 210300);
+});
