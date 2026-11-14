@@ -910,6 +910,14 @@ function policyDecide(event, ctx, pstate, rawConfig, log, now = Date.now()) {
         const st = normStatus(board.get(id).status);
         if (!DISPATCHABLE.has(st)) return block("boardItems", `token-guard: ${id} is ${st} on the board. Reopen it with task_inbox set before dispatching.`);
         if (running.has(id)) return block("boardBusy", `token-guard: ${id} is already being worked on in another task. Wait for that result; one task at a time per item.`);
+        // The same stuck item again and again burns the owner's tokens and starves the rest of the board.
+        const maxNoProgress = policy.board.maxNoProgress === undefined ? 3 : Number(policy.board.maxNoProgress) || 0;
+        const streak = maxNoProgress > 0 && typeof pstate.noProgressStreak === "function" ? pstate.noProgressStreak(id, board.get(id)) : 0;
+        if (maxNoProgress > 0 && streak >= maxNoProgress) {
+          return block("loopBreak", `token-guard: ${id} has had ${streak} tasks in a row that moved nothing (blocked, partly, failed). Another try burns tokens the same way. ` +
+            "Dispatch another item now (task_inbox queue). For this one: remove what blocks it, or split it into small items that one task can finish (task_inbox add), " +
+            "or move it to Blocked with the reason. After splitting or removing the blocker, move it with a note starting \"Rescoped:\" to try again.");
+        }
       }
       const projects = new Set(ids.map((id) => String(board.get(id).project || "").toLowerCase()));
       if (projects.size > 1) return block("mixedProjects", `token-guard: these items belong to different projects (${[...projects].join(", ")}). One task, one project: dispatch them separately.`);

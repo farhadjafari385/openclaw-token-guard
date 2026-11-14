@@ -97,7 +97,7 @@ function queueOrder(items, projectOrder = []) {
 // The work in hand and what may start next: with `wip` items in hand nothing new starts. With
 // `maxTasksByAgent` ({ agent: n }), an item whose owner already runs n tasks (`running`: { agent: tasks })
 // is passed over, so the next item another agent can take is offered instead of the queue standing still.
-function queueState(items, { wip = 1, projectOrder = [], maxTasksByAgent = {}, running = {} } = {}) {
+function queueState(items, { wip = 1, projectOrder = [], maxTasksByAgent = {}, running = {}, stuck = null } = {}) {
   const all = [...(items instanceof Map ? items.values() : items || [])];
   const active = all.filter((it) => ACTIVE.has(normStatus(it.status)));
   const queue = queueOrder(all, projectOrder);
@@ -109,6 +109,7 @@ function queueState(items, { wip = 1, projectOrder = [], maxTasksByAgent = {}, r
     const owner = String(it.owner || "");
     const cap = Number((maxTasksByAgent || {})[owner]) || 0;
     if (cap > 0 && (taken[owner] || 0) >= cap) continue;
+    if (stuck && stuck(it)) continue; // refused at dispatch (loopBreak): the queue moves on
     next.push(it);
     if (owner) taken[owner] = (taken[owner] || 0) + 1;
   }
