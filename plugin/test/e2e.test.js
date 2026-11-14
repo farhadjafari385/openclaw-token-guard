@@ -669,6 +669,71 @@ test("a task whose run ended is closed at once, even without an end event, and i
   }
 });
 
+// 2026-11-14: the owner got ~860 team messages a day, three per task (dispatch, "On it", result), and could not
+// see what was delivered. With resultsOnly, Telegram gets the outcome alone, naming its task.
+test("results only: no dispatch or acknowledgement post, no CI-wait step, and the result names its task", async () => {
+  const root = harness();
+  process.env.OC_INBOX_FILE = path.join(root, "inbox.jsonl");
+  process.env.OC_INBOX_BIN = path.join(REPO, "bin", "oc-inbox");
+  const telegram = [];
+  globalThis.fetch = async (url, opts = {}) => {
+    if (String(url).startsWith("https://api.telegram.org/")) {
+      telegram.push(JSON.parse(opts.body || "{}"));
+      return { ok: true, json: async () => ({ ok: true, result: { message_id: 6000 + telegram.length } }) };
+    }
+    return { ok: false, status: 404, json: async () => ({}) };
+  };
+  const handlers = {};
+  const services = [];
+  const api = {
+    pluginConfig: {
+      orchestratorAgent: "coordinator",
+      board: { enabled: false },
+      topics: { enabled: false },
+      mirror: { enabled: true, chatId: "-100", systemTopic: 160, defaultTopic: 160, minIntervalMs: 0, resultsOnly: true, acks: false,
+        botTokenFiles: { coordinator: path.join(root, "bot.token"), writer: path.join(root, "bot.token") } },
+      jobs: { stateFile: path.join(root, "state", "jobs.json"), idleWakeSession: "agent:coordinator:explicit:team-ops", refusal: { enabled: false } },
+      triage: { enabled: false },
+    },
+    logger: { info: () => {}, warn: () => {}, error: () => {}, debug: () => {} },
+    on: (name, fn) => { (handlers[name] = handlers[name] || []).push(fn); },
+    registerService: (s) => services.push(s),
+    registerTool: () => {},
+    runtime: { subagent: { run: async () => ({ runId: "r" }), getSessionMessages: async () => ({ messages: [] }) } },
+  };
+  const entry = (await import(pathToFileURL(path.join(root, "plugin", "index.js")).href)).default;
+  entry.register(api);
+  const realSetInterval = globalThis.setInterval;
+  globalThis.setInterval = () => ({ unref() {} });
+  for (const s of services) if (s.start) s.start();
+  globalThis.setInterval = realSetInterval;
+  const call = (name, event, ctx) => { for (const h of handlers[name] || []) h(event, ctx); };
+  const ORC = { agentId: "coordinator", sessionKey: "agent:coordinator:explicit:team-ops", runId: "run-r" };
+  const jobs = () => JSON.parse(fs.readFileSync(path.join(root, "state", "jobs.json"), "utf8")).jobs;
+  const run = async (child, label, text) => {
+    call("before_tool_call", { toolName: "sessions_spawn", params: { agentId: "writer", task: brief("ab12cd34"), label } }, ORC);
+    call("subagent_spawned", { childSessionKey: child, agentId: "writer", label }, { requesterSessionKey: ORC.sessionKey });
+    assert.ok(await until(() => jobs()[child] && jobs()[child].status === "running"));
+    call("agent_end", { messages: [{ role: "assistant", content: [{ type: "text", text }] }] }, { sessionKey: child, agentId: "writer" });
+    call("subagent_progress", { childSessionKey: child, phase: "ended", outcome: "ok" }, {});
+    await settle();
+  };
+  try {
+    // a CI step: nothing posted at all
+    await run("agent:writer:subagent:w1", "shop: push the price fix",
+      "Pushed.\n\nRESULT: waiting\nLink: https://gitlab.com/acme/shop/-/merge_requests/7");
+    assert.equal(telegram.length, 0, `posted: ${telegram.map((m) => m.text).join(" | ")}`);
+    // the real outcome: one post, naming the task and its item
+    await run("agent:writer:subagent:w2", "shop: show the price on checkout", "The price renders.\n\nRESULT: done\n- the price renders");
+    assert.ok(await until(() => telegram.length === 1), `posts: ${telegram.length}`);
+    assert.match(telegram[0].text, /Done/);
+    assert.match(telegram[0].text, /<b>Show the price on checkout<\/b>/);
+    assert.doesNotMatch(telegram.map((m) => m.text).join("\n"), /can you take this one|over to you|this one is yours|On it/);
+  } finally {
+    await settle();
+  }
+});
+
 test("a CI wait on an MR with no pipeline lets go of the item after a short wait; a spent triage budget hands over to the idle wake", async () => {
   const root = harness();
   process.env.OC_INBOX_FILE = path.join(root, "inbox.jsonl");

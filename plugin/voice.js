@@ -157,6 +157,8 @@ function resultText(cfg, job, verdict, moves = []) {
   const { summary, details } = splitReport(job.resultText);
   const first = `${handleOf(cfg, orcOf(cfg))} ${head}${mins ? ` (${mins} min)` : ""}.`;
   const out = [summary ? `${first} ${mdToHtml(summary, 700)}` : first];
+  // No dispatch post to reply to: the result names its task and items itself.
+  if (cfg.resultsOnly) out.splice(1, 0, `<b>${esc(clip(titleOf(job.label), 200))}</b>${(job.items || []).length ? ` <i>${esc(job.items.join(" "))}</i>` : ""}`);
   if (job.error) out.push(`Error: <code>${esc(clip(job.error, 300))}</code>`);
   if (details) out.push(`<blockquote expandable>${mdToHtml(details, 2600, false)}</blockquote>`);
   if (!job.resultText) out.push("I left no written report; my session history has the details.");

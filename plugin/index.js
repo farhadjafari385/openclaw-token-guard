@@ -452,7 +452,7 @@ export default definePluginEntry({
         const prior = items.length ? takeResultForItems(items, job.topic) : null;
         const replyTo = prior ? prior.resultMsgId : requestMessageFor(job.topic, items, board);
         if (replyTo) setJob(key, { requestMsgId: replyTo });
-        const thread = say(orchestrator, job.topic, dispatchText(voice, store.data.jobs[key] || job), { html: true, replyTo })
+        const thread = voice.resultsOnly ? Promise.resolve(null) : say(orchestrator, job.topic, dispatchText(voice, store.data.jobs[key] || job), { html: true, replyTo })
           .then((id) => {
             if (typeof id !== "number") return null;
             setJob(key, { dispatchMsgId: id });
@@ -657,11 +657,13 @@ export default definePluginEntry({
           const before = normStatus(board.get(id).status);
           return { id, before, to: nextAfterJob(before, cur.agentId, verdict) };
         }).filter((m) => m.to !== m.before);
-        // The worker answers its dispatch, from its own bot, once the dispatch is posted.
+        // The worker answers its dispatch, from its own bot, once the dispatch is posted. With results only, a
+        // "CI is running" step is not posted: the guard follows the pipeline and the item's real result comes later.
         Promise.resolve(threads.get(key)).catch(() => null).then(() => {
           threads.delete(key);
+          if (voice.resultsOnly && verdict === "waiting") return null;
           const j = fresh().jobs[key] || cur;
-          return say(j.agentId, j.topic, resultText(voice, j, verdict, plan), { html: true, replyTo: j.dispatchMsgId || null });
+          return say(j.agentId, j.topic, resultText(voice, j, verdict, plan), { html: true, replyTo: j.dispatchMsgId || j.requestMsgId || null });
         }).then((id) => { if (typeof id === "number") setJob(key, { resultMsgId: id }); });
         Promise.all(plan.map((m) => systemMove(m.id, m.to, `${cur.agentId} task ended: ${verdict} [job ${cur.short}]`)))
           .then(() => refreshItems(cur.items || []));
