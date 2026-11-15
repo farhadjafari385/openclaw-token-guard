@@ -59,6 +59,10 @@ function secretish(raw, names) {
   if (/^[A-Z0-9_]+$/.test(s) && !/\d/.test(s)) return null;
   if (/[`*()]|\.(?:token|pass|key|secret|md|txt|pem|b64|json|sh|py)\b/.test(s)) return null;
   if (/^[A-Za-z][a-z]+[.,:;!?]?$/.test(s)) return null;
+  // Words joined by - or / with no digit: a header name or a label, not a secret. 2026-11-15: "Content-Type:" (from a
+  // curl file) and two hyphenated words from accounts.md were taken for secrets, and every brief naming them was
+  // refused, so devops could not be dispatched at all.
+  if (!/\d/.test(s) && /^[A-Za-z]+(?:[-/][A-Za-z]+)+:?$/.test(s)) return null;
   if (/^[a-z0-9-]+(?:\.[a-z0-9-]+)+$/i.test(s) && !/\d.*[A-Za-z].*\d/.test(s)) return null;
   if (names && (names.has(s) || names.has(s.replace(/[.,:;]+$/, "")))) return null;
   if (s.length >= 20 && classes(s) >= 2) return s;
@@ -303,7 +307,10 @@ function outgoingDiff(dir) {
 const HOW =
   "Secrets are used only through a consumer that never prints them: `curl -K -` reading its config from stdin, " +
   "GIT_ASKPASS, `--password-stdin`, `ssh -i`, or `~/.openclaw/bin/oc-secret-save` to store one. Never paste a value " +
-  "into a message, page, form, file, command line or commit.";
+  "into a message, page, form, file, command line or commit. Copy these, changing only the file and URL: " +
+  "API token: `printf 'header = \"PRIVATE-TOKEN: %s\"\\n' \"$(cat ~/.openclaw/secrets/<file>)\" | curl -sS -K - <url>` " +
+  "(Bearer: `header = \"Authorization: Bearer %s\"`); registry: `cat ~/.openclaw/secrets/<file> | docker login <registry> -u <user> --password-stdin`; " +
+  "git over HTTPS works as it is (the credential helper). Do not retry other ways: each refusal costs a turn.";
 
 // The decision for one tool call. undefined = allow; { block, blockReason, rule } = refuse.
 function secretDecide(event, ctx, cfg, log) {

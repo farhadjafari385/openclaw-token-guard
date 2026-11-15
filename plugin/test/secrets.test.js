@@ -189,3 +189,30 @@ test("the plugin wires it for a worker: tool calls refused, Telegram sends cance
   const written = first("before_message_write", { message: { role: "assistant", content: [{ type: "text", text: `see ${TG_SHAPED}` }] } }, W);
   assert.equal(written.message.content[0].text, "see [REDACTED:telegram-bot-token]");
 });
+
+// 2026-11-15: "Content-Type:" from a curl file and hyphenated words from the accounts list were taken for secrets;
+// every orchestrator brief naming them was refused (secretOutbound) and devops could not be dispatched at all.
+test("plain joined words in the secret store are not secrets; real values next to them still are", async () => {
+  const fs = (await import("node:fs")).default;
+  const os = (await import("node:os")).default;
+  const path = (await import("node:path")).default;
+  const { loadSecretValues } = await import("../secrets.js");
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "tg-sec-"));
+  fs.writeFileSync(path.join(dir, "shop.curl"), "curl -H 'Content-Type: application/json' -H 'X-Api-Key: Zq7vLm2Rt9Wx4Kp8' https://shop.example\n");
+  fs.writeFileSync(path.join(dir, "accounts.md"), "| site | user | password |\n| Rest-Auth | owner_one | Tr4v-9!kQz |\n| console/URL | admin | Pa55-word-77 |\n");
+  const values = loadSecretValues(dir);
+  for (const notSecret of ["Content-Type:", "Content-Type", "Rest-Auth", "console/URL"]) assert.ok(!values.has(notSecret), `${notSecret} taken for a secret`);
+  for (const secret of ["Zq7vLm2Rt9Wx4Kp8", "Tr4v-9!kQz", "Pa55-word-77"]) assert.ok(values.has(secret), `${secret} missed`);
+});
+
+// 2026-11-15: 574 secretRead refusals in a day; the refusal named the consumers but showed no working command.
+test("the secret refusal shows commands that the guard itself allows", async () => {
+  const { secretDecide } = await import("../secrets.js");
+  const cfg = { secrets: { dir: "~/.openclaw/secrets" } };
+  const r = secretDecide({ toolName: "exec", params: { command: "cat ~/.openclaw/secrets/gitlab-main.token" } }, { agentId: "devops" }, cfg, () => {});
+  assert.equal(r && r.rule, "secretRead");
+  const examples = [...r.blockReason.matchAll(/`([^`]*secrets\/<file>[^`]*)`/g)].map((m) => m[1]
+    .replace("<file>", "gitlab-main.token").replace("<url>", "https://gitlab.com/api/v4/user").replace("<registry>", "registry.gitlab.com").replace("<user>", "x"));
+  assert.equal(examples.length, 2);
+  for (const c of examples) assert.ok(!secretReadViolation(c, cfg), `the example is refused: ${c}`);
+});
