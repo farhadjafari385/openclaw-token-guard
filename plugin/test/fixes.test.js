@@ -436,7 +436,43 @@ test("a task's real token use is read from its CLI session log, and its budget f
   assert.ok(over && over.overBudget, "the budget fires on the real use");
   assert.equal(data.jobs.k.cliTokens, 210300);
   assert.equal(data.jobs.k.cliCalls, 3);
-  assert.equal(data.usageByDay[new Date(now).toISOString().slice(0, 10)].devops, 210300);
   assert.equal(meterCliUsage(data, "k", cfg, now, home), null, "nothing new, nothing counted twice");
   assert.equal(data.jobs.k.cliTokens, 210300);
+});
+
+// 2026-11-15: the meter kept a reading for 4 of 255 tasks. Another copy of the state, newer only by lastActivityAt,
+// won each merge and dropped the job's meter fields; the next tick re-read the log from the start and the day totals
+// counted it again.
+test("the meter's totals survive a merge with a copy that never saw them, and a lost copy never counts a log twice", async () => {
+  const { meterCliUsage, mergeStates, cliUsageByDay } = await import("../jobs.js");
+  const os = await import("node:os");
+  const fs = (await import("node:fs")).default;
+  const path = (await import("node:path")).default;
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "tg-cli2-"));
+  const dir = path.join(home, ".claude", "projects", "-home-x--openclaw-workspace-qa");
+  fs.mkdirSync(dir, { recursive: true });
+  const log = path.join(dir, "b1.jsonl");
+  const use = JSON.stringify({ type: "assistant", message: { usage: { input_tokens: 0, cache_read_input_tokens: 1000, cache_creation_input_tokens: 0, output_tokens: 0 } } }) + "\n";
+  fs.writeFileSync(log, JSON.stringify({ type: "user", message: { content: "Items:\n- feed0001" } }) + "\n" + use + use);
+  const now = Date.now();
+  const job = { key: "k", status: "running", agentId: "qa", items: ["feed0001"], spawnedAt: now - 60000, lastActivityAt: now - 60000 };
+  const mine = { jobs: { k: { ...job } } };
+  meterCliUsage(mine, "k", {}, now, home);
+  assert.equal(mine.jobs.k.cliTokens, 2000);
+  const other = { jobs: { k: { ...job, lastActivityAt: now } } };  // newer, but no meter fields
+  const merged = mergeStates(other, mine);
+  assert.equal(merged.jobs.k.cliTokens, 2000, "kept from the older copy");
+  assert.equal(merged.jobs.k.cliLog, log);
+  assert.equal(merged.jobs.k.lastActivityAt, now, "the newer copy still wins the rest");
+  fs.appendFileSync(log, use);
+  const stale = { jobs: { k: { ...job } } };  // a copy that lost the fields reads the same totals, not double
+  meterCliUsage(stale, "k", {}, now, home);
+  assert.equal(stale.jobs.k.cliTokens, 3000);
+  const ended = { jobs: { k: { ...merged.jobs.k, status: "ended", endedAt: now } } };
+  fs.appendFileSync(log, use);
+  meterCliUsage(ended, "k", {}, now + 60000, home);
+  assert.equal(ended.jobs.k.cliTokens, 4000, "the tail written after the last tick is read once the task ends");
+  assert.equal(meterCliUsage(ended, "k", {}, now + 20 * 60000, home), null, "and not after that");
+  const day = new Date(now - 60000).toISOString().slice(0, 10);
+  assert.equal(cliUsageByDay(ended)[day].qa, 4000);
 });

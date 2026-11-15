@@ -1168,7 +1168,7 @@ test("during a Claude limit the owner gets the limit and its end instead of Open
   try {
     const out = call("message_sending", { to: "42", content: FAIL }, DM);
     assert.ok(out && typeof out.content === "string", "the bare failure is rewritten");
-    assert.match(out.content, /usage limit is reached, so I can't answer until \d{2}:\d{2} UTC \(in about \d+ min\)/);
+    assert.match(out.content, /usage limit is reached, so I can't answer until (?:\w{3}, \d{1,2} \w{3} )?\d{2}:\d{2} UTC \(in about \d+ min\)/);
     assert.match(out.content, /your message is kept/);
     assert.ok(!out.cancel);
     // every message during the limit gets it (silence reads as broken), and a limit-free failure is left alone

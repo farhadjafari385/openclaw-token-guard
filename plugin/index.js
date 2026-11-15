@@ -919,7 +919,7 @@ export default definePluginEntry({
       }
       // The real token use of each running task, from its CLI session log (OpenClaw reports only a run's last call).
       for (const job of Object.values(store.data.jobs)) {
-        if (job.status !== "running") continue;
+        if (job.status !== "running" && !(job.cliLog && Date.now() - (job.endedAt || 0) < 15 * 60000)) continue;
         let over = null;
         try { over = meterCliUsage(store.data, job.key, jobsCfg, Date.now()); } catch (error) { log("warn", "token-guard could not read a task's CLI usage", { job: job.short, error: String(error && error.message) }); }
         store.touch();

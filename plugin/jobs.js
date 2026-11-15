@@ -69,6 +69,7 @@ function emptyState() {
 
 // Telegram message ids of a job's thread; kept from either copy when two copies merge.
 const THREAD_FIELDS = ["requestMsgId", "dispatchMsgId", "ackMsgId", "resultMsgId", "answeredAt"];
+const METER_COUNTERS = ["cliTokens", "cliCalls", "usedTokens"];
 
 function shortId(key) {
   return crypto.createHash("sha1").update(String(key)).digest("hex").slice(0, 6);
@@ -87,8 +88,14 @@ function newerJob(a, b) {
   const wait = mergeWait(win.waitFor, other.waitFor);
   // Counters only go up: a copy that missed a map query must not lock the task's code again.
   const graphQueries = Math.max(win.graphQueries || 0, other.graphQueries || 0);
-  if (!missing.length && wait === win.waitFor && graphQueries === (win.graphQueries || 0)) return win;
-  const out = Object.assign({}, win);
+  // The meter's totals too (2026-11-15: a copy that only bumped lastActivityAt won every merge and dropped them; 4 of
+  // 255 tasks a day kept a reading).
+  const meter = {};
+  for (const f of METER_COUNTERS) if ((other[f] || 0) > (win[f] || 0)) meter[f] = other[f];
+  if (!win.cliLog && other.cliLog) meter.cliLog = other.cliLog;
+  if (!win.overBudget && other.overBudget) meter.overBudget = true;
+  if (!missing.length && wait === win.waitFor && graphQueries === (win.graphQueries || 0) && !Object.keys(meter).length) return win;
+  const out = Object.assign({}, win, meter);
   for (const f of missing) out[f] = other[f];
   if (wait !== win.waitFor) out.waitFor = wait;
   if (graphQueries) out.graphQueries = graphQueries;
@@ -633,33 +640,54 @@ function readCliUsage(file, offset = 0) {
   return { tokens, calls, offset: offset + Buffer.byteLength(text.slice(0, end + 1), "utf8") };
 }
 
-// Adds a running task's new CLI usage; returns the job when this pushed it over its token budget. The day's use per
-// agent is kept too (usageByDay), for the owner's numbers.
-function meterCliUsage(data, sessionKey, cfg, now = Date.now(), home = os.homedir()) {
+// What this process has read of each CLI log: the totals live here, not in the shared state, so a lost or stale copy
+// of a job can never make the meter count a log twice. A fresh process reads each log once from the start.
+const cliReads = new Map();
+
+function cliTotals(file) {
+  const seen = cliReads.get(file) || { offset: 0, tokens: 0, calls: 0 };
+  const r = readCliUsage(file, seen.offset);
+  const now = { offset: r.offset, tokens: seen.tokens + r.tokens, calls: seen.calls + r.calls };
+  cliReads.set(file, now);
+  if (cliReads.size > 500) cliReads.delete(cliReads.keys().next().value);
+  return now;
+}
+
+// Sets a task's real token use from its CLI log (absolute totals); returns the job when this put a running task over
+// its token budget. A task that ended in the last `tailMs` is read once more for what it wrote after the last tick.
+function meterCliUsage(data, sessionKey, cfg, now = Date.now(), home = os.homedir(), tailMs = 15 * 60000) {
   const job = data.jobs[sessionKey];
-  if (!job || job.status !== "running") return null;
+  if (!job) return null;
+  const running = job.status === "running";
+  if (!running && !(job.cliLog && now - (job.endedAt || 0) < tailMs)) return null;
+  if (data.usageByDay) delete data.usageByDay; // the old incremental day totals counted logs twice
   if (!job.cliLog) {
     const f = findCliLog(job, home);
     if (!f) return null;
     job.cliLog = f;
-    job.cliOffset = 0;
   }
-  const r = readCliUsage(job.cliLog, job.cliOffset || 0);
-  job.cliOffset = r.offset;
-  if (!r.tokens) return null;
-  job.cliTokens = (job.cliTokens || 0) + r.tokens;
-  job.cliCalls = (job.cliCalls || 0) + r.calls;
-  const day = new Date(now).toISOString().slice(0, 10);
-  data.usageByDay = data.usageByDay || {};
-  for (const d of Object.keys(data.usageByDay)) if (d < new Date(now - 14 * 86400000).toISOString().slice(0, 10)) delete data.usageByDay[d];
-  const today = (data.usageByDay[day] = data.usageByDay[day] || {});
-  today[job.agentId] = (today[job.agentId] || 0) + r.tokens;
+  const t = cliTotals(job.cliLog);
+  if (t.tokens <= (job.cliTokens || 0)) return null;
+  job.cliTokens = t.tokens;
+  job.cliCalls = Math.max(t.calls, job.cliCalls || 0);
   if (job.cliTokens > (job.usedTokens || 0)) job.usedTokens = job.cliTokens;
-  if (!job.overBudget && cfg.budgetTokens > 0 && job.usedTokens > cfg.budgetTokens) {
+  if (running && !job.overBudget && cfg.budgetTokens > 0 && job.usedTokens > cfg.budgetTokens) {
     job.overBudget = true;
     return job;
   }
   return null;
+}
+
+// Real tokens per day and agent, from the metered tasks (by the day each task started), for the owner's numbers.
+function cliUsageByDay(data) {
+  const out = {};
+  for (const job of Object.values(data.jobs || {})) {
+    if (!job.cliTokens) continue;
+    const day = new Date(job.spawnedAt || 0).toISOString().slice(0, 10);
+    out[day] = out[day] || {};
+    out[day][job.agentId] = (out[day][job.agentId] || 0) + job.cliTokens;
+  }
+  return out;
 }
 
 export {
@@ -691,4 +719,5 @@ export {
   findCliLog,
   readCliUsage,
   meterCliUsage,
+  cliUsageByDay,
 };
