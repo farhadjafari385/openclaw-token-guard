@@ -576,6 +576,14 @@ function noProgressStreak(jobs, id, item, now = Date.now(), windowMs = 48 * 3600
   return n;
 }
 
+// Tasks an item has had (killed or lost ones aside). On 2026-11-15 items that needed 10 or more tasks took 51% of all
+// tasks and most of them never reached Done (the sales bot 67, the video generator 66): a whole feature on one item.
+function itemTaskCount(jobs, id) {
+  let n = 0;
+  for (const j of jobs || []) if (j && (j.items || []).includes(id) && j.outcome !== "killed" && j.outcome !== "lost") n += 1;
+  return n;
+}
+
 // The real token use of a task. For Claude CLI runs OpenClaw tells plugins only the last model call of a run
 // (2026-11-14: a devops task with 33 tool calls was recorded at 71k tokens, about 1% of what it used; the team burned
 // 1.05B tokens a day, 95% re-reading context, while the guard saw 6-10M and its per-task budget never fired). The CLI's
@@ -716,6 +724,7 @@ export {
   scanJobs,
   lastAssistantText,
   noProgressStreak,
+  itemTaskCount,
   findCliLog,
   readCliUsage,
   meterCliUsage,

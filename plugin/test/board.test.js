@@ -312,3 +312,39 @@ test("an item stuck in tasks that move nothing is refused and skipped in the que
   assert.equal(policyDecide(spawn("c0ffee02"), COORD, ps, cfg).params.cleanup, "delete", "other work starts");
   assert.equal(policyDecide(spawn("c0ffee01"), COORD, ps, Object.assign({}, CFG, { board: { wip: 10, maxNoProgress: 0 } })).rule, "queueOrder", "0 turns the check off");
 });
+
+// 2026-11-15: items that needed 10 or more tasks took 51% of all tasks and mostly never reached Done (a sales bot 67,
+// a video generator 66, each a whole feature on one item). Past the cap an item gets no more tasks; a note does not
+// lift it: what is left goes on small items of its own.
+test("an item past its task cap is refused and skipped in the queue; the rest of the work goes on new small items", async () => {
+  const { itemTaskCount } = await import("../jobs.js");
+  const now = Date.parse("2026-11-15T23:00:00Z");
+  const job = (i, extra = {}) => Object.assign({ items: ["feed0001"], status: "ended", spawnedAt: now - i * 3600000, resultText: "RESULT: waiting" }, extra);
+  const jobs = [...Array.from({ length: 9 }, (_, i) => job(i + 1)), job(20, { outcome: "killed" }), { items: ["feed0002"], status: "ended", spawnedAt: now }];
+  assert.equal(itemTaskCount(jobs, "feed0001"), 9, "a task cut off by a restart does not count");
+  const items = new Map([
+    ["feed0001", { id: "feed0001", project: "demo", status: "todo", rank: 1, owner: "writer", title: "whole feature", history: [{ ts: new Date(now).toISOString(), note: "Rescoped: one more try" }] }],
+    ["feed0002", { id: "feed0002", project: "demo", status: "todo", rank: 2, owner: "writer", title: "small piece", history: [] }],
+  ]);
+  const all = [...jobs, job(0.5)];
+  const stuck = (it) => itemTaskCount(all, it.id) >= 10;
+  const ps = { boardItems: () => items, runningItemIds: () => new Set(), runningTasks: () => 0,
+    queue: () => queueState(items, { wip: 10, stuck }), noProgressStreak: () => 0, itemTasks: (id) => itemTaskCount(all, id) };
+  const spawn = (id) => ({ toolName: "sessions_spawn", params: { agentId: "writer", task: `Project: demo (/srv/demo)\nScope: x\nItems:\n${id}\nDone when: tests pass\nStop if: y` } });
+  const cfg = Object.assign({}, CFG, { board: { wip: 10, maxTasksPerItem: 10 } });
+  const r = policyDecide(spawn("feed0001"), COORD, ps, cfg);
+  assert.equal(r.rule, "splitItem", "the 10th task is refused, a Rescoped note or not");
+  assert.match(r.blockReason, /has had 10 tasks/);
+  assert.match(r.blockReason, /task_inbox add/);
+  assert.match(r.blockReason, /Dropped with "split into <ids>"/);
+  assert.deepEqual(queueState(items, { wip: 10, stuck }).next.map((i) => i.id), ["feed0002"], "the queue offers the small piece");
+  assert.equal(policyDecide(spawn("feed0002"), COORD, ps, cfg).params.cleanup, "delete", "the small piece starts");
+  const nine = Object.assign({}, ps, { itemTasks: (id) => itemTaskCount(jobs, id), queue: () => queueState(items, { wip: 10 }) });
+  assert.equal(policyDecide(spawn("feed0001"), COORD, nine, cfg).params.cleanup, "delete", "under the cap it still starts");
+  const piece = { toolName: "task_inbox", params: { action: "add", project: "demo", title: "whole feature: first small piece" } };
+  items.get("feed0001").title = "whole feature small piece first";
+  assert.equal(policyDecide(piece, COORD, ps, cfg), undefined, "a piece of an item past its cap is not its duplicate");
+  assert.equal(policyDecide(piece, COORD, nine, cfg).rule, "duplicateItem", "an item under the cap still catches duplicates");
+  const off = Object.assign({}, ps, { queue: () => queueState(items, { wip: 10 }) });  // the plugin builds no cap into the queue either
+  assert.equal(policyDecide(spawn("feed0001"), COORD, off, Object.assign({}, CFG, { board: { wip: 10 } })).params.cleanup, "delete", "no cap set: off");
+});

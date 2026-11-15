@@ -582,12 +582,13 @@ function words(text) {
 }
 
 // An open item in the same project whose title says the same thing (most of the words shared).
-function similarOpenItem(board, project, title) {
+function similarOpenItem(board, project, title, skip = null) {
   const a = words(title);
   if (a.size < 2) return null;
   const proj = String(project || "").toLowerCase();
   for (const it of board.values()) {
     if (!["backlog", "todo", "in_progress", "review", "qa", "blocked"].includes(String(it.status || "").toLowerCase().replace(/[\s-]+/g, "_"))) continue;
+    if (skip && skip(it)) continue;
     if (proj && String(it.project || "").toLowerCase() !== proj) continue;
     const b = words(it.title);
     let shared = 0;
@@ -801,7 +802,10 @@ function policyDecide(event, ctx, pstate, rawConfig, log, now = Date.now()) {
           return block("itemPerStep", "token-guard: do not add an item for a retry, a gate or a proof step. Keep the owner's original item and move it (task_inbox set: in_progress, review, qa) and dispatch the next agent on that same item id.");
         }
         const board = pstate && typeof pstate.boardItems === "function" ? pstate.boardItems() : null;
-        const twin = board ? similarOpenItem(board, String(params.project || ""), title) : null;
+        // An item past its task cap is being split: its pieces share its words and are not duplicates of it.
+        const capN = Number(policy.board.maxTasksPerItem) || 0;
+        const beingSplit = capN > 0 && typeof pstate.itemTasks === "function" ? (it) => pstate.itemTasks(it.id) >= capN : null;
+        const twin = board ? similarOpenItem(board, String(params.project || ""), title, beingSplit) : null;
         if (twin) {
           return block("duplicateItem", `token-guard: this is the same request as open item ${twin.id} ("${String(twin.title).slice(0, 80)}"). Keep one item per request: update ${twin.id} (task_inbox set, with a note) instead of adding a new one.`);
         }
@@ -917,6 +921,14 @@ function policyDecide(event, ctx, pstate, rawConfig, log, now = Date.now()) {
           return block("loopBreak", `token-guard: ${id} has had ${streak} tasks in a row that moved nothing (blocked, partly, failed). Another try burns tokens the same way. ` +
             "Dispatch another item now (task_inbox queue). For this one: remove what blocks it, or split it into small items that one task can finish (task_inbox add), " +
             "or move it to Blocked with the reason. After splitting or removing the blocker, move it with a note starting \"Rescoped:\" to try again.");
+        }
+        // A whole feature on one item: it takes half the team's tasks and rarely reaches Done. No note lifts this one.
+        const maxTasksPerItem = Number(policy.board.maxTasksPerItem) || 0;
+        const had = maxTasksPerItem > 0 && typeof pstate.itemTasks === "function" ? pstate.itemTasks(id) : 0;
+        if (maxTasksPerItem > 0 && had >= maxTasksPerItem) {
+          return block("splitItem", `token-guard: ${id} has had ${had} tasks without reaching Done: it is a feature, not one item. It gets no more tasks. ` +
+            "Split what is left into small items that one task can finish (one MR, one fix, one check each; task_inbox add, same project, rank them) and dispatch those. " +
+            `Then close ${id}: Done if what it delivered stands on its own (say what, in the note), otherwise Dropped with "split into <ids>".`);
         }
       }
       const projects = new Set(ids.map((id) => String(board.get(id).project || "").toLowerCase()));

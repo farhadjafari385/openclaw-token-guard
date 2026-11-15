@@ -8,7 +8,7 @@ import { correctTopic, isGeneral, projectOfTopic, projectsMentioned } from "./to
 import { isLimitError, isLimitReply, isRunFailureReply, allowLimitReply, limitResetAt } from "./limits.js";
 import {
   createJobStore, mergeJobsConfig, recordSpawn, recordActivity, recordUsage, recordCall, callBudget, recordTime, recordCheck, recordGraph, recordResultText, finalAnswer, missingProof,
-  recordEnd, recordProgress, setClaudeLimited, clearClaudeLimited, setCodexLimited, scanJobs, lastAssistantText, noProgressStreak, meterCliUsage,
+  recordEnd, recordProgress, setClaudeLimited, clearClaudeLimited, setCodexLimited, scanJobs, lastAssistantText, noProgressStreak, itemTaskCount, meterCliUsage,
 } from "./jobs.js";
 import { createMirror, topicFor, messageIdOf } from "./mirror.js";
 import { secretDecide, findSecret, redactDeep } from "./secrets.js";
@@ -352,10 +352,12 @@ export default definePluginEntry({
     };
     const maxNoProgress = boardCfg.maxNoProgress === undefined ? 3 : Number(boardCfg.maxNoProgress) || 0;
     const streakOf = (id, item, jobs) => noProgressStreak(jobs || Object.values(fresh().jobs), id, item, Date.now());
+    const maxTasksPerItem = Number(boardCfg.maxTasksPerItem) || 0;
     const queueNow = (inboxItems) => {
-      const jobs = maxNoProgress > 0 ? Object.values(fresh().jobs) : null; // read once for the whole queue
+      const jobs = maxNoProgress > 0 || maxTasksPerItem > 0 ? Object.values(fresh().jobs) : null; // read once for the whole queue
       return queueState(inboxItems, Object.assign({}, queueCfg, { running: runningByAgent(),
-        stuck: jobs ? (it) => streakOf(it.id, it, jobs) >= maxNoProgress : null }));
+        stuck: jobs ? (it) => (maxNoProgress > 0 && streakOf(it.id, it, jobs) >= maxNoProgress) ||
+          (maxTasksPerItem > 0 && itemTaskCount(jobs, it.id) >= maxTasksPerItem) : null }));
     };
     const orcRunCalls = new Map(); // orchestrator run id -> tool calls so far
     const countOrcCall = (runId) => {
@@ -382,6 +384,7 @@ export default definePluginEntry({
       queue: () => queueNow(loadInboxItems()),
       runningTasks: (agentId) => runningByAgent()[agentId] || 0,
       noProgressStreak: (id, item) => streakOf(id, item),
+      itemTasks: (id) => itemTaskCount(Object.values(fresh().jobs), id),
       onBlock: (rule, info) => {
         if (["protectedFile", "protectedConfig", "backChannel", "spawnByWorker", "sendByWorker", "orchestratorOnly", "modelPin"].includes(rule)) {
           systemNote(`${rule}:${info.agentId}`, guardText(voice, rule, info), { html: true });
