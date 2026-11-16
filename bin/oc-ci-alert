@@ -1,0 +1,36 @@
+#!/usr/bin/env python3
+"""oc-ci-alert: post every newly failed GitLab pipeline of the Starforge project to Telegram topic 151.
+Run from cron. Tokens are read from ~/.openclaw/secrets (never printed, never in argv).
+  oc-ci-alert            check once and post new failures
+  oc-ci-alert --test     post a test line to the topic
+"""
+import json, os, sys, urllib.request, urllib.parse
+S = os.path.expanduser('~/.openclaw/secrets/')
+PROJECT, CHAT, THREAD = '12345678', '-1000000000001', 151
+STATE = os.path.expanduser('~/.openclaw/state/ci-alert-Starforge.json')
+rd = lambda n: open(S + n).read().strip()
+
+def gl(path):
+    r = urllib.request.Request('https://gitlab.com/api/v4/projects/%s/%s' % (PROJECT, path), headers={'PRIVATE-TOKEN': rd('gitlab-pipeline-watch.token')})
+    return json.load(urllib.request.urlopen(r, timeout=30))
+
+def post(text):
+    d = urllib.parse.urlencode({'chat_id': CHAT, 'message_thread_id': THREAD, 'text': text, 'disable_web_page_preview': 'true'}).encode()
+    r = json.load(urllib.request.urlopen('https://api.telegram.org/bot%s/sendMessage' % rd('telegram-devops.token'), d, timeout=30))
+    return r.get('ok')
+
+if '--test' in sys.argv:
+    print('test post ok:', post('CI alert test: failed pipelines of Starforge will be posted here automatically.')); sys.exit(0)
+os.makedirs(os.path.dirname(STATE), exist_ok=True)
+try: seen = set(json.load(open(STATE)))
+except Exception: seen = None
+pls = gl('pipelines?status=failed&order_by=id&sort=desc&per_page=20')
+if seen is None:  # first run: remember existing failures, do not flood the topic
+    seen = {p['id'] for p in pls}
+else:
+    for p in reversed(pls):
+        if p['id'] in seen: continue
+        jobs = [j['name'] for j in gl('pipelines/%d/jobs?scope[]=failed&per_page=20' % p['id'])]
+        ref = p['ref'] if not p['ref'].startswith('refs/merge-requests') else 'MR ' + p['ref'].split('/')[2]
+        if post('CI FAILED on %s: pipeline %d (%s)\nfailed jobs: %s\n%s' % (ref, p['id'], p['sha'][:8], ', '.join(jobs) or '-', p['web_url'])): seen.add(p['id'])
+json.dump(sorted(seen)[-200:], open(STATE, 'w'))
