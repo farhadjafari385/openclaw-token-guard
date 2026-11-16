@@ -63,7 +63,10 @@ const AUTO_FROM = new Set(["in_progress", "review", "qa"]);
 function nextAfterJob(before, role, verdict) {
   const s = normStatus(before);
   if (!AUTO_FROM.has(s)) return s;
-  if (verdict === "blocked") return "blocked";
+  // A worker's "blocked" is a claim, not a decision (2026-11-16: 23 items went to Blocked by task results in a morning,
+  // some on blockers the team could clear). The item stays in hand; the orchestrator unblocks it or parks it with an
+  // owner reason (enforced in policy: blockedReason).
+  if (verdict === "blocked") return "review";
   if (verdict === "waiting") return s; // stays where it is until its pipeline ends (the CI watch moves it)
   if (verdict === "failed") return "todo";
   if (verdict !== "done") return "review"; // no clear verdict: the orchestrator checks it

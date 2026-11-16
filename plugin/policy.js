@@ -573,6 +573,9 @@ function spawnRewrite(params, policy, pstate, now) {
 }
 
 
+// A Blocked note must name a blocker the team cannot clear itself.
+const OWNER_BLOCK = /\bowner(?:'s)?(?: own)? (?:money|accounts?|id|hold|sign-?in|laptop)\b|\bexternal wait\b/i;
+
 // Titles of items that are really a step of another item.
 const GATE_TITLE = /^\s*(retry|re-?try|resume|re-?dispatch|re-?review|qa gate|review gate|live proof|live qa|live frames|qa pr|qa:|review:|verify pr|merge pr)\b/i;
 
@@ -774,6 +777,14 @@ function policyDecide(event, ctx, pstate, rawConfig, log, now = Date.now()) {
             "payment or message id>\". A webhook without errors, pages answering 200 or tools listed are not proof.");
         }
       }
+      // Blocked is only for what the team cannot do itself: the owner's money, accounts, ID, an owner hold, or a wait on an
+      // outside party. Everything else the team unblocks (owner 2026-11-14: "20 blocked items done a day").
+      if (action === "set" && normStatus(String(params.status || "")) === "blocked" && !OWNER_BLOCK.test(String(params.note || ""))) {
+        return block("blockedReason",
+          "token-guard: Blocked is only for what the team cannot do itself. Say which one in the note: \"owner money: ...\", \"owner account: ...\", " +
+          "\"owner ID: ...\", \"owner hold: ...\" (an owner order), \"owner's laptop: ...\" or \"external wait: ...\" (an outside party, with its ticket or date). " +
+          "Anything else is the team's to unblock: dispatch the fix now, or split the item.");
+      }
       if (!orchestrator && agentId !== policy.board.agent) {
         return block("boardWrite", "token-guard: only the orchestrator and the PM change the board. Put your status in your final answer: the board moves automatically when your task ends.");
       }
@@ -920,7 +931,7 @@ function policyDecide(event, ctx, pstate, rawConfig, log, now = Date.now()) {
         if (maxNoProgress > 0 && streak >= maxNoProgress) {
           return block("loopBreak", `token-guard: ${id} has had ${streak} tasks in a row that moved nothing (blocked, partly, failed). Another try burns tokens the same way. ` +
             "Dispatch another item now (task_inbox queue). For this one: remove what blocks it, or split it into small items that one task can finish (task_inbox add), " +
-            "or move it to Blocked with the reason. After splitting or removing the blocker, move it with a note starting \"Rescoped:\" to try again.");
+            "or, if only the owner can clear it, move it to Blocked with an owner reason (owner money/account/ID/hold, external wait). After splitting or removing the blocker, move it with a note starting \"Rescoped:\" to try again.");
         }
         // A whole feature on one item: it takes half the team's tasks and rarely reaches Done. No note lifts this one.
         const maxTasksPerItem = Number(policy.board.maxTasksPerItem) || 0;
@@ -955,8 +966,8 @@ function policyDecide(event, ctx, pstate, rawConfig, log, now = Date.now()) {
         const fresh = ids.filter((id) => !inHand.has(id));
         const name = (it) => `${it.id} "${String(it.title || "").slice(0, 60)}" (${normStatus(it.status)})`;
         if (fresh.length && q.active.length >= q.wip) {
-          if (q.wip === 1) return block("queueBusy", `token-guard: one item at a time. ${q.active.map(name).join(", ")} is in hand: take it to Done (dispatch its next gate) or Blocked (with the reason) before anything new starts.`);
-          return block("queueBusy", `token-guard: the team has ${q.active.length} items in hand, its limit of ${q.wip}. Take one to Done (dispatch its next gate) or Blocked (with the reason) before anything new starts.`);
+          if (q.wip === 1) return block("queueBusy", `token-guard: one item at a time. ${q.active.map(name).join(", ")} is in hand: take it to Done (dispatch its next gate) or Blocked (with an owner reason) before anything new starts.`);
+          return block("queueBusy", `token-guard: the team has ${q.active.length} items in hand, its limit of ${q.wip}. Take one to Done (dispatch its next gate) or Blocked (with an owner reason) before anything new starts.`);
         }
         const allowed = new Set(q.next.map((it) => it.id));
         const early = fresh.filter((id) => !allowed.has(id));

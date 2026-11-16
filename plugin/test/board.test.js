@@ -30,7 +30,8 @@ test("the worker's RESULT line decides where its items go", () => {
   assert.equal(nextAfterJob("qa", "devops", "done"), "done");
   assert.equal(nextAfterJob("in_progress", "devops", "done"), "review");
   assert.equal(nextAfterJob("in_progress", "writer", "failed"), "todo");
-  assert.equal(nextAfterJob("review", "reviewer", "blocked"), "blocked");
+  assert.equal(nextAfterJob("review", "reviewer", "blocked"), "review", "a worker's blocked stays in hand: the orchestrator decides");
+  assert.equal(nextAfterJob("in_progress", "writer", "blocked"), "review");
   assert.equal(nextAfterJob("in_progress", "writer", "unknown"), "review");
   // A late or duplicate result never undoes a later decision.
   for (const st of ["done", "dropped", "archived", "blocked", "todo", "backlog"]) {
@@ -347,4 +348,19 @@ test("an item past its task cap is refused and skipped in the queue; the rest of
   assert.equal(policyDecide(piece, COORD, nine, cfg).rule, "duplicateItem", "an item under the cap still catches duplicates");
   const off = Object.assign({}, ps, { queue: () => queueState(items, { wip: 10 }) });  // the plugin builds no cap into the queue either
   assert.equal(policyDecide(spawn("feed0001"), COORD, off, Object.assign({}, CFG, { board: { wip: 10 } })).params.cleanup, "delete", "no cap set: off");
+});
+
+// 2026-11-16: the owner wants Blocked items done too; a Blocked item must name a blocker the team cannot clear itself.
+test("Blocked needs an owner reason or an outside wait; the PM's audit wording passes", () => {
+  const set = (note) => ({ toolName: "task_inbox", params: { action: "set", id: "c0ffee01", status: "blocked", note } });
+  const cfg = Object.assign({}, CFG, { board: { wip: 10 } });
+  for (const note of ["needs DNS access", "waiting for the reviewer", "Blocked: CI is red", ""]) {
+    assert.equal(policyDecide(set(note), COORD, {}, cfg).rule, "blockedReason", note);
+  }
+  for (const note of ["owner money: one real $4.99 purchase", "Audit 11-16: stays Blocked, owner's own account (ask T1)", "owner hold: no work on the game project",
+    "Owner ID: Zarinpal merchant id", "owner's laptop: WHM backups", "external wait: Bazaar review ticket 123 (2026-11-20)"]) {
+    const d = policyDecide(set(note), COORD, {}, cfg);
+    assert.ok(!d || d.rule !== "blockedReason", note);
+  }
+  assert.equal(policyDecide({ toolName: "task_inbox", params: { action: "set", id: "c0ffee01", status: "todo", note: "x" } }, COORD, {}, cfg), undefined, "other moves are not touched");
 });

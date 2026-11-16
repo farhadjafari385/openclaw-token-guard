@@ -1,3 +1,4 @@
+import { execFile } from "node:child_process";
 // The CI watch: a worker pushes, reports "RESULT: waiting" with its pipeline or pull request link and
 // ends its session; the guard follows that pipeline through the GitLab or GitHub API (no model runs)
 // and moves the item on when it finishes. Waiting inside a session re-read the whole context on every
@@ -66,4 +67,20 @@ function failedParts(link, body, checks) {
 // 10-minute wait held the queue for 12 minutes on each such MR.
 const DEFAULT_CI = { pollSeconds: 120, maxWaitMinutes: 150, noPipelineMinutes: 3 };
 
-export { parseCiLink, ciRequest, ciState, failedParts, DEFAULT_CI };
+// Reads a CI API with curl in its own process. On 2026-11-16 the gateway's own fetch failed 14 times against 8
+// successes ("fetch failed": its stalled main thread blew the connect timeout) while curl from the same host answered
+// in 0.5 s; three items sat in Review with "CI unreadable". The header (with the token) goes through stdin, never argv.
+function curlJson(url, headers = {}, timeoutSeconds = 30, run = execFile) {
+  return new Promise((resolve, reject) => {
+    const child = run("curl", ["-sS", "--fail-with-body", "-m", String(timeoutSeconds), "-K", "-", url],
+      { maxBuffer: 16 * 1024 * 1024, timeout: (timeoutSeconds + 5) * 1000 }, (error, stdout) => {
+        if (error) return reject(new Error(`curl: ${String(error.message || error).split("\n")[0].slice(0, 160)}`));
+        try { resolve(JSON.parse(stdout)); } catch { reject(new Error("curl: not JSON")); }
+      });
+    const cfg = Object.entries(headers).map(([k, v]) => `header = "${k}: ${String(v).replace(/["\\\n\r]/g, "")}"`).join("\n") + "\n";
+    child.stdin.end(cfg);
+  });
+}
+
+export {
+  curlJson, parseCiLink, ciRequest, ciState, failedParts, DEFAULT_CI };

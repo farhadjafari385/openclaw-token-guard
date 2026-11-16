@@ -20,7 +20,7 @@ import { inboxArgs, loadInboxItems, runInbox } from "./inbox.js";
 import { processBoot } from "./boot.js";
 import { selectSkills, skillsLine } from "./skills.js";
 import { mergeTriageConfig, triageSnapshot, triageSignature, TRIAGE_PROMPT, parseTriage, triageWakeMessage } from "./triage.js";
-import { parseCiLink, ciRequest, ciState, failedParts, DEFAULT_CI } from "./ci.js";
+import { parseCiLink, ciRequest, ciState, failedParts, DEFAULT_CI, curlJson } from "./ci.js";
 import { allowAgentWake, wakeMessage, DEFAULT_WAKE, WAKE_REASONS } from "./wake.js";
 import fs from "node:fs";
 import { execFile } from "node:child_process";
@@ -1010,7 +1010,14 @@ export default definePluginEntry({
       const token = readToken(req.host === "gitlab" ? ciCfg.gitlabTokenFile : ciCfg.githubTokenFile);
       if (token && req.host === "gitlab") headers["PRIVATE-TOKEN"] = token;
       if (token && req.host === "github") headers.Authorization = `Bearer ${token}`;
-      const r = await fetch(req.url, { headers, signal: AbortSignal.timeout(20000) });
+      let r;
+      try {
+        r = await fetch(req.url, { headers, signal: AbortSignal.timeout(20000) });
+      } catch (error) {
+        // The gateway's stalled main thread breaks its own connections; curl runs in a process of its own.
+        log("info", "token-guard CI watch: fetch failed, reading with curl", { url: req.url, error: String(error && error.message) });
+        return curlJson(req.url, headers, 30);
+      }
       if (!r.ok) throw new Error(`HTTP ${r.status} from ${req.host}`);
       return r.json();
     };
@@ -1040,6 +1047,7 @@ export default definePluginEntry({
             ? await ciFetch({ host: "github", url: `https://api.github.com/repos/${w.repo}/commits/${body.head.sha}/check-runs?per_page=100` }) : null;
           state = ciState(w, body, checks);
           parts = failedParts(w, body, checks);
+          if (w.errors) w.errors = 0; // five failures in a row end the watch, not five over its whole wait
         } catch (error) {
           w.errors = (w.errors || 0) + 1;
           log("warn", "token-guard CI watch could not read the pipeline", { url: w.url, error: String(error && error.message) });

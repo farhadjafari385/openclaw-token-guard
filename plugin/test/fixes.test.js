@@ -476,3 +476,21 @@ test("the meter's totals survive a merge with a copy that never saw them, and a 
   const day = new Date(now - 60000).toISOString().slice(0, 10);
   assert.equal(cliUsageByDay(ended)[day].qa, 4000);
 });
+
+// 2026-11-16: the gateway's own fetch to GitLab failed 14 times against 8 successes while curl answered in 0.5 s, and
+// items sat in Review as "CI unreadable". The fallback reads with curl; the token travels on stdin, never in argv.
+test("the CI watch reads with curl when the gateway's fetch fails, and never puts the token in argv", async () => {
+  const { curlJson } = await import("../ci.js");
+  let seen = null;
+  const fake = (cmd, args, opts, cb) => {
+    const child = { stdin: { end: (data) => { seen = { cmd, args, data }; setImmediate(() => cb(null, '{"status":"success"}')); } } };
+    return child;
+  };
+  const body = await curlJson("https://gitlab.com/api/v4/projects/1/pipelines/2", { "PRIVATE-TOKEN": "glpat-SECRET\nx", Accept: "application/json" }, 30, fake);
+  assert.deepEqual(body, { status: "success" });
+  assert.equal(seen.cmd, "curl");
+  assert.ok(!seen.args.join(" ").includes("SECRET"), "not in argv");
+  assert.match(seen.data, /^header = "PRIVATE-TOKEN: glpat-SECRETx"$/m, "on stdin, newline stripped");
+  const failing = (cmd, args, opts, cb) => ({ stdin: { end: () => setImmediate(() => cb(new Error("Command failed: curl\n(28) timeout"), "")) } });
+  await assert.rejects(curlJson("https://x/y", {}, 30, failing), /^Error: curl: Command failed: curl$/);
+});
