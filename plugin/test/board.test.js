@@ -364,3 +364,29 @@ test("Blocked needs an owner reason or an outside wait; the PM's audit wording p
   }
   assert.equal(policyDecide({ toolName: "task_inbox", params: { action: "set", id: "c0ffee01", status: "todo", note: "x" } }, COORD, {}, cfg), undefined, "other moves are not touched");
 });
+
+// 2026-11-17: three tasks ended ok but their end never moved their items; the items sat "in progress" with no task.
+test("an item a finished task left in progress gets the move its result calls for", async () => {
+  const { strandedMoves } = await import("../board.js");
+  const now = Date.parse("2026-11-17T08:30:00Z");
+  const t = (min) => now - min * 60000;
+  const items = new Map([
+    ["a0000001", { id: "a0000001", status: "in_progress", history: [{ ts: new Date(t(60)).toISOString(), to: "in_progress" }] }],
+    ["a0000002", { id: "a0000002", status: "in_progress", history: [{ ts: new Date(t(60)).toISOString(), to: "in_progress" }] }],
+    ["a0000003", { id: "a0000003", status: "in_progress", history: [{ ts: new Date(t(60)).toISOString(), to: "in_progress" }] }],
+    ["a0000004", { id: "a0000004", status: "in_progress", history: [{ ts: new Date(t(1)).toISOString(), to: "review" }] }],
+    ["a0000005", { id: "a0000005", status: "review", history: [] }],
+  ]);
+  const jobs = {
+    j1: { short: "j1", agentId: "writer", items: ["a0000001"], status: "ended", outcome: "ok", endedAt: t(50), resultText: "MR opened, CI running.\nNext: review." },
+    j2: { short: "j2", agentId: "reviewer", items: ["a0000002"], status: "ended", outcome: "ok", endedAt: t(2), resultText: "RESULT: done" },
+    j3a: { short: "j3a", agentId: "writer", items: ["a0000003"], status: "ended", outcome: "ok", endedAt: t(50), resultText: "RESULT: done" },
+    j3b: { short: "j3b", agentId: "writer", items: ["a0000003"], status: "running", spawnedAt: t(10) },
+    j4: { short: "j4", agentId: "qa", items: ["a0000004"], status: "ended", outcome: "ok", endedAt: t(30), resultText: "RESULT: done" },
+    j5: { short: "j5", agentId: "qa", items: ["a0000005"], status: "ended", outcome: "ok", endedAt: t(30), resultText: "RESULT: done" },
+  };
+  assert.deepEqual(strandedMoves(items, jobs, now), [{ id: "a0000001", to: "review", job: "j1", agent: "writer", verdict: "unknown" }],
+    "only the stranded one: not one that just ended, has a task running, was moved since, or is not in progress");
+  jobs.j1.resultText = "RESULT: failed\n- tests red";
+  assert.equal(strandedMoves(items, jobs, now)[0].to, "todo");
+});

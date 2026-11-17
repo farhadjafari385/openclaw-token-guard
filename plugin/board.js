@@ -79,6 +79,29 @@ function nextAfterJob(before, role, verdict) {
 // ---- the queue: one item at a time, in the order the PM keeps ----
 // Items in In progress, Review or QA are the work in hand; To do is the queue. The order: the PM's rank
 // (1 first; unranked after), then the project order the owner set, then priority, then age.
+// Items a finished task left in In progress (2026-11-17: three tasks ended ok at 07:33-08:01, their end never moved
+// their items, and the items sat "in progress" with no task for an hour while the queue counted them as in hand).
+// Returns the moves the end should have made: an item In progress, no running task on it, its newest task ended
+// more than `minMs` ago, and nothing moved the item since that end.
+function strandedMoves(items, jobs, now = Date.now(), minMs = 5 * 60000) {
+  const list = [...(items instanceof Map ? items.values() : items || [])];
+  const all = Object.values(jobs || {});
+  const running = new Set(all.filter((j) => j.status === "running").flatMap((j) => j.items || []));
+  const out = [];
+  for (const it of list) {
+    if (normStatus(it.status) !== "in_progress" || running.has(it.id)) continue;
+    const last = all.filter((j) => (j.items || []).includes(it.id) && j.endedAt).sort((a, b) => b.endedAt - a.endedAt)[0];
+    if (!last || now - last.endedAt < minMs) continue;
+    const moved = (it.history || []).some((h) => Date.parse(h && h.ts) > last.endedAt);
+    if (moved) continue;
+    let verdict = resultVerdict(last.resultText, last.outcome);
+    if (verdict === "waiting") verdict = "unknown";
+    const to = nextAfterJob("in_progress", last.agentId, verdict);
+    if (to !== "in_progress") out.push({ id: it.id, to, job: last.short || "", agent: last.agentId, verdict });
+  }
+  return out;
+}
+
 const ACTIVE = new Set(["in_progress", "review", "qa"]);
 const PRIORITY_RANK = { urgent: 0, high: 1, normal: 2, low: 3 };
 
@@ -217,6 +240,6 @@ function looksLikeRequest(text) {
 
 export {
   COLUMNS, LEGACY, LABELS, TRANSITIONS, DISPATCHABLE, OPEN, AUTO_FROM, FAILED_OUTCOMES,
-  ACTIVE, queueOrder, queueState,
+  ACTIVE, queueOrder, queueState, strandedMoves,
   isLimitBlock, normStatus, canMove, resultVerdict, nextAfterJob, renderBoard, renderOverview, auditBoard, parseApproval, looksLikeRequest,
 };

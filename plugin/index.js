@@ -3,7 +3,7 @@ import { definePluginEntry } from "openclaw/plugin-sdk/plugin-entry";
 import { Type } from "typebox";
 import { createState, decide, forgetRefusedBrief } from "./guard.js";
 import { policyDecide, firstLine, itemsFromBrief, completeBrief, codexEnabled, CHECK_COMMAND, GRAPH_COMMAND } from "./policy.js";
-import { ACTIVE, isLimitBlock, normStatus, resultVerdict, nextAfterJob, queueState, renderBoard, renderOverview, auditBoard, parseApproval, looksLikeRequest } from "./board.js";
+import { ACTIVE, strandedMoves, isLimitBlock, normStatus, resultVerdict, nextAfterJob, queueState, renderBoard, renderOverview, auditBoard, parseApproval, looksLikeRequest } from "./board.js";
 import { correctTopic, isGeneral, projectOfTopic, projectsMentioned } from "./topics.js";
 import { isLimitError, isLimitReply, isRunFailureReply, allowLimitReply, limitResetAt } from "./limits.js";
 import {
@@ -23,6 +23,7 @@ import { mergeTriageConfig, triageSnapshot, triageSignature, TRIAGE_PROMPT, pars
 import { parseCiLink, ciRequest, ciState, failedParts, DEFAULT_CI, curlJson } from "./ci.js";
 import { allowAgentWake, wakeMessage, DEFAULT_WAKE, WAKE_REASONS } from "./wake.js";
 import fs from "node:fs";
+import { ownerQuestion, allowHold, decideWakeText } from "./ownerask.js";
 import { execFile } from "node:child_process";
 import { mergeRefusalConfig, isLoginRefusal, recordRefusal, dueRefusals, closeRefusals, refusalsWithinHour, retryWakeText } from "./refusal.js";
 
@@ -111,7 +112,9 @@ export default definePluginEntry({
 
     // ---- the board ----
     const projectFor = (item) => projectsMentioned(` project: ${item && item.project} `, projects)[0] || String((item && item.project) || "").toLowerCase();
-    const systemMove = (id, to, note) => runInbox(["set", id, "--status", to, "--by", "system", "--note", String(note || "").slice(0, 300)]).catch(() => null);
+    const systemMove = (id, to, note) => runInbox(["set", id, "--status", to, "--by", "system", "--note", String(note || "").slice(0, 300)])
+      .then((r) => { if (r && r.code) log("warn", "token-guard board move failed", { id, to, code: r.code, text: String(r.text || "").slice(0, 200) }); return r; })
+      .catch((error) => { log("warn", "token-guard board move failed", { id, to, error: String(error && error.message) }); return null; });
     const boardTimers = new Map();
     const refreshBoard = (project) => {
       if (!boardCfg.enabled || !boardCfg.view || !project) return;
@@ -713,6 +716,7 @@ export default definePluginEntry({
 
     // ---- topics: a reply that belongs in another topic is cancelled and reposted there ----
     const pointed = new Set();
+    const ownerAskHolds = new Map(); // session -> last hold time
     const limitReplies = new Map(); // destination -> limit reset time
     api.on("message_sending", safe("message_sending", (event, ctx) => {
       // While Claude's usage limit holds, OpenClaw answers every message with "⚠️ OpenClaw couldn't finish this reply ..."
@@ -745,6 +749,16 @@ export default definePluginEntry({
       // The owner's private chat with the orchestrator (a Telegram DM's chat id is the owner's user id).
       const toOwner = !!ownerId && String(event.to || "").split(":").pop() === ownerId;
       if (!String(event.to || "").includes(chatId) && !toOwner) return undefined;
+      // The orchestrator does not stop to ask the owner what it can decide (owner, 2026-11-17): the message is held
+      // and the orchestrator is woken to decide and act. At most one hold per session in 10 minutes.
+      const question = fromOrc ? ownerQuestion(event.content) : null;
+      if (question && allowHold(ownerAskHolds, sessionKey) && api.runtime && api.runtime.subagent && typeof api.runtime.subagent.run === "function") {
+        const where = toOwner ? `in the owner's private chat (message tool: channel telegram, target ${ownerId})` : `in topic ${event.threadId || 1} of the team group`;
+        api.runtime.subagent.run({ sessionKey: jobsCfg.idleWakeSession, deliver: false, message: decideWakeText(question, where) })
+          .catch((error) => log("warn", "token-guard could not wake the orchestrator after holding an owner question", { error: String(error && error.message) }));
+        log("info", "token-guard held an orchestrator question to the owner", { question: question.slice(0, 160), toOwner });
+        return { cancel: true, cancelReason: "token-guard: decide it yourself; the owner is not asked what the team can decide" };
+      }
       const current = toOwner || isGeneral(event.threadId) ? null : Number(event.threadId);
       // The orchestrator answering a result: the answer belongs in that task's project topic, under the
       // worker's result, even when the task was dispatched from another topic's session.
@@ -931,6 +945,13 @@ export default definePluginEntry({
       store.save();
       let inboxItems = [];
       try { inboxItems = [...loadInboxItems().values()]; } catch { inboxItems = []; }
+      // Finished work never waits: an item a task's end did not move gets that move now.
+      if (boardCfg.enabled) {
+        for (const m of strandedMoves(inboxItems, store.data.jobs, Date.now())) {
+          log("info", "token-guard moved an item its finished task left in progress", m);
+          await systemMove(m.id, m.to, `${m.agent} task ended: ${m.verdict} [job ${m.job}] (moved by the guard: the end did not move it)`);
+        }
+      }
       const actions = scanJobs(store.data, jobsCfg, Date.now(), {
         bootId: BOOT_ID,
         bootStartedAt: BOOT_STARTED_AT,

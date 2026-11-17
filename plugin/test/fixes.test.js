@@ -494,3 +494,22 @@ test("the CI watch reads with curl when the gateway's fetch fails, and never put
   const failing = (cmd, args, opts, cb) => ({ stdin: { end: () => setImmediate(() => cb(new Error("Command failed: curl\n(28) timeout"), "")) } });
   await assert.rejects(curlJson("https://x/y", {}, 30, failing), /^Error: curl: Command failed: curl$/);
 });
+
+// 2026-11-17, owner: "THE ORC AGENTS ALWAYS HOLD TO ASK ME SHIT QUESTIONS!!! PREVENT IT". Ten asks in 24 h; the ones
+// that needed the owner were a login code on the owner's phone and a password-handling change.
+test("the orchestrator's questions to the owner are held unless only the owner can answer them", async () => {
+  const { ownerQuestion, allowHold } = await import("../ownerask.js");
+  for (const t of ["Which app is this for, the shop or the game's Android build?", "Is it OK to use it just for those two numbers?",
+    "Done.\n\nShould I merge it now or wait for QA?", "- Do you want me to start the redesign?"]) {
+    assert.ok(ownerQuestion(t), t);
+  }
+  for (const t of ["Could you request a login code once and confirm it arrives?", "Do you approve paying $99 for the Apple account?",
+    "Can you scan the QR code to sign in to Telegram?", "**Why it failed:** your question (\"which one is done NOW?\") got no answer.",
+    "The pipeline is green. QA is next.", "What broke? The cache key changed.", "Should I delete the old production database?"]) {
+    assert.equal(ownerQuestion(t), null, t);
+  }
+  const holds = new Map();
+  assert.equal(allowHold(holds, "s", 0), true);
+  assert.equal(allowHold(holds, "s", 60000), false, "a reply is not held twice in a row");
+  assert.equal(allowHold(holds, "s", 11 * 60000), true);
+});
