@@ -1,3 +1,4 @@
+import { paceText } from "./pace.js";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -376,7 +377,15 @@ function normaliseModel(model, allowed) {
   const up = allowed.map((a) => ({ a, v: modelVersion(a) }))
     .filter((x) => x.v && x.v.family === want.family && (x.v.version[0] - want.version[0] || x.v.version[1] - want.version[1]) >= 0)
     .sort((x, y) => x.v.version[0] - y.v.version[0] || x.v.version[1] - y.v.version[1]);
-  return up.length ? up[0].a : null;
+  if (up.length) return up[0].a;
+  // A family taken out of allowedModels altogether (Opus, 2026-11-17: it spends a plan's weekly limit about 1.7
+  // times as fast) runs on the newest allowed version of the next family down, instead of failing the dispatch.
+  const order = ["opus", "sonnet"];
+  if (!order.includes(want.family) || allowed.some((a) => (modelVersion(a) || {}).family === want.family)) return null;
+  const down = allowed.map((a) => ({ a, v: modelVersion(a) }))
+    .filter((x) => x.v && x.v.family === order[order.indexOf(want.family) + 1])
+    .sort((x, y) => y.v.version[0] - x.v.version[0] || y.v.version[1] - x.v.version[1]);
+  return down.length ? down[0].a : null;
 }
 
 // A brief's own setting line, "Model: <value>" or "Effort: <value>": the colon is required (so "Model
@@ -984,6 +993,9 @@ function policyDecide(event, ctx, pstate, rawConfig, log, now = Date.now()) {
         return block("maintenance", "token-guard: the gateway is being restarted for maintenance, so a task started now would be cut off. Do not dispatch now and leave the items as they are: the job tracker wakes you again once the gateway is back.");
       }
     }
+    // Ahead of the weekly pace: the week's allowance would run out days before the reset.
+    const pace = pstate && pstate.paceHold;
+    if (pace && pace.until > now) return block("weeklyPace", paceText(pace, now));
     const claudeUntil = (pstate && pstate.claudeLimitedUntil) || 0;
     const codexUntil = (pstate && pstate.codexLimitedUntil) || 0;
     // The date too when it is not today: "until 02:00 UTC" read as already past when the limit ran two days.

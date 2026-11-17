@@ -124,6 +124,11 @@ function mergeStates(a, b) {
   // A limit cleared after it was recorded stays cleared, whichever copy still holds the old one.
   out.claudeLimitedUntil = out.claudeLimitClearedAt > out.claudeLimitedAt ? 0 : Math.max(a.claudeLimitedUntil || 0, b.claudeLimitedUntil || 0);
   out.codexLimitedUntil = Math.max(a.codexLimitedUntil || 0, b.codexLimitedUntil || 0);
+  // The weekly-pace reading: the newest one wins.
+  const pace = (a.paceCheckedAt || 0) >= (b.paceCheckedAt || 0) ? a : b;
+  out.paceCheckedAt = pace.paceCheckedAt || 0;
+  out.paceHold = pace.paceHold || null;
+  out.paceUsage = pace.paceUsage || null;
   out.ownerLimitNoticeAt = Math.max(a.ownerLimitNoticeAt || 0, b.ownerLimitNoticeAt || 0);
   out.ownerLimitAnsweredAt = Math.max(a.ownerLimitAnsweredAt || 0, b.ownerLimitAnsweredAt || 0);
   out.claudeLimitText = (a.claudeLimitedUntil || 0) >= (b.claudeLimitedUntil || 0) ? a.claudeLimitText : b.claudeLimitText;
@@ -422,6 +427,8 @@ function scanJobs(data, rawCfg, now, env) {
     if (!sessionKey) return false;
     // Claude at its limit and no Codex to run on (off, or limited too): a wake cannot run, so do not spend one.
     if ((data.claudeLimitedUntil || 0) > now && (!env.codexEnabled || (data.codexLimitedUntil || 0) > now)) return false;
+    // Ahead of the weekly pace: the guard's own wakes wait too (each costs a full orchestrator turn).
+    if (data.paceHold && data.paceHold.until > now) return false;
     if (!canWake(data, cfg, now)) {
       const day = dayKey(now);
       if (data.notes.wakeCap !== day) {

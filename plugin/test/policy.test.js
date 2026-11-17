@@ -459,3 +459,23 @@ test("an old or retired model version runs on the next allowed version of its fa
   assert.equal(run("anthropic/claude-sonnet-7", later).block, true);
   assert.equal(run("anthropic/claude-fable-5-2").block, true);
 });
+
+test("ahead of the weekly pace, a dispatch waits and says until when", () => {
+  const now = Date.parse("2026-11-17T14:01:00Z");
+  const spawn = { toolName: "sessions_spawn", params: { agentId: "writer", task: "Project: ai\nX" } };
+  const hold = { until: Date.parse("2026-11-20T09:12:00Z"), reason: "pace", used: 95, allowed: 57, elapsed: 50 };
+  const r = policyDecide(spawn, COORD, { paceHold: hold }, {}, null, now);
+  assert.equal(r.block, true);
+  assert.match(r.blockReason, /ahead of its weekly allowance \(95%.*until Fri, 20 Nov 09:12 UTC/);
+  assert.notEqual(rule(policyDecide(spawn, COORD, { paceHold: Object.assign({}, hold, { until: now - 1 }) }, {}, null, now)), "weeklyPace");
+});
+
+test("with Opus out of the allowed models, an Opus request runs on the newest Sonnet instead of failing", () => {
+  const SONNET_ONLY = { spawn: { allowedModels: ["anthropic/claude-sonnet-5-5", "anthropic/claude-haiku-5-5"] } };
+  const spawn = { toolName: "sessions_spawn", params: { agentId: "writer", task: "Project: ai\nX", model: "anthropic/claude-opus-5-5" } };
+  const r = policyDecide(spawn, COORD, {}, SONNET_ONLY);
+  assert.notEqual(r && r.block, true);
+  assert.equal(r.params.model, "anthropic/claude-sonnet-5-5");
+  // Opus still allowed: it stays Opus
+  assert.equal(policyDecide(spawn, COORD, {}, { spawn: { allowedModels: ["anthropic/claude-opus-5-5", "anthropic/claude-sonnet-5-5"] } }).params.model, "anthropic/claude-opus-5-5");
+});

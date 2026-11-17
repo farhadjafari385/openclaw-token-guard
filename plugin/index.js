@@ -24,6 +24,7 @@ import { parseCiLink, ciRequest, ciState, failedParts, DEFAULT_CI, curlJson } fr
 import { allowAgentWake, wakeMessage, DEFAULT_WAKE, WAKE_REASONS } from "./wake.js";
 import fs from "node:fs";
 import { ownerQuestion, allowHold, decideWakeText } from "./ownerask.js";
+import { mergePaceConfig, paceHold, paceText } from "./pace.js";
 import { execFile } from "node:child_process";
 import { mergeRefusalConfig, isLoginRefusal, recordRefusal, dueRefusals, closeRefusals, refusalsWithinHour, retryWakeText } from "./refusal.js";
 
@@ -87,6 +88,12 @@ export default definePluginEntry({
 
     const store = createJobStore(jobsCfg.stateFile);
     store.load();
+    const paceCfg = mergePaceConfig(cfg.pace);
+    // The weekly-pace hold in force now, or null.
+    const paced = () => {
+      const h = paceCfg.enabled ? store.data.paceHold : null;
+      return h && h.until > Date.now() ? h : null;
+    };
     // Another copy of the plugin may have written newer state (message ids, owner messages): read it first.
     let freshAt = 0;
     const fresh = () => {
@@ -371,6 +378,7 @@ export default definePluginEntry({
     const pstate = {
       get claudeLimitedUntil() { return store.data.claudeLimitedUntil || 0; },
       get codexLimitedUntil() { return store.data.codexLimitedUntil || 0; },
+      get paceHold() { return paced(); },
       // The deploy script touches this file before it stops the gateway (and removes it once it is back).
       maintenanceSince: () => {
         try { return fs.statSync(String(jobsCfg.stateFile).replace(/^~/, process.env.HOME || "").replace(/[^/]+$/, "maintenance")).mtimeMs; } catch { return 0; }
@@ -923,10 +931,47 @@ export default definePluginEntry({
     const generation = crypto.randomUUID();
     const isActive = () => globalThis[GEN_KEY] === generation;
     const BOOT_GRACE_MS = 10 * 60000; // agents are still loading after a gateway start
+    // ---- weekly pace: read the plan's usage; ahead of an even pace, dispatches and the guard's wakes wait ----
+    const paceTick = async () => {
+      if (!paceCfg.enabled) return;
+      const now = Date.now();
+      if (now - (store.data.paceCheckedAt || 0) < paceCfg.everyMinutes * 60000) return;
+      store.data.paceCheckedAt = now;
+      store.touch();
+      let token = "";
+      try { token = JSON.parse(fs.readFileSync(String(paceCfg.credentialsFile).replace(/^~/, process.env.HOME || ""), "utf8")).claudeAiOauth.accessToken || ""; } catch { token = ""; }
+      if (!token) return;
+      let usage;
+      try { usage = await curlJson(paceCfg.url, { Authorization: `Bearer ${token}`, "anthropic-beta": "oauth-2025-04-20" }, 20); } catch (error) {
+        log("warn", "token-guard could not read the plan usage", { error: String(error && error.message).replace(/Bearer \S+/g, "Bearer ***").slice(0, 160) });
+        return;
+      }
+      const prev = paced();
+      const hold = paceHold(usage, now, paceCfg);
+      const week = usage && usage.seven_day, five = usage && usage.five_hour;
+      store.data.paceUsage = { at: now, week: week ? week.utilization : null, weekResetsAt: week ? week.resets_at : null, five: five ? five.utilization : null };
+      store.data.paceHold = hold;
+      store.touch();
+      store.save();
+      if (hold && (!prev || prev.reason !== hold.reason)) {
+        log("info", "token-guard: ahead of the weekly pace; dispatches wait", { reason: hold.reason, used: hold.used, until: new Date(hold.until).toISOString() });
+        systemNote(`pace:${hold.reason}`, `⏸️ ${paceText(hold, now).replace(/^token-guard: /, "")}`);
+      }
+      if (!hold && prev) {
+        log("info", "token-guard: back on the weekly pace", { used: store.data.paceUsage.week });
+        if (api.runtime && api.runtime.subagent && typeof api.runtime.subagent.run === "function") {
+          await api.runtime.subagent.run({ sessionKey: jobsCfg.idleWakeSession, deliver: false,
+            message: `[pace] The team is back on its weekly pace (${store.data.paceUsage.week}% of the Claude plan's weekly limit used). Dispatch the queue now, one item at a time.` })
+            .catch((error) => log("warn", "token-guard could not wake the orchestrator after the pace hold", { error: String(error && error.message) }));
+        }
+      }
+    };
+
     const tick = async () => {
       if (!jobsCfg.enabled || !isActive()) return;
       if (Date.now() - BOOT_STARTED_AT < BOOT_GRACE_MS) return;
       store.refresh();
+      try { await paceTick(); } catch (error) { log("warn", "token-guard pace check failed", { error: String(error && error.message).slice(0, 160) }); }
       // The spawned run ended and the task has been quiet since, but no end event came: close it.
       for (const job of Object.values(store.data.jobs)) {
         if (job.status !== "running" || !job.runOutcome) continue;
@@ -997,7 +1042,7 @@ export default definePluginEntry({
     };
     // ---- a dispatch refused by OpenClaw's login check: check again, then the orchestrator sends it again ----
     const refusalTick = async () => {
-      if (!refusalCfg.enabled) return;
+      if (!refusalCfg.enabled || paced()) return;
       const now = Date.now();
       for (const [, r] of dueRefusals(store.data, now, refusalCfg)) {
         const name = nameOf(voice, r.agentId);
@@ -1096,7 +1141,7 @@ export default definePluginEntry({
         post(orchestrator, job.topic || "system", `🔁 CI ${outcome === "success" ? "passed ✅" : outcome === "failed" ? "failed ❌" : outcome} for <b>${String(job.label || "").replace(/[<>&]/g, "")}</b>: ${moved}`, { html: true, replyTo: job.resultMsgId || null });
         const day = new Date(now).toISOString().slice(0, 10);
         store.data.wakesByDay[day] = (store.data.wakesByDay[day] || 0) + 1;
-        if (api.runtime && api.runtime.subagent && typeof api.runtime.subagent.run === "function") {
+        if (!paced() && api.runtime && api.runtime.subagent && typeof api.runtime.subagent.run === "function") {
           await api.runtime.subagent.run({ sessionKey: jobsCfg.idleWakeSession, deliver: false,
             message: `[ci] The pipeline of "${job.label}" ended: ${outcome} (${w.url}). Board: ${moved}. ${todo} One item at a time: this item stays in hand until it is Done or Blocked.` })
             .catch((error) => log("warn", "token-guard could not wake the orchestrator after CI", { error: String(error && error.message) }));
@@ -1142,7 +1187,7 @@ export default definePluginEntry({
       if (!serious.length || !due || !api.runtime || !api.runtime.subagent || typeof api.runtime.subagent.run !== "function") return;
       // The PM runs on Claude: during a Claude limit the run can only fail (it once posted "Board check
       // (error): nothing to fix" and used up the 3-hour slot). Wait for the reset instead.
-      if ((store.data.claudeLimitedUntil || 0) > now) return;
+      if ((store.data.claudeLimitedUntil || 0) > now || paced()) return;
       store.data.pmAudit = { lastAt: now };
       store.touch();
       const sessionKey = `agent:${pm}:subagent:board-audit-${now.toString(36)}`;
@@ -1215,6 +1260,7 @@ export default definePluginEntry({
       store.data.triage = store.data.triage || { lastAt: 0 };
       if (now - (store.data.triage.lastAt || 0) < triageCfg.everyMinutes * 60000) return;
       if ((store.data.claudeLimitedUntil || 0) > now) return; // Haiku is Claude; the plain wakes still run
+      if (paced()) return; // ahead of the weekly pace: no wake to spend
       const lastOrc = Math.max(0, ...Object.values(store.data.orcActivity || {}).map(Number));
       if (now - lastOrc < triageCfg.orchestratorQuietMinutes * 60000) return; // it is working: do not interrupt
       store.data.triage.lastAt = now;
