@@ -44,6 +44,19 @@ const WAITERS = new Set(["oc-wait", "oc-wait-pipeline"]);
 const WRAPPERS = new Set(["nohup", "exec", "env", "command", "builtin", "nice", "setsid", "stdbuf"]);
 const INTERPRETERS = /^(python[0-9.]*|bash|sh)$/;
 
+// How a refused mixed brief splits: each non-small item alone; small items together by project and owner.
+function batchesOf(items) {
+  const out = [];
+  const groups = new Map();
+  for (const it of items) {
+    if (it.size !== "small") { out.push([it.id]); continue; }
+    const k = `${it.project || ""}|${it.owner || ""}`;
+    if (!groups.has(k)) { groups.set(k, []); out.push(groups.get(k)); }
+    groups.get(k).push(it.id);
+  }
+  return out;
+}
+
 function mergeConfig(cfg) {
   const merged = Object.assign({}, DEFAULT_CONFIG);
   for (const [key, value] of Object.entries(cfg || {})) {
@@ -712,7 +725,8 @@ function decide(event, ctx, state, rawConfig, log, now = Date.now()) {
           (big.length > 0
             ? `token-guard: ${big.map((it) => `${it.id} (${it.size})`).join(", ")} must each get a fresh session of its own. `
             : "token-guard: these items belong to different projects or owners. ") +
-          "Only small items of the same project, owner and area share one session. Run task_inbox plan and start one session per batch.");
+          "Only small items of the same project, owner and area share one session. Send these now, one sessions_spawn each: " +
+          batchesOf(items).map((b) => b.join(" + ")).join("; ") + ".");
       }
     }
   }

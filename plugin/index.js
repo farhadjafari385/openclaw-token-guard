@@ -400,6 +400,8 @@ export default definePluginEntry({
       jobOf: (sessionKey) => fresh().jobs[sessionKey] || null,
       runCalls: (runId) => (runId && orcRunCalls.get(runId)) || 0,
       queue: () => queueNow(loadInboxItems()),
+      // What the orchestrator can dispatch right now (added to a refused dispatch), or a plain "nothing: end your turn".
+      startable: () => startableText(),
       runningTasks: (agentId) => runningByAgent()[agentId] || 0,
       noProgressStreak: (id, item) => streakOf(id, item),
       itemTasks: (id) => itemTaskCount(Object.values(fresh().jobs), id),
@@ -1170,6 +1172,18 @@ export default definePluginEntry({
       if (out === lastQueue) return;
       lastQueue = out;
       fs.writeFileSync(String(jobsCfg.stateFile).replace(/^~/, home).replace(/[^/]+$/, "queue.json"), out);
+    };
+    const startableText = () => {
+      const q = queueNow(loadInboxItems());
+      const busy = runningItemIds();
+      const line = (it) => `- ${it.id} [${normStatus(it.status)}] ${String(it.title || "").slice(0, 70)} (owner ${it.owner || "?"})`;
+      const gates = q.active.filter((it) => !busy.has(it.id) && ["in_progress", "review", "qa"].includes(normStatus(it.status)));
+      const fresh0 = q.next.filter((it) => !busy.has(it.id));
+      if (!gates.length && !fresh0.length) {
+        return "Nothing can be dispatched now: every item in hand is being worked on or waits on CI, and no queued item's agent is free. " +
+          "Stop dispatching and end your turn; the guard wakes you when a task ends.";
+      }
+      return ["Can dispatch now:", ...gates.slice(0, 5).map((it) => `${line(it)}: its next gate`), ...fresh0.slice(0, 5).map(line)].join("\n");
     };
     const queueText = () => {
       const q = queueNow(loadInboxItems());

@@ -633,6 +633,8 @@ function canonicalProject(policy, name) {
 }
 // A merge of a merge request or pull request: CLI or the GitLab/GitHub merge API.
 const MERGE_COMMAND = /\b(?:glab|gh)\b[^;&|\n]*?\b(?:mr|pr)\s+merge\b|\/merge_requests\/\d+\/merge\b|\/pulls\/\d+\/merge\b/;
+// Dispatch refusals that come with the list of what can start now.
+const DISPATCH_HINT_RULES = new Set(["boardBusy", "agentBusy", "queueBusy", "queueOrder", "loopBreak", "splitItem", "ownerBlocked", "boardItems"]);
 const projectList = (policy) => Object.keys(policy.projects || {}).join(", ");
 
 function projectName(policy, line) {
@@ -737,6 +739,11 @@ function policyDecide(event, ctx, pstate, rawConfig, log, now = Date.now()) {
   const block = (rule, reason) => {
     if (typeof log === "function") log(enforce ? "warn" : "info", `token-guard ${enforce ? "blocked" : "would block"} ${tool} (${rule})`, { rule, agentId, sessionKey, toolName: tool });
     if (pstate && typeof pstate.onBlock === "function") pstate.onBlock(rule, { agentId, sessionKey, tool });
+    // A refused dispatch says what can be dispatched instead, so the orchestrator does not spend another turn looking it
+    // up or retrying the same refusal (2026-11-17: 126 refused dispatches in a day, up to 12 of one rule in a row).
+    if (tool === "sessions_spawn" && orchestrator && DISPATCH_HINT_RULES.has(rule) && pstate && typeof pstate.startable === "function") {
+      try { const hint = pstate.startable(); if (hint) reason = `${reason}\n${hint}`; } catch { /* a hint is optional */ }
+    }
     return enforce ? { block: true, blockReason: reason, rule } : undefined;
   };
 

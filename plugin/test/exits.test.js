@@ -141,3 +141,36 @@ test("one merge at a time per project: a merge waits while the last merge's main
     assert.equal(MERGE_COMMAND.test(c), false, c);
   }
 });
+
+test("a refused dispatch says what can be dispatched now, or to end the turn", () => {
+  const board = new Map([["aa11bb22", { id: "aa11bb22", project: "demo", title: "In hand", status: "review" }]]);
+  const COORD = { agentId: "coordinator", sessionKey: "agent:coordinator:main" };
+  const cfg = { orchestratorAgent: "coordinator", projects: { demo: "/srv/demo" }, board: { requireItems: true } };
+  const spawn = { toolName: "sessions_spawn", params: { agentId: "reviewer", task: BRIEF("aa11bb22") } };
+  const ps = (hint) => ({ boardItems: () => board, runningItemIds: () => new Set(["aa11bb22"]), startable: () => hint });
+  const r = policyDecide(spawn, COORD, ps("Can dispatch now:\n- cc33dd44 [todo] Next thing (owner writer)"), cfg);
+  assert.equal(r.rule, "boardBusy");
+  assert.match(r.blockReason, /already being worked on[\s\S]*\nCan dispatch now:\n- cc33dd44/);
+  const none = policyDecide(spawn, COORD, ps("Nothing can be dispatched now: ... end your turn"), cfg);
+  assert.match(none.blockReason, /end your turn/);
+  // A worker's refusal, or a hint that throws, is unchanged.
+  const thrower = { boardItems: () => board, runningItemIds: () => new Set(["aa11bb22"]), startable: () => { throw new Error("x"); } };
+  assert.doesNotMatch(policyDecide(spawn, COORD, thrower, cfg).blockReason, /Can dispatch/);
+});
+
+test("a refused mixed brief lists the split, so no plan lookup is needed", async () => {
+  const { decide, createState } = await import("../guard.js");
+  const s = createState();
+  const items = [
+    { id: "aa000001", project: "demo", owner: "writer", size: "medium" },
+    { id: "aa000002", project: "demo", owner: "writer", size: "small" },
+    { id: "aa000003", project: "demo", owner: "writer", size: "small" },
+    { id: "aa000004", project: "other", owner: "qa", size: "small" },
+  ];
+  s.lookupInbox = () => new Map(items.map((it) => [it.id, it]));
+  const ctx = { agentId: "coordinator", sessionKey: "agent:coordinator:main" };
+  const task = `${BRIEF(items.map((it) => it.id).join(", "))}\n${"Detail. ".repeat(20)}`;
+  const r = decide({ toolName: "sessions_spawn", params: { agentId: "writer", task } }, ctx, s, {});
+  assert.ok(r && r.block, "mixed brief refused");
+  assert.match(r.blockReason, /one sessions_spawn each: aa000001; aa000002 \+ aa000003; aa000004\./);
+});
