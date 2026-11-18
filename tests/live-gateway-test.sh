@@ -34,22 +34,23 @@ if (exec 3<>"/dev/tcp/127.0.0.1/$PORT") 2>/dev/null; then echo "port $PORT is bu
 SBX="$(mktemp -d /tmp/token-guard-live.XXXXXX)"
 TOKEN="$(python3 -c 'import secrets; print(secrets.token_hex(24))')"
 mkdir -p "$SBX/state" "$SBX/plugin/node_modules" "$SBX/home/.openclaw/bin"
-cp "$REPO_ROOT"/plugin/{index.js,guard.js,inbox.js,package.json,openclaw.plugin.json} "$SBX/plugin/"
+# Every module the plugin imports (2026-11-18, F03: only 5 files were copied while index.js imports ~15).
+cp "$REPO_ROOT"/plugin/*.js "$REPO_ROOT"/plugin/{package.json,openclaw.plugin.json} "$SBX/plugin/"
 ln -s "$OC_PKG" "$SBX/plugin/node_modules/openclaw"
 [ -d "$OC_PKG/node_modules/typebox" ] && cp -rL "$OC_PKG/node_modules/typebox" "$SBX/plugin/node_modules/typebox"
-cp "$REPO_ROOT"/bin/* "$SBX/home/.openclaw/bin/"
+for f in "$REPO_ROOT"/bin/*; do [ -f "$f" ] && cp "$f" "$SBX/home/.openclaw/bin/"; done
 
 cat > "$SBX/openclaw.json" <<JSON
 {
   "gateway": {
     "mode": "local", "bind": "loopback", "port": $PORT,
     "auth": { "mode": "token", "token": "$TOKEN" },
-    "tools": { "allow": ["exec", "sessions_send"] }
+    "tools": { "allow": ["exec", "process", "sessions_send", "sessions_spawn"] }
   },
   "tools": { "profile": "full", "alsoAllow": ["task_inbox"], "exec": { "host": "gateway", "mode": "full" } },
   "plugins": {
     "load": { "paths": ["$SBX/plugin"] },
-    "entries": { "token-guard": { "enabled": true, "config": { "briefCheckAgents": [] } } }
+    "entries": { "token-guard": { "enabled": true, "config": { "briefCheckAgents": [], "orchestratorAgent": "main" } } }
   }
 }
 JSON
@@ -76,14 +77,20 @@ invoke() { # tool json-args -> prints "HTTP_CODE BODY"
   curl -s -m 60 -o "$SBX/out.json" -w '%{http_code}' -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
     -d "{\"tool\":\"$1\",\"args\":$2,\"sessionKey\":\"agent:main:main\"}" "http://127.0.0.1:$PORT/tools/invoke"
 }
-expect() { # name tool args want(blocked|allowed) [grep]
-  local name="$1" tool="$2" args="$3" want="$4" pattern="${5:-}"
+NOT_VERIFIED=0
+expect() { # name tool args want(blocked|allowed) [grep] [mandatory]
+  local name="$1" tool="$2" args="$3" want="$4" pattern="${5:-}" mandatory="${6:-}"
   local code; code="$(invoke "$tool" "$args")"
   local body; body="$(cat "$SBX/out.json" 2>/dev/null)"
   local got="error"
   if [ "$code" = "403" ] && printf '%s' "$body" | grep -q 'token-guard'; then got="blocked"; fi
   if [ "$code" = "200" ]; then got="allowed"; fi
   if [ "$got" = "error" ] && [ "$code" = "404" ] && printf '%s' "$body" | grep -q 'Tool not available'; then
+    if [ -n "$mandatory" ]; then # a gate that could not be exercised is not a pass
+      printf 'NOT VERIFIED  %-38s %s is not reachable over HTTP; this gate is unproven here\n' "$name" "$tool"
+      NOT_VERIFIED=$((NOT_VERIFIED + 1))
+      return
+    fi
     printf 'SKIP  %-46s %s is not exposed over HTTP here (unit tests + live agent check cover it)\n' "$name" "$tool"
     SKIPS=$((SKIPS + 1))
     return
@@ -115,12 +122,15 @@ expect "process: kill never blocked"              process '{"action":"kill","ses
 for i in 1 2 3; do expect "exec: status command run $i" exec '{"command":"echo same-status"}' allowed; done
 expect "exec: same command 4th time blocked"      exec '{"command":"echo same-status"}' blocked 'same command ran 4 times'
 LONG="$(python3 -c 'print("Please fix it. " * 60)')"
-expect "sessions_send: brief without fields blocked" sessions_send "{\"sessionKey\":\"agent:main:other\",\"message\":\"$LONG\"}" blocked 'missing Project:'
-expect "task_inbox: add"                          task_inbox '{"action":"add","project":"sandbox","title":"Live test item","type":"bug","done_when":"test passes"}' allowed
+expect "sessions_send: work into a standing chat blocked" sessions_send "{\"sessionKey\":\"agent:main:other\",\"message\":\"$LONG\"}" blocked 'fresh task session' mandatory
+expect "sessions_spawn: brief without fields blocked" sessions_spawn "{\"agentId\":\"other\",\"task\":\"$LONG\"}" blocked 'every task starts from the board' mandatory
+expect "task_inbox: add"                         task_inbox '{"action":"add","project":"sandbox","title":"Live test item","type":"bug","done_when":"test passes"}' allowed
 expect "task_inbox: plan lists the item"          task_inbox '{"action":"plan"}' allowed 'Live test item'
 
 echo
 grep -c 'token-guard blocked' "$SBX/gateway.log" | xargs -I{} echo "gateway log: {} block lines"
-if [ "$FAILS" -eq 0 ]; then echo "live-gateway-test: all checks passed ($SKIPS skipped)"; exit 0; fi
+echo "SUMMARY fail=$FAILS skip=$SKIPS not_verified=$NOT_VERIFIED"
+if [ "$FAILS" -eq 0 ] && [ "$NOT_VERIFIED" -eq 0 ]; then echo "live-gateway-test: all checks passed ($SKIPS skipped)"; exit 0; fi
+if [ "$FAILS" -eq 0 ]; then echo "live-gateway-test: no failures, but $NOT_VERIFIED mandatory gate(s) NOT VERIFIED"; exit 3; fi
 echo "live-gateway-test: $FAILS check(s) failed (rerun with --keep and read gateway.log)"
 exit 1
