@@ -76,6 +76,14 @@ function nextAfterJob(before, role, verdict) {
   return "review";
 }
 
+// Where an item goes when its task ends, and the note for that move. A blocked result that names the owner's action
+// (ownerAct) parks the item in Blocked with that reason from any work column, Review included.
+function moveAfterJob(before, role, verdict, ownerAct, short) {
+  const s = normStatus(before);
+  if (verdict === "blocked" && ownerAct && AUTO_FROM.has(s)) return { to: "blocked", note: `Owner action: ${ownerAct} [job ${short}]` };
+  return { to: nextAfterJob(s, role, verdict), note: null };
+}
+
 // ---- the queue: one item at a time, in the order the PM keeps ----
 // Items in In progress, Review or QA are the work in hand; To do is the queue. The order: the PM's rank
 // (1 first; unranked after), then the project order the owner set, then priority, then age.
@@ -241,5 +249,5 @@ function looksLikeRequest(text) {
 export {
   COLUMNS, LEGACY, LABELS, TRANSITIONS, DISPATCHABLE, OPEN, AUTO_FROM, FAILED_OUTCOMES,
   ACTIVE, queueOrder, queueState, strandedMoves,
-  isLimitBlock, normStatus, canMove, resultVerdict, nextAfterJob, renderBoard, renderOverview, auditBoard, parseApproval, looksLikeRequest,
+  isLimitBlock, normStatus, canMove, resultVerdict, nextAfterJob, moveAfterJob, renderBoard, renderOverview, auditBoard, parseApproval, looksLikeRequest,
 };

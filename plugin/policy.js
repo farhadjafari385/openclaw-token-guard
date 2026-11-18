@@ -404,9 +404,98 @@ function needsUserPath(item) {
   return USER_FACING.test(String(item.title || ""));
 }
 
+// A user path is proof only with what the user did, an arrow, and the id of what came back, e.g.
+// "User path: sent a photo → enhanced photo back, job 77". A bare "User path: ok", "→ HTTP 200" or "→ works" is not.
+// Linear scan, no backtracking regex: it runs in the gateway thread on every done/approve of a user-facing item.
+const PROOF_ID = /\b(?:job|payment|message|msg|order|invoice|id|run|chat)\b[\s#:=-]{0,4}(?:id\b[\s#:=-]{0,3})?([0-9a-z][0-9a-z_-]{0,40})/gi;
+function isUserPathProof(note) {
+  const n = String(note || "");
+  const at = n.search(/User path\s*:/i);
+  if (at < 0) return false;
+  const rest = n.slice(at).replace(/^User path\s*:/i, "").slice(0, 600);
+  const arrows = ["→", "->", "=>"].map((a) => rest.indexOf(a)).filter((i) => i >= 0);
+  if (!arrows.length) return false;
+  const cut = Math.min(...arrows);
+  if (!/\S/.test(rest.slice(0, cut))) return false;
+  for (const m of rest.slice(cut).matchAll(PROOF_ID)) if (/\d/.test(m[1])) return true;
+  return false;
+}
+
+// Proof counts from this round of work only: history notes before the item's last reopen (a move back to Backlog,
+// To do or In progress) belong to an earlier attempt.
 function hasUserPath(item, note) {
-  const notes = [note, item.note, ...((item.history || []).map((h) => h && h.note))];
-  return notes.some((n) => /\bUser path\s*:/i.test(String(n || "")));
+  const hist = (item && item.history) || [];
+  let from = 0;
+  hist.forEach((h, i) => { if (h && h.to && ["backlog", "todo", "in_progress"].includes(normStatus(h.to))) from = i + 1; });
+  const notes = [note, item && item.note, ...hist.slice(from).map((h) => h && h.note)];
+  return notes.some(isUserPathProof);
+}
+
+// ---- quick exits and handoffs read from a worker's report ----
+
+// "RESULT: blocked" with an "Owner action: owner account: <what the owner must do>" line is a finished task, not a failure:
+// the item goes straight to Blocked with that reason, without a Review round-trip through the orchestrator, and is not
+// dispatched again into the same wall (rule ownerBlocked).
+function ownerActionExit(text) {
+  const t = String(text || "");
+  if (!/^\s*[*_`>]*\s*RESULT\s*[:=-]\s*[*_`]*\s*blocked\b/im.test(t)) return null;
+  const m = /^\s*[*_`>-]*\s*Owner action\s*:\s*(.+)$/im.exec(t);
+  if (!m) return null;
+  const action = m[1].replace(/[*_`]+/g, "").trim();
+  const k = OWNER_BLOCK.exec(action);
+  if (!k) return null;
+  // The stored note must still name the owner reason, or the item is not held.
+  return (k.index + k[0].length <= 280 ? action : action.slice(k.index)).slice(0, 280);
+}
+
+// The "Handoff:" block that ends a worker's report (at most 10 lines of at most 300 characters), verbatim.
+function handoffOf(text) {
+  const lines = String(text || "").split("\n");
+  let start = -1;
+  for (let i = 0; i < lines.length; i++) if (/^\s*[*_`>#-]*\s*Handoff\s*:/i.test(lines[i])) start = i;
+  if (start < 0) return null;
+  const out = [];
+  const first = lines[start].replace(/^\s*[*_`>#-]*\s*Handoff\s*:\s*[*_`]*/i, "").trim();
+  if (first) out.push(first.slice(0, 300));
+  for (let i = start + 1; i < lines.length && out.length < 10; i++) {
+    const l = lines[i];
+    if (/^\s*```/.test(l) || /^\s*RESULT\s*[:=-]/i.test(l)) break;
+    if (!l.trim()) { if (out.length) break; continue; }
+    out.push(l.replace(/\s+$/, "").slice(0, 300));
+  }
+  return out.length ? out.join("\n") : null;
+}
+
+const HANDOFF_HEAD = "Last Handoff (verbatim; do not re-check what it proves):";
+const HANDOFF_SKIP_OUTCOMES = new Set(["error", "timeout", "killed", "lost"]);
+
+// Every brief carries each item's last Handoff verbatim, from the newest task on that item that ended normally in the
+// last 48 hours and wrote one. Orchestrators were asked to paste it and often did not; the guard adds it when missing.
+// Never from a failed or cut-off task, or one whose cited proof was missing. Added once per job and once per brief.
+function withHandoffs(task, jobs, now = Date.now(), maxAgeMs = 48 * 3600000) {
+  const t = String(task || "");
+  if (t.includes(HANDOFF_HEAD)) return null;
+  const ids = itemsFromBrief(t);
+  if (!ids.length) return null;
+  const usable = (j) => j && j.status !== "running" && j.resultText && !HANDOFF_SKIP_OUTCOMES.has(j.outcome) &&
+    !(j.missingEvidence && j.missingEvidence.length) && !/^\s*[*_`>]*\s*RESULT\s*[:=-]\s*[*_`]*\s*fail/im.test(j.resultText) &&
+    now - (j.endedAt || 0) < maxAgeMs;
+  const ended = (jobs || []).filter(usable).sort((a, b) => (b.endedAt || 0) - (a.endedAt || 0));
+  const byJob = new Map();
+  for (const id of ids) {
+    const j = ended.find((x) => (x.items || []).includes(id) && handoffOf(x.resultText));
+    if (!j) continue;
+    if (!byJob.has(j)) byJob.set(j, []);
+    byJob.get(j).push(id);
+  }
+  const parts = [];
+  for (const [j, jids] of byJob) {
+    const h = handoffOf(j.resultText);
+    if (t.includes(h)) continue;
+    parts.push(`- ${jids.join(", ")}, from ${j.agentId || "a worker"}${j.short ? ` (job ${j.short})` : ""}:\n${h.split("\n").map((l) => `  ${l}`).join("\n")}`);
+  }
+  if (!parts.length) return null;
+  return `${t}\n\n${HANDOFF_HEAD}\n${parts.join("\n")}`;
 }
 
 // ---- code maps (graphify) ----
@@ -542,6 +631,8 @@ function canonicalProject(policy, name) {
   }
   return "";
 }
+// A merge of a merge request or pull request: CLI or the GitLab/GitHub merge API.
+const MERGE_COMMAND = /\b(?:glab|gh)\b[^;&|\n]*?\b(?:mr|pr)\s+merge\b|\/merge_requests\/\d+\/merge\b|\/pulls\/\d+\/merge\b/;
 const projectList = (policy) => Object.keys(policy.projects || {}).join(", ");
 
 function projectName(policy, line) {
@@ -690,6 +781,18 @@ function policyDecide(event, ctx, pstate, rawConfig, log, now = Date.now()) {
         }
       }
       if (git) return block("gitSafety", `token-guard: blocked: ${git}. Merges to main happen only through a reviewed merge request (the Team Lead merges when the pipeline is green).`);
+      // One merge at a time per project: a merge while main's pipeline from the last merge still runs cancels that pipeline
+      // on the single runner, so parallel MRs kept restarting the deploy (2026-11-17).
+      if (subagent && MERGE_COMMAND.test(command) && pstate && typeof pstate.mergesInFlight === "function") {
+        const task = typeof pstate.jobFor === "function" ? pstate.jobFor(sessionKey) : null;
+        const key = (name) => canonicalProject(policy, name) || String(name || "").replace(/\(.*$/, "").trim().toLowerCase();
+        const mine = key(task && task.project);
+        const busy = mine ? pstate.mergesInFlight().filter((m) => m.sessionKey !== sessionKey && key(m.project) === mine) : [];
+        if (busy.length) {
+          return block("mergeQueue", `token-guard: one merge at a time: main's pipeline from the last merge in this project is still running (${busy[0].url}). ` +
+            `Merging now cancels it. Do not merge. End with RESULT: waiting and that pipeline link (${busy[0].url}): the guard follows it, and this merge goes next once main is green.`);
+        }
+      }
       if (MUTATING_OPENCLAW.test(command)) return block("protectedConfig", `token-guard: changing OpenClaw config, plugins, crons, secrets, agents or models is not allowed for agents. ${RULES_MESSAGE}`);
       if (/(?:^|[\s;&|])chattr\s/.test(command)) return block("protectedFile", `token-guard: chattr is not allowed. ${RULES_MESSAGE}`);
       if (writesProtected(policy, command, agentId, params.workdir || params.cwd)) return block("protectedFile", `token-guard: this command would change a protected file. ${RULES_MESSAGE}${secretHint(command)}`);
@@ -933,6 +1036,12 @@ function policyDecide(event, ctx, pstate, rawConfig, log, now = Date.now()) {
       for (const id of ids) {
         const st = normStatus(board.get(id).status);
         if (!DISPATCHABLE.has(st)) return block("boardItems", `token-guard: ${id} is ${st} on the board. Reopen it with task_inbox set before dispatching.`);
+        // Parked on the owner: a new task hits the same wall. It is dispatched again only after someone moves it out
+        // of Blocked with a note on what changed (the owner signed in, paid, answered).
+        if (st === "blocked" && OWNER_BLOCK.test(String(board.get(id).note || ""))) {
+          return block("ownerBlocked", `token-guard: ${id} waits on the owner or an outside party (${String(board.get(id).note).slice(0, 160)}). ` +
+            "Another task hits the same wall. When that is done, move the item to To do with task_inbox set and a note starting \"Operator:\" that says what changed, then dispatch.");
+        }
         if (running.has(id)) return block("boardBusy", `token-guard: ${id} is already being worked on in another task. Wait for that result; one task at a time per item.`);
         // The same stuck item again and again burns the owner's tokens and starves the rest of the board.
         const maxNoProgress = policy.board.maxNoProgress === undefined ? 3 : Number(policy.board.maxNoProgress) || 0;
@@ -1049,4 +1158,10 @@ export {
   firstLine,
   itemsFromBrief,
   policyDecide,
+  hasUserPath,
+  isUserPathProof,
+  MERGE_COMMAND,
+  ownerActionExit,
+  handoffOf,
+  withHandoffs,
 };

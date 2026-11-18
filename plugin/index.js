@@ -2,8 +2,8 @@ import crypto from "node:crypto";
 import { definePluginEntry } from "openclaw/plugin-sdk/plugin-entry";
 import { Type } from "typebox";
 import { createState, decide, forgetRefusedBrief } from "./guard.js";
-import { policyDecide, firstLine, itemsFromBrief, completeBrief, codexEnabled, CHECK_COMMAND, GRAPH_COMMAND } from "./policy.js";
-import { ACTIVE, strandedMoves, isLimitBlock, normStatus, resultVerdict, nextAfterJob, queueState, renderBoard, renderOverview, auditBoard, parseApproval, looksLikeRequest } from "./board.js";
+import { policyDecide, firstLine, itemsFromBrief, completeBrief, codexEnabled, CHECK_COMMAND, GRAPH_COMMAND, ownerActionExit, withHandoffs } from "./policy.js";
+import { ACTIVE, strandedMoves, isLimitBlock, normStatus, resultVerdict, nextAfterJob, moveAfterJob, queueState, renderBoard, renderOverview, auditBoard, parseApproval, looksLikeRequest } from "./board.js";
 import { correctTopic, isGeneral, projectOfTopic, projectsMentioned } from "./topics.js";
 import { isLimitError, isLimitReply, isRunFailureReply, allowLimitReply, limitResetAt } from "./limits.js";
 import {
@@ -292,8 +292,10 @@ export default definePluginEntry({
       for (const id of ids) {
         const it = board.get(id);
         if (!it) continue;
-        const said = /Owner said: «([\s\S]*?)»/.exec(String(it.details || ""));
-        const past = (it.history || []).filter((h) => h.note && h.by !== "system").slice(-4).map((h) => `  - ${h.from} -> ${h.to}: ${String(h.note).slice(0, 240)}`);
+        let said = /Owner said: «([\s\S]*?)»/.exec(String(it.details || ""));
+        if (said && String(p.task || "").includes(said[1].slice(0, 60))) said = null; // already in the brief
+        const noteNow0 = String(it.note || "").trim();
+        const past = (it.history || []).filter((h) => h.note && h.by !== "system" && String(h.note).trim() !== noteNow0).slice(-4).map((h) => `  - ${h.from} -> ${h.to}: ${String(h.note).slice(0, 240)}`);
         const noteNow = String(it.note || "").trim();
         parts.push(`- ${id} ${it.title || ""}${said ? `\n  Owner said: «${said[1].slice(0, 1200)}»` : ""}` +
           `${noteNow ? `\n  Latest note on the item: ${noteNow.slice(0, 900)}` : ""}${past.length ? `\n  Earlier on this item:\n${past.join("\n")}` : ""}`);
@@ -385,6 +387,11 @@ export default definePluginEntry({
       },
       boardItems: () => loadInboxItems(),
       runningItemIds,
+      // Merges whose main pipeline the guard still follows: a reviewer's wait on a pipeline or run (not an MR), at most 3 h old.
+      mergesInFlight: () => Object.entries(fresh().jobs)
+        .filter(([, j]) => j.agentId === "reviewer" && j.waitFor && !j.waitFor.done && ["gitlab-pipeline", "github-run"].includes(j.waitFor.kind) &&
+          Date.now() - (j.waitFor.since || 0) < 3 * 3600000)
+        .map(([sessionKey, j]) => ({ sessionKey, project: j.project, url: j.waitFor.url })),
       jobFor: (sessionKey) => {
         const job = store.data.jobs[sessionKey];
         return job && job.status === "running" ? job : null;
@@ -535,6 +542,9 @@ export default definePluginEntry({
           if (event.toolName === "sessions_spawn" && ctx && ctx.agentId === orchestrator) {
             params = withOwnerWords(params || event.params || {}) || params;
             params = withSkills(params || event.params || {}) || params;
+            const p0 = params || event.params || {};
+            const handed = withHandoffs(p0.task, Object.values(fresh().jobs));
+            if (handed) params = Object.assign({}, p0, { task: handed });
             rememberSpawn(params || event.params || {}, ctx);
           }
           const bare = String(event.toolName || "").split("__").pop();
@@ -674,9 +684,11 @@ export default definePluginEntry({
           else verdict = "unknown";
         }
         const board = loadInboxItems();
+        // A blocked result that names the owner's action parks the item in Blocked with that reason at once.
+        const ownerAct = verdict === "blocked" ? ownerActionExit(cur.resultText) : null;
         const plan = (cur.items || []).filter((id) => board.has(id)).map((id) => {
           const before = normStatus(board.get(id).status);
-          return { id, before, to: nextAfterJob(before, cur.agentId, verdict) };
+          return Object.assign({ id, before }, moveAfterJob(before, cur.agentId, verdict, ownerAct, cur.short));
         }).filter((m) => m.to !== m.before);
         // The worker answers its dispatch, from its own bot, once the dispatch is posted. With results only, a
         // "CI is running" step is not posted: the guard follows the pipeline and the item's real result comes later.
@@ -686,7 +698,7 @@ export default definePluginEntry({
           const j = fresh().jobs[key] || cur;
           return say(j.agentId, j.topic, resultText(voice, j, verdict, plan), { html: true, replyTo: j.dispatchMsgId || j.requestMsgId || null });
         }).then((id) => { if (typeof id === "number") setJob(key, { resultMsgId: id }); });
-        Promise.all(plan.map((m) => systemMove(m.id, m.to, `${cur.agentId} task ended: ${verdict} [job ${cur.short}]`)))
+        Promise.all(plan.map((m) => systemMove(m.id, m.to, m.note || `${cur.agentId} task ended: ${verdict} [job ${cur.short}]`)))
           .then(() => refreshItems(cur.items || []));
       };
       if (job.resultText || !api.runtime || !api.runtime.subagent || typeof api.runtime.subagent.getSessionMessages !== "function") return finish();
