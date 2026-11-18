@@ -73,8 +73,22 @@ function inboxFile() {
   return process.env.OC_INBOX_FILE || join(homedir(), ".openclaw", "inbox", "inbox.jsonl");
 }
 
-// Current items by id, folded from the inbox event log the same way oc-inbox does.
-// Synchronous and small: the guard calls it only when a brief is dispatched.
+// How many status moves an item keeps (oc-inbox HISTORY_KEEP).
+const HISTORY_KEEP = 20;
+
+// A status move, recorded the way oc-inbox _move records it (no entry when the status does not change).
+function moveItem(it, to, ev, note = ev.note) {
+  const from = it.status;
+  if (from === to) return;
+  it.status = to;
+  it.history.push({ ts: ev.ts ?? null, from, to, by: ev.by ?? null, note: note ?? null });
+  if (it.history.length > HISTORY_KEEP) it.history = it.history.slice(-HISTORY_KEEP);
+}
+
+// Current items by id, folded from the inbox event log exactly as oc-inbox fold_state does, with the same fields
+// (details, source, batch and history included). 2026-11-18: this fold used to drop them, so briefs never carried
+// the owner's words, replies lost their source message, and every check that reads history (stranded moves, the
+// "Rescoped:" streak reset, "User path:" proof) saw an empty one. tests/test_inbox_parity.py keeps the two folds equal.
 function loadInboxItems(file = inboxFile()) {
   const items = new Map();
   let raw;
@@ -93,10 +107,11 @@ function loadInboxItems(file = inboxFile()) {
     if (!ev || !ev.id) continue;
     if (ev.kind === "add") {
       items.set(ev.id, {
-        id: ev.id, project: ev.project, title: ev.title, owner: ev.owner, size: ev.size || "medium", area: ev.area,
-        type: ev.type || "task", priority: ev.priority || "normal", rank: null,
-        done_when: ev.done_when, status: normStatus(ev.status || "backlog"), note: null,
-        orc_approved_ts: null, owner_approved_ts: null, created_ts: ev.ts, updated_ts: ev.ts,
+        id: ev.id, project: ev.project, title: ev.title, type: ev.type || "task", priority: ev.priority || "normal",
+        rank: null, details: ev.details ?? null, done_when: ev.done_when ?? null, source: ev.source ?? null,
+        owner: ev.owner ?? null, size: ev.size || "medium", area: ev.area ?? null, status: normStatus(ev.status || "backlog"),
+        batch: null, note: null, orc_approved_ts: null, owner_approved_ts: null, history: [],
+        created_ts: ev.ts ?? null, updated_ts: ev.ts ?? null,
       });
       continue;
     }
@@ -105,17 +120,18 @@ function loadInboxItems(file = inboxFile()) {
     if (ev.kind === "set") {
       for (const key of ["owner", "size", "area", "done_when", "title", "priority", "project"]) if (ev[key]) it[key] = ev[key];
       if ("rank" in ev) it.rank = Number(ev.rank) > 0 ? Number(ev.rank) : null; // the PM's queue position (0 clears it)
+      if ("batch" in ev) it.batch = ev.batch;
       if ("note" in ev) it.note = ev.note;
       if (ev.status) {
         const to = normStatus(ev.status);
         if (to !== "done" && to !== "dropped") { it.orc_approved_ts = null; it.owner_approved_ts = null; }
-        it.status = to;
+        moveItem(it, to, ev);
       }
-      it.updated_ts = ev.ts;
+      it.updated_ts = ev.ts ?? null;
     } else if (ev.kind === "approve" && (it.status === "done" || it.status === "dropped")) {
       if (ev.by === "owner") it.owner_approved_ts = ev.ts; else it.orc_approved_ts = ev.ts;
-      if (it.orc_approved_ts && it.owner_approved_ts) it.status = "archived";
-      it.updated_ts = ev.ts;
+      if (it.orc_approved_ts && it.owner_approved_ts) moveItem(it, "archived", ev, "approved by the orchestrator and the owner");
+      it.updated_ts = ev.ts ?? null;
     }
   }
   return items;
