@@ -11,11 +11,13 @@ PRIVATE=""
 fail=0
 while read -r local_ref local_sha remote_ref remote_sha; do
   [ "$local_sha" = "0000000000000000000000000000000000000000" ] && continue
-  if [ "$remote_sha" = "0000000000000000000000000000000000000000" ]; then range="$local_sha"; else range="$remote_sha..$local_sha"; fi
-  for c in $(git rev-list "$range"); do
+  # A new branch, or a force-push whose old commit is not here (a rewrite): check everything the push carries.
+  if [ "$remote_sha" = "0000000000000000000000000000000000000000" ] || ! git cat-file -e "$remote_sha^{commit}" 2>/dev/null; then range="$local_sha"; else range="$remote_sha..$local_sha"; fi
+  commits=$(git rev-list "$range") || { echo "pre-push: cannot list the commits in $range: push refused (fail closed)."; exit 1; }
+  for c in $commits; do
     if git grep -nI -E "$SECRET" "$c" -- . >/dev/null 2>&1; then echo "pre-push: secret-like value in $c:"; git grep -nI -E "$SECRET" "$c" -- . | cut -d: -f1-3 | head -5; fail=1; fi
-    if [ -n "$PRIVATE" ] && git grep -nI -E "$PRIVATE" "$c" -- . >/dev/null 2>&1; then echo "pre-push: private identifier in $c:"; git grep -nI -E "$PRIVATE" "$c" -- . | cut -d: -f1-3 | head -5; fail=1; fi
-    if git log -1 --format=%B "$c" | grep -qE "$SECRET${PRIVATE:+|$PRIVATE}"; then echo "pre-push: secret or private identifier in the message of $c"; fail=1; fi
+    if [ -n "$PRIVATE" ] && git grep -nIi -E "$PRIVATE" "$c" -- . >/dev/null 2>&1; then echo "pre-push: private identifier in $c:"; git grep -nIi -E "$PRIVATE" "$c" -- . | cut -d: -f1-3 | head -5; fail=1; fi
+    if git log -1 --format=%B "$c" | grep -qE "$SECRET" || { [ -n "$PRIVATE" ] && git log -1 --format=%B "$c" | grep -qiE "$PRIVATE"; }; then echo "pre-push: secret or private identifier in the message of $c"; fail=1; fi
   done
 done
 [ "$fail" = 0 ] || { echo "pre-push: push refused. Remove the data (and rewrite the commits) first."; exit 1; }
