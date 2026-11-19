@@ -1109,6 +1109,12 @@ function policyDecide(event, ctx, pstate, rawConfig, log, now = Date.now()) {
         return block("maintenance", "token-guard: the gateway is being restarted for maintenance, so a task started now would be cut off. Do not dispatch now and leave the items as they are: the job tracker wakes you again once the gateway is back.");
       }
     }
+    // The gateway's event loop was blocked a moment ago: a task started now gets no exec (MCP CONNECT_TIMEOUT).
+    if (tool === "sessions_spawn" && pstate && typeof pstate.loopHold === "function") {
+      let busy = null;
+      try { busy = pstate.loopHold(); } catch { busy = null; }
+      if (busy && busy.until > now) return block("gatewayBusy", busy.text);
+    }
     // Ahead of the weekly pace: the week's allowance would run out days before the reset.
     const pace = pstate && pstate.paceHold;
     if (pace && pace.until > now) return block("weeklyPace", paceText(pace, now));
