@@ -187,3 +187,10 @@ It comes with no support and no promise: no one is obliged to answer issues, fix
 working. The agents it runs execute commands and spend money on the accounts you connect, so read the code, review
 the configuration and test it on a machine and accounts you can afford to lose. Nothing here is legal, security or
 financial advice.
+
+## Local pre-push hook
+
+`.githooks/pre-push` refuses pushes that carry secrets or private identifiers, then runs the same two
+steps as the `test` workflow (gitleaks over the history, then `bash tests/run-all.sh`) so a push that
+would turn CI red is stopped locally. Enable it once per clone: `git config core.hooksPath .githooks`.
+Never push with `--no-verify`.

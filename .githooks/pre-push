@@ -21,3 +21,12 @@ while read -r local_ref local_sha remote_ref remote_sha; do
   done
 done
 [ "$fail" = 0 ] || { echo "pre-push: push refused. Remove the data (and rewrite the commits) first."; exit 1; }
+
+# Mirror of .github/workflows/test.yml (job "test"): gitleaks over the whole history, then the full suite.
+# Needs gitleaks, node and python3 on PATH (the workflow installs the same).
+export PATH="$HOME/.local/bin:$PATH"
+root=$(git rev-parse --show-toplevel)
+command -v gitleaks >/dev/null || { echo "pre-push: gitleaks not installed (the CI job runs it)" >&2; exit 1; }
+(cd "$root" && gitleaks git --no-banner --redact .) || { echo "pre-push: BLOCKED (gitleaks found a secret in history)" >&2; exit 1; }
+(cd "$root" && bash tests/run-all.sh) || { echo "pre-push: BLOCKED (tests/run-all.sh failed)" >&2; exit 1; }
+echo "pre-push: all local CI checks passed"
