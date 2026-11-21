@@ -47,7 +47,7 @@ const DEFAULT_POLICY = {
   },
   backChannels: {
     enabled: true,
-    blockedTools: ["SendMessage", "TeamCreate", "TeamDelete", "Agent", "Task", "conversations_send", "conversations_turn", "cron", "gateway"],
+    blockedTools: ["SendMessage", "TeamCreate", "TeamDelete", "conversations_send", "conversations_turn", "cron", "gateway"],
   },
   orchestratorOnly: { enabled: true },
   pins: { enabled: true },
@@ -706,6 +706,24 @@ function similarOpenItem(board, project, title, skip = null) {
 
 // A brief that misses a required line gets it from its board items instead of a rejection (on
 // 2026-11-05 the orchestrator lost 23 turns resending briefs for a missing Done when or Stop if).
+// "Subagents: max 2, Model: anthropic/claude-sonnet-5-5, Effort: low" (or "Subagents: 0" / "none") -> {max, model, effort}.
+function parseSubagents(brief) {
+  const line = String(brief || "").split("\n").map((l) => l.replace(/^[\s>*#_-]+/, "")).find((l) => /^subagents\s*:/i.test(l));
+  if (!line) return { max: 0, model: "", effort: "" };
+  const rest = line.replace(/^subagents\s*:\s*/i, "");
+  const n = /(?:max\s*)?(\d+)/i.exec(rest);
+  const max = /^(none|no|off)\b/i.test(rest) ? 0 : Math.max(0, Math.min(5, n ? Number(n[1]) : 0));
+  const m = /model\s*:\s*([\w./-]+)/i.exec(rest);
+  const e = /effort\s*:\s*(\w+)/i.exec(rest);
+  return { max, model: m ? modelAlias(m[1]) : "", effort: e ? e[1].toLowerCase() : "" };
+}
+
+// Claude Code's subagent tool takes "opus" | "sonnet" | "haiku".
+function modelAlias(model) {
+  const m = String(model || "").toLowerCase();
+  return /opus/.test(m) ? "opus" : /haiku/.test(m) ? "haiku" : /sonnet/.test(m) ? "sonnet" : m;
+}
+
 function completeBrief(task, board) {
   const text = String(task || "");
   if (!board || typeof board.get !== "function") return text;
@@ -721,6 +739,7 @@ function completeBrief(task, board) {
   const done = items.map((it) => String(it.done_when || "").trim()).filter(Boolean);
   if (!has("done when") && done.length) add.push(`Done when: ${done.join(" AND ")}`);
   if (!has("stop if")) add.push("Stop if: anything that needs the owner's OK (a production change, money, credentials, anything public, deleting data)");
+  if (!has("subagents")) add.push("Subagents: max 0 (this task runs alone)");
   return add.length ? `${text.trimEnd()}\n${add.join("\n")}` : text;
 }
 
@@ -804,6 +823,23 @@ function policyDecide(event, ctx, pstate, rawConfig, log, now = Date.now()) {
       if (/(?:^|[\s;&|])chattr\s/.test(command)) return block("protectedFile", `token-guard: chattr is not allowed. ${RULES_MESSAGE}`);
       if (writesProtected(policy, command, agentId, params.workdir || params.cwd)) return block("protectedFile", `token-guard: this command would change a protected file. ${RULES_MESSAGE}${secretHint(command)}`);
     }
+  }
+
+  // 1c. Claude Code subagents inside a worker's own task (owner 2026-11-21: "subagents on, the orchestrator decides,
+  // the guard enforces"). Only as many as the brief's "Subagents: max N" line allows, on the brief's model; never for
+  // the orchestrator (it dispatches tasks) and never outside a task.
+  if (tool === "Agent" || tool === "Task") {
+    if (!subagent || !job) return block("subagentsOff", "token-guard: Claude Code subagents run only inside a dispatched task, within its brief's Subagents line.");
+    const lim = parseSubagents(job.brief);
+    if (!lim.max) return block("subagentsOff", "token-guard: this brief allows no subagents (Subagents: max 0). Do the work in this session, or ask the orchestrator in your report for a brief that allows them.");
+    if ((job.subagentCalls || 0) >= lim.max) {
+      return block("subagentLimit", `token-guard: this task's brief allows ${lim.max} subagent(s) and they are used. Finish the rest in this session.`);
+    }
+    if (lim.model && params.model && modelAlias(params.model) !== lim.model) {
+      return block("subagentModel", `token-guard: this brief's subagents run on ${lim.model}; set model "${lim.model}".`);
+    }
+    if (lim.model && !params.model) return { params: Object.assign({}, params, { model: lim.model }) };
+    return undefined;
   }
 
   // 2. No back channels: work and results flow only through the orchestrator's spawns, where they are mirrored to the group.
@@ -1152,6 +1188,8 @@ function policyDecide(event, ctx, pstate, rawConfig, log, now = Date.now()) {
 }
 
 export {
+  parseSubagents,
+  modelAlias,
   canonicalProject,
   briefSetting,
   CHECK_COMMAND,

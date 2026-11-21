@@ -8,7 +8,7 @@ import { correctTopic, isGeneral, projectOfTopic, projectsMentioned } from "./to
 import { isLimitError, isLimitReply, isRunFailureReply, allowLimitReply, limitResetAt } from "./limits.js";
 import {
   createJobStore, mergeJobsConfig, recordSpawn, recordActivity, recordUsage, recordCall, callBudget, recordTime, recordCheck, recordGraph, recordResultText, finalAnswer, missingProof,
-  recordEnd, recordProgress, setClaudeLimited, clearClaudeLimited, setCodexLimited, scanJobs, lastAssistantText, noProgressStreak, itemTaskCount, meterCliUsage,
+  recordEnd, recordProgress, setClaudeLimited, clearClaudeLimited, setCodexLimited, scanJobs, lastAssistantText, noProgressStreak, itemTaskCount, meterCliUsage, recordSubagent,
 } from "./jobs.js";
 import { createMirror, topicFor, messageIdOf } from "./mirror.js";
 import { secretDecide, findSecret, redactDeep } from "./secrets.js";
@@ -543,6 +543,12 @@ export default definePluginEntry({
           const rewritten = pol && pol.params ? Object.assign({}, base, { params: pol.params }) : base;
           const res = decide(rewritten, ctx, state, cfg, log, now);
           if (res && res.block) return res;
+          // An allowed Claude Code subagent in a worker's task: counted against its brief's Subagents line.
+          const tname = String(event.toolName || "").split("__").pop();
+          if ((tname === "Agent" || tname === "Task") && ctx && ctx.agentId !== orchestrator && recordSubagent(store.data, ctx.sessionKey)) {
+            store.touch();
+            log("info", "token-guard: a task started a Claude Code subagent", { agentId: ctx.agentId, sessionKey: ctx.sessionKey });
+          }
           let params = (res && res.params) || (pol && pol.params) || (base !== event ? base.params : undefined);
           if (event.toolName === "sessions_spawn" && ctx && ctx.agentId === orchestrator) {
             params = withOwnerWords(params || event.params || {}) || params;

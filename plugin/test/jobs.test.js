@@ -254,3 +254,36 @@ test("a job keeps the task's verdict from its RESULT line, apart from how the ru
     assert.equal(job.verdict, verdict, text);
   }
 });
+
+
+test("RAISE lines in a result wake the orchestrator once with the request to check", async () => {
+  const { parseRaises } = await import("../jobs.js");
+  assert.deepEqual(parseRaises("x\nRAISE: qa 0123abcd verify the fix on the live URL\n- RAISE: @reviewer 0123abcd: merge when green"),
+    [{ agent: "qa", item: "0123abcd", why: "verify the fix on the live URL" }, { agent: "reviewer", item: "0123abcd", why: "merge when green" }]);
+  assert.deepEqual(parseRaises("no raise here"), []);
+  const d = emptyState();
+  spawned(d, 0);
+  recordResultText(d, CHILD, "RESULT: done\nRAISE: qa 0123abcd verify on live", CFG);
+  recordEnd(d, CHILD, "ok", "", 10 * MIN);
+  const a = scanJobs(d, CFG, 10 * MIN + 1000, env());
+  const raise = a.filter((x) => x.kind === "wake" && x.reason === "raise");
+  assert.equal(raise.length, 1);
+  assert.match(raise[0].message, /RAISE qa for 0123abcd: verify on live/);
+  assert.match(raise[0].message, /is it in the budget, is it a duplicate/);
+  assert.equal(scanJobs(d, CFG, 11 * MIN, env()).filter((x) => x.reason === "raise").length, 0, "only once");
+});
+
+test("a task's Claude Code subagent logs count toward its real tokens", async () => {
+  const fs = await import("node:fs"); const os = await import("node:os"); const path = await import("node:path");
+  const { subagentTotals } = await import("../jobs.js");
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "tg-sub-"));
+  const log = path.join(dir, "sess.jsonl");
+  fs.writeFileSync(log, "");
+  fs.mkdirSync(path.join(dir, "sess", "subagents"), { recursive: true });
+  const line = (i, o) => JSON.stringify({ type: "assistant", message: { id: `m${i}`, usage: { input_tokens: i, output_tokens: o, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 } } });
+  fs.writeFileSync(path.join(dir, "sess", "subagents", "agent-a.jsonl"), [line(100, 10), line(200, 20)].join("\n") + "\n");
+  const t = subagentTotals(log);
+  assert.equal(t.files, 1);
+  assert.ok(t.tokens >= 330 - 1 && t.calls >= 1, JSON.stringify(t));
+  fs.rmSync(dir, { recursive: true, force: true });
+});
