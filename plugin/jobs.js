@@ -350,7 +350,22 @@ function recordEnd(data, sessionKey, outcome, error, now) {
   job.outcome = (cleanup ? job.runOutcome || "ok" : outcome) || job.runOutcome || "unknown";
   job.error = error ? String(error).slice(0, 500) : "";
   job.endedAt = now;
+  // What the task delivered, from its RESULT line. `outcome` is only how the run ended ("ok" even for a blocked or
+  // failed task): on 2026-11-21 an audit found 63 jobs "ok" while 27 of 35 ends were not done.
+  job.verdict = taskVerdict(job);
   return job;
+}
+
+function taskVerdict(job) {
+  if (job.outcome === "killed" || job.outcome === "lost" || job.outcome === "interrupted") return job.outcome;
+  if (job.outcome && job.outcome !== "ok") return "failed";
+  const m = /^\s*[*_`>]*\s*RESULT\s*[:=-]\s*[*_`]*\s*([a-z ]+)/im.exec(String(job.resultText || ""));
+  const v = m ? m[1].trim().toLowerCase() : "";
+  if (/^(done|approved|pass|passed|merged|released|shipped|complete|completed)\b/.test(v)) return "done";
+  if (/^blocked\b/.test(v)) return "blocked";
+  if (/^(waiting|pending|awaiting)\b/.test(v)) return "waiting";
+  if (/^(changes requested|fail|failed|partly|partially|partial|not done)\b/.test(v)) return "failed";
+  return "unknown";
 }
 
 function setCodexLimited(data, untilMs, text) {
@@ -731,6 +746,7 @@ export {
   scanJobs,
   lastAssistantText,
   noProgressStreak,
+  taskVerdict,
   itemTaskCount,
   findCliLog,
   readCliUsage,
