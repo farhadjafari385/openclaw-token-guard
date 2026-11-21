@@ -240,6 +240,12 @@
         "additionalProperties": true,
         "description": "10-minute Haiku triage: enabled, everyMinutes, model, orchestratorQuietMinutes"
       },
+      "loop": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": { "sampleMs": { "type": "number" }, "lagMs": { "type": "number" }, "calmMs": { "type": "number" }, "maxHoldMs": { "type": "number" } },
+        "description": "Gateway event-loop watch: a dispatch waits while the loop was blocked (lagMs) until calm for calmMs, at most maxHoldMs per stretch"
+      },
       "pace": {
         "type": "object",
         "additionalProperties": true,

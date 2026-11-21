@@ -383,7 +383,7 @@ export default definePluginEntry({
       get codexLimitedUntil() { return store.data.codexLimitedUntil || 0; },
       get paceHold() { return paced(); },
       // Until when the gateway's event loop is too busy to start a task (0 = fine): a task started in it gets no exec.
-      loopHold: () => { const st = startLoopWatch(); const until = loopHold(st, Date.now()); return until ? { until, text: loopText(st, until, Date.now()) } : null; },
+      loopHold: () => { const st = startLoopWatch(cfg.loop); const until = loopHold(st, Date.now(), cfg.loop); return until ? { until, text: loopText(st, until, Date.now()) } : null; },
       // The deploy script touches this file before it stops the gateway (and removes it once it is back).
       maintenanceSince: () => {
         try { return fs.statSync(String(jobsCfg.stateFile).replace(/^~/, process.env.HOME || "").replace(/[^/]+$/, "maintenance")).mtimeMs; } catch { return 0; }
@@ -1363,7 +1363,7 @@ export default definePluginEntry({
         id: "token-guard-jobs",
         start() {
           globalThis[GEN_KEY] = generation;
-          startLoopWatch();
+          startLoopWatch(cfg.loop);
           const prev = globalThis[Symbol.for("token-guard.timer")];
           if (prev) clearInterval(prev);
           if (timer) clearInterval(timer);
