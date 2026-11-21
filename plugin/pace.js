@@ -13,13 +13,19 @@ const DEFAULT_PACE = {
   aheadPercent: 5,          // how far ahead of an even pace the team may run (early in the week, a burst is fine)
   reservePercent: 97,       // above this, only the owner's conversations run until the reset
   fiveHourPercent: 95,      // the 5-hour window: hold at this until it resets
+  // An owner budget for a stretch of hours (owner 2026-11-21: "at most ~6 more points in 12 h"): from windowStart,
+  // weekly use may grow by windowPerHour points per hour above windowStartPercent, for windowHours.
+  windowStart: "",
+  windowStartPercent: 0,
+  windowPerHour: 0,
+  windowHours: 0,
   credentialsFile: "~/.claude/.credentials.json",
   url: "https://api.anthropic.com/api/oauth/usage",
 };
 
 function mergePaceConfig(raw) {
   const cfg = Object.assign({}, DEFAULT_PACE, raw || {});
-  for (const k of ["everyMinutes", "aheadPercent", "reservePercent", "fiveHourPercent"]) cfg[k] = Number(cfg[k]);
+  for (const k of ["everyMinutes", "aheadPercent", "reservePercent", "fiveHourPercent", "windowStartPercent", "windowPerHour", "windowHours"]) cfg[k] = Number(cfg[k]) || 0;
   cfg.enabled = cfg.enabled === true;
   return cfg;
 }
@@ -43,6 +49,15 @@ function paceHold(usage, now, rawCfg) {
     const until = Math.min(resetsAt, start + ((used - cfg.aheadPercent) / 100) * WEEK_MS);
     if (until > now) return { until, reason: "pace", used, allowed, elapsed, resetsAt };
   }
+  // The owner's budget window, if one is set and running.
+  const wStart = Date.parse(cfg.windowStart || "");
+  if (Number.isFinite(wStart) && cfg.windowPerHour > 0 && cfg.windowHours > 0 && now >= wStart && now < wStart + cfg.windowHours * 3600000) {
+    const budget = cfg.windowStartPercent + cfg.windowPerHour * ((now - wStart) / 3600000);
+    if (used > budget) {
+      const until = Math.min(wStart + cfg.windowHours * 3600000, wStart + ((used - cfg.windowStartPercent) / cfg.windowPerHour) * 3600000);
+      if (until > now) return { until, reason: "budget", used, allowed: Math.round(budget * 10) / 10, elapsed, resetsAt };
+    }
+  }
   const five = usage.five_hour;
   const fiveUsed = five && Number(five.utilization);
   const fiveReset = five && Date.parse(five.resets_at);
@@ -62,6 +77,9 @@ function paceText(hold, now) {
   const when = utc(hold.until, now);
   if (hold.reason === "fiveHour") {
     return `token-guard: the Claude plan's 5-hour window is ${hold.used}% used, so this task would stop halfway. Do not dispatch now and leave its items in To do; the guard wakes you after ${when}. Answer the owner as usual.`;
+  }
+  if (hold.reason === "budget") {
+    return `token-guard: the owner's budget allows ${hold.allowed}% of the Claude plan's weekly limit by now and ${hold.used}% is used, so dispatches wait until ${when}. Do not dispatch now and leave the items in To do; the guard wakes you then. Answer the owner as usual.`;
   }
   if (hold.reason === "reserve") {
     return `token-guard: the Claude plan's weekly limit is ${hold.used}% used; the rest is kept for the owner's conversations until it resets at ${when}. Do not dispatch and leave the items in To do; the guard wakes you after the reset. Answer the owner as usual.`;
