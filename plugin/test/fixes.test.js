@@ -202,8 +202,9 @@ test("a brief missing required lines is completed from its board items instead o
   const out = completeBrief(brief, board);
   for (const line of ["Project: demo", "Items: ab12cd34", "Done when: pipeline green and the fix live", "Stop if: anything that needs the owner's OK"]) assert.ok(out.includes(line), line);
   assert.match(out, /\nScope: in: exactly these items/);
-  const full = "Project: demo\nScope: x\nItems: ab12cd34\nDone when: y\nStop if: z";
+  const full = "Project: demo\nScope: x\nItems: ab12cd34\nDone when: y\nStop if: z\nSubagents: max 2, Model: sonnet, Effort: low";
   assert.equal(completeBrief(full, board), full); // nothing to add
+  assert.match(completeBrief(full.replace(/\nSubagents:.*/, ""), board), /\nSubagents: max 0 \(this task runs alone\)$/, "no Subagents line = none");
   assert.equal(completeBrief("No item ids here", board), "No item ids here");
   // and the completed brief passes the old brief-field check
   const { decide, createState } = await import("../guard.js");

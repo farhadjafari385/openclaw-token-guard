@@ -263,6 +263,24 @@ function callBudget(cfg, agentId) {
   return own > 0 ? own : Number(cfg && cfg.budgetCalls) || 0;
 }
 
+// A Claude Code subagent a running task started (allowed by its brief's Subagents line).
+function recordSubagent(data, sessionKey) {
+  const job = data.jobs[sessionKey];
+  if (!job || job.status !== "running") return false;
+  job.subagentCalls = (job.subagentCalls || 0) + 1;
+  return true;
+}
+
+// "RAISE: <agent> <item> <why>" lines in a worker's message or result: a request that the orchestrator start
+// another role (owner 2026-11-21). Workers never start agents; the orchestrator checks need, budget and duplicates.
+function parseRaises(text) {
+  const out = [];
+  const re = /^[\s>*_`-]*RAISE\s*[:=]\s*@?([a-z][\w-]*)\s+([0-9a-f]{8})\b[\s:,-]*(.*)$/gim;
+  let m;
+  while ((m = re.exec(String(text || ""))) && out.length < 5) out.push({ agent: m[1].toLowerCase(), item: m[2], why: m[3].trim().slice(0, 300) });
+  return out;
+}
+
 // One tool call by a running task; returns the job when this call used up its budget.
 function recordCall(data, sessionKey, cfg) {
   const job = data.jobs[sessionKey];
@@ -498,6 +516,17 @@ function scanJobs(data, rawCfg, now, env) {
       continue;
     }
     if (job.status === "ended") {
+      // A worker asked for another role (RAISE lines): the orchestrator checks it and dispatches or refuses, once.
+      const raises = !job.raiseWoke && job.requesterSessionKey ? parseRaises(job.resultText) : [];
+      if (raises.length) {
+        job.raiseWoke = now;
+        wake(job.requesterSessionKey,
+          `[raise] ${job.agentId} asks for another role (task ${describe(job)} [job ${job.short}]):\n` +
+          raises.map((r) => `- RAISE ${r.agent} for ${r.item}: ${r.why || "(no reason given)"}`).join("\n") +
+          "\nCheck each: does the item need it now, is it in the budget, is it a duplicate of running or queued work? " +
+          "Approved: dispatch it with sessions_spawn (the usual brief). Refused: reply under the result with the reason in one line.",
+          "raise");
+      }
       const seenAt = data.orcActivity[job.requesterSessionKey] || 0;
       const seen = seenAt > (job.endedAt || 0) + 2000;
       if (!seen && now - job.endedAt >= cfg.wakeAfterEndMinutes * 60000) {
@@ -506,7 +535,7 @@ function scanJobs(data, rawCfg, now, env) {
           job.wakes += 1;
           job.lastWakeAt = now;
           wake(job.requesterSessionKey,
-            `[job-tracker] Task finished: ${describe(job)}, outcome ${job.outcome}${job.error ? ` (${job.error})` : ""} [job ${job.short}].\n` +
+            `[job-tracker] Task finished: ${describe(job)}, verdict ${job.verdict || taskVerdict(job)} (run ${job.outcome})${job.error ? ` (${job.error})` : ""} [job ${job.short}].\n` +
             `Done when: ${job.doneWhen || "(see brief)"}\nResult:\n${job.resultText || "(no final text was captured; read it with sessions_history on " + job.key + ")"}\n` +
             `${job.missingEvidence && job.missingEvidence.length ? `\nWARNING: these files cited as proof do not exist: ${job.missingEvidence.join(", ")}. Treat those claims as unproven.\n` : ""}\n${ACT_NOW}`,
             "ended");
@@ -683,6 +712,19 @@ function cliTotals(file) {
   return now;
 }
 
+function subagentTotals(cliLog) {
+  const dir = String(cliLog || "").replace(/\.jsonl$/, "") + path.sep + "subagents";
+  let names = [];
+  try { names = fs.readdirSync(dir).filter((n) => n.endsWith(".jsonl")); } catch { return { tokens: 0, calls: 0, files: 0 }; }
+  let tokens = 0, calls = 0;
+  for (const n of names) {
+    const r = cliTotals(path.join(dir, n));
+    tokens += r.tokens;
+    calls += r.calls;
+  }
+  return { tokens, calls, files: names.length };
+}
+
 // Sets a task's real token use from its CLI log (absolute totals); returns the job when this put a running task over
 // its token budget. A task that ended in the last `tailMs` is read once more for what it wrote after the last tick.
 function meterCliUsage(data, sessionKey, cfg, now = Date.now(), home = os.homedir(), tailMs = 15 * 60000) {
@@ -696,7 +738,12 @@ function meterCliUsage(data, sessionKey, cfg, now = Date.now(), home = os.homedi
     if (!f) return null;
     job.cliLog = f;
   }
-  const t = cliTotals(job.cliLog);
+  const main = cliTotals(job.cliLog);
+  // Its Claude Code subagents write their own logs beside it (<session>/subagents/agent-*.jsonl): they count too.
+  const sub = subagentTotals(job.cliLog);
+  job.subagentTokens = sub.tokens;
+  job.subagentLogs = sub.files;
+  const t = { tokens: main.tokens + sub.tokens, calls: main.calls + sub.calls };
   if (t.tokens <= (job.cliTokens || 0)) return null;
   job.cliTokens = t.tokens;
   job.cliCalls = Math.max(t.calls, job.cliCalls || 0);
@@ -747,6 +794,9 @@ export {
   lastAssistantText,
   noProgressStreak,
   taskVerdict,
+  recordSubagent,
+  parseRaises,
+  subagentTotals,
   itemTaskCount,
   findCliLog,
   readCliUsage,

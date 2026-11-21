@@ -67,7 +67,7 @@ test("OpenClaw config, plugin, cron, secret and model changes are blocked; reads
 });
 
 test("back channels: hidden agent tools, worker spawns and agent-to-agent sends are blocked", () => {
-  for (const toolName of ["SendMessage", "TeamCreate", "Agent", "Task", "conversations_send", "mcp__openclaw__cron", "gateway"]) {
+  for (const toolName of ["SendMessage", "TeamCreate", "conversations_send", "mcp__openclaw__cron", "gateway"]) {
     assert.equal(rule(policyDecide({ toolName, params: { action: "add" } }, DEVOPS, {}, {})), "backChannel", toolName);
   }
   assert.equal(policyDecide({ toolName: "cron", params: { action: "list" } }, DEVOPS, {}, {}), undefined);
@@ -478,4 +478,25 @@ test("with Opus out of the allowed models, an Opus request runs on the newest So
   assert.equal(r.params.model, "anthropic/claude-sonnet-5-5");
   // Opus still allowed: it stays Opus
   assert.equal(policyDecide(spawn, COORD, {}, { spawn: { allowedModels: ["anthropic/claude-opus-5-5", "anthropic/claude-sonnet-5-5"] } }).params.model, "anthropic/claude-opus-5-5");
+});
+
+
+// Owner 2026-11-21: subagents on, the orchestrator decides per task, the guard enforces the brief's line.
+test("Claude Code subagents: only in a task, only as many as the brief allows, on the brief's model", async () => {
+  const { parseSubagents, modelAlias } = await import("../policy.js");
+  assert.deepEqual(parseSubagents("Project: x\nSubagents: max 2, Model: anthropic/claude-sonnet-5-5, Effort: low"), { max: 2, model: "sonnet", effort: "low" });
+  assert.deepEqual(parseSubagents("Subagents: none"), { max: 0, model: "", effort: "" });
+  assert.equal(parseSubagents("no line").max, 0);
+  assert.equal(parseSubagents("Subagents: max 9").max, 5, "hard cap 5");
+  assert.equal(modelAlias("anthropic/claude-opus-5-5"), "opus");
+  const agent = (params = {}) => ({ toolName: "Agent", params: Object.assign({ description: "d", prompt: "p" }, params) });
+  const ps = (job) => ({ jobFor: () => job });
+  const brief = "Project: demo\nSubagents: max 2, Model: anthropic/claude-haiku-5-5, Effort: low";
+  assert.equal(rule(policyDecide(agent(), DEVOPS, ps({ brief: "Project: demo" }), {})), "subagentsOff", "no line = none");
+  assert.equal(rule(policyDecide(agent(), COORD, ps(null), {})), "subagentsOff", "not for the orchestrator");
+  assert.equal(policyDecide(agent(), DEVOPS, ps({ brief, subagentCalls: 0 }), {}).params.model, "haiku", "the brief's model is set");
+  assert.equal(policyDecide(agent({ model: "haiku" }), DEVOPS, ps({ brief, subagentCalls: 1 }), {}), undefined);
+  assert.equal(rule(policyDecide(agent({ model: "opus" }), DEVOPS, ps({ brief, subagentCalls: 0 }), {})), "subagentModel");
+  assert.equal(rule(policyDecide(agent(), DEVOPS, ps({ brief, subagentCalls: 2 }), {})), "subagentLimit");
+  assert.equal(rule(policyDecide({ toolName: "Task", params: {} }, DEVOPS, ps({ brief, subagentCalls: 2 }), {})), "subagentLimit");
 });
