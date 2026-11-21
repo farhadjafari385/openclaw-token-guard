@@ -240,3 +240,17 @@ test("a map query is recorded on the running task and survives a stale plugin co
   assert.equal(mergeStates(a, b).jobs[key].graphQueries, 1);
   assert.equal(mergeStates(a, b).jobs[key].lastActivityAt, 9);
 });
+
+// 2026-11-21 audit: every job said outcome "ok" while most ends were blocked, failed or had no verdict.
+test("a job keeps the task's verdict from its RESULT line, apart from how the run ended", () => {
+  const ends = [["RESULT: done. Pipeline green.", "ok", "done"], ["x\n\nRESULT: blocked\nOwner action: owner money: pay", "ok", "blocked"],
+    ["RESULT: partly done", "ok", "failed"], ["RESULT: waiting https://ci/1", "ok", "waiting"], ["no result line", "ok", "unknown"],
+    ["RESULT: done", "error", "failed"], ["RESULT: done", "killed", "killed"]];
+  for (const [text, outcome, verdict] of ends) {
+    const d = emptyState();
+    spawned(d, 0);
+    recordResultText(d, CHILD, text, CFG);
+    const job = recordEnd(d, CHILD, outcome, "", 10 * MIN);
+    assert.equal(job.verdict, verdict, text);
+  }
+});

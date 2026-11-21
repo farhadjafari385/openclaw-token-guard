@@ -243,7 +243,7 @@
       "pace": {
         "type": "object",
         "additionalProperties": true,
-        "description": "Weekly pace from the Claude plan's usage: enabled, everyMinutes, aheadPercent, reservePercent, fiveHourPercent"
+        "description": "Weekly pace from the Claude plan's usage: enabled, everyMinutes, aheadPercent, reservePercent, fiveHourPercent, and an owner budget window: windowStart (ISO), windowStartPercent, windowPerHour, windowHours"
       },
       "skills": {
         "type": "object",
