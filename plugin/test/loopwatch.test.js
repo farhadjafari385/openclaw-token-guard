@@ -18,9 +18,21 @@ test("a late timer holds dispatches until the loop has been calm", () => {
 test("the hold has a ceiling for a chronically busy host", () => {
   const st = fresh(); const cfg = mergeLoopConfig({});
   let now = 1e12;
-  for (let i = 0; i < 20; i++) { now += 60000; recordSample(st, now, now - 4000, {}); } // 4 s late every minute
+  for (let i = 0; i < 20; i++) { now += 60000; recordSample(st, now, now - 9000, {}); } // 9 s late every minute
   assert.ok(now - st.runStart > cfg.maxHoldMs);
   assert.equal(loopHold(st, now), 0);
+});
+
+test("a 4 s hiccup on a loaded host does not hold launches (owner 2026-11-21)", () => {
+  const st = fresh(); const t0 = 1e12;
+  recordSample(st, t0, t0 - 4000, {});
+  assert.equal(loopHold(st, t0 + 1000), 0);
+});
+
+test("the loop thresholds come from the plugin config", () => {
+  const st = fresh(); const t0 = 1e12;
+  recordSample(st, t0, t0 - 4000, { lagMs: 3000 });
+  assert.ok(loopHold(st, t0 + 1000, { lagMs: 3000 }) > t0 + 1000);
 });
 
 test("a spawn is refused while the loop is blocked, other tools are not", () => {
