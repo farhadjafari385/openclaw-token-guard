@@ -246,7 +246,20 @@ function looksLikeRequest(text) {
   return /\b(fix|add|make|change|create|deploy|remove|delete|build|implement|update|move|rename|need|needs|should|must|want|why|broken|bug|error|issue|not working|doesn'?t work|failing|failed|wrong|missing|improve|redesign|check|do it|go ahead|send|report|connect|install|set up|setup|start|stop|run|ship|publish|test|verify|review|merge|finish|continue|give me|show me|tell me)\b/i.test(t);
 }
 
+// A fingerprint of the open board (id, column, latest note) for "has anything changed since?" checks.
+// Owner 2026-11-21 (cost): the orchestrator is not woken again about a board that did not change.
+function boardPrint(items) {
+  const rows = [];
+  for (const it of (items && typeof items.values === "function" ? items.values() : items || [])) {
+    const st = normStatus(it.status);
+    if (st === "done" || st === "dropped" || st === "archived") continue;
+    rows.push(`${it.id}|${st}|${String(it.note || "").slice(0, 200)}`);
+  }
+  return rows.sort().join("\n");
+}
+
 export {
+  boardPrint,
   COLUMNS, LEGACY, LABELS, TRANSITIONS, DISPATCHABLE, OPEN, AUTO_FROM, FAILED_OUTCOMES,
   ACTIVE, queueOrder, queueState, strandedMoves,
   isLimitBlock, normStatus, canMove, resultVerdict, nextAfterJob, moveAfterJob, renderBoard, renderOverview, auditBoard, parseApproval, looksLikeRequest,

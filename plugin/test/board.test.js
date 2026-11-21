@@ -409,3 +409,12 @@ test("an item with no Done when is refused when the board requires one; a Done w
   assert.notEqual(policyDecide(spawn("d0d0e002"), COORD, ps, cfg).rule, "doneWhenRequired");
   assert.notEqual(policyDecide(spawn("d0d0e001"), COORD, ps, Object.assign({}, CFG, { board: { wip: 10 } })).rule, "doneWhenRequired", "off unless configured");
 });
+
+test("the open-board print changes with a column or note and ignores closed items", async () => {
+  const { boardPrint } = await import("../board.js");
+  const a = new Map([["a1", { id: "a1", status: "todo", note: "x" }], ["a2", { id: "a2", status: "done", note: "old" }]]);
+  const b = new Map([["a1", { id: "a1", status: "todo", note: "x" }], ["a2", { id: "a2", status: "done", note: "changed" }]]);
+  assert.equal(boardPrint(a), boardPrint(b), "a closed item's change does not count");
+  assert.notEqual(boardPrint(a), boardPrint(new Map([["a1", { id: "a1", status: "in_progress", note: "x" }]])));
+  assert.notEqual(boardPrint(a), boardPrint(new Map([["a1", { id: "a1", status: "todo", note: "y" }]])));
+});

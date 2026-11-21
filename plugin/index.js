@@ -3,7 +3,7 @@ import { definePluginEntry } from "openclaw/plugin-sdk/plugin-entry";
 import { Type } from "typebox";
 import { createState, decide, forgetRefusedBrief } from "./guard.js";
 import { policyDecide, firstLine, itemsFromBrief, completeBrief, codexEnabled, CHECK_COMMAND, GRAPH_COMMAND, ownerActionExit, withHandoffs } from "./policy.js";
-import { ACTIVE, strandedMoves, isLimitBlock, normStatus, resultVerdict, nextAfterJob, moveAfterJob, queueState, renderBoard, renderOverview, auditBoard, parseApproval, looksLikeRequest } from "./board.js";
+import { boardPrint, ACTIVE, strandedMoves, isLimitBlock, normStatus, resultVerdict, nextAfterJob, moveAfterJob, queueState, renderBoard, renderOverview, auditBoard, parseApproval, looksLikeRequest } from "./board.js";
 import { correctTopic, isGeneral, projectOfTopic, projectsMentioned } from "./topics.js";
 import { isLimitError, isLimitReply, isRunFailureReply, allowLimitReply, limitResetAt } from "./limits.js";
 import {
@@ -1249,8 +1249,15 @@ export default definePluginEntry({
           return;
         }
         post(pm, teamTopic, auditText(voice, res && res.status, text), { html: true });
-        // The PM's findings reach the orchestrator at once (owner's order), not at its next wake.
-        if (String(text || "").trim()) {
+        // The PM's findings reach the orchestrator at once (owner's order), not at its next wake. Owner 2026-11-21
+        // (cost): not when the open board is the same as at the last heads-up. One Opus session took 8,182 turns of
+        // heads-ups about the same board on 2026-11-12.
+        const openPrint = boardPrint(loadInboxItems());
+        const sameBoard = openPrint && store.data.pmHeadsUpPrint === openPrint;
+        if (sameBoard) log("info", "token-guard: PM heads-up skipped, the open board is unchanged since the last one");
+        if (String(text || "").trim() && !sameBoard) {
+          store.data.pmHeadsUpPrint = openPrint;
+          store.touch();
           await api.runtime.subagent.run({ sessionKey: jobsCfg.idleWakeSession, deliver: false,
             message: `[PM heads-up] The board audit found and fixed this; act on what is left for you (one item at a time):\n${String(text).slice(0, 2500)}` })
             .catch((error) => log("warn", "token-guard could not pass the PM's heads-up on", { error: String(error && error.message) }));
