@@ -390,3 +390,31 @@ test("an item a finished task left in progress gets the move its result calls fo
   jobs.j1.resultText = "RESULT: failed\n- tests red";
   assert.equal(strandedMoves(items, jobs, now)[0].to, "todo");
 });
+
+// 2026-11-21 (owner: "make sure they finish tasks, actually done"): an item with no checkable finish line ends
+// "partly done" and is redone; a dispatch needs a Done when on the item or in the brief.
+test("an item with no Done when is refused when the board requires one; a Done when in the brief or on the item lets it go", () => {
+  const items = new Map([
+    ["d0d0e001", { id: "d0d0e001", project: "demo", status: "todo", rank: 1, owner: "writer", title: "no finish line", history: [] }],
+    ["d0d0e002", { id: "d0d0e002", project: "demo", status: "todo", rank: 2, owner: "writer", title: "has one", done_when: "curl returns 200", history: [] }],
+  ]);
+  const ps = { boardItems: () => items, runningItemIds: () => new Set(), runningTasks: () => 0,
+    queue: () => queueState(items, { wip: 10 }), noProgressStreak: () => 0 };
+  const spawn = (id, done = "") => ({ toolName: "sessions_spawn", params: { agentId: "writer", task: `Project: demo (/srv/demo)\nScope: x\nItems:\n${id}\n${done}Stop if: y` } });
+  const cfg = Object.assign({}, CFG, { board: { wip: 10, requireDoneWhen: true } });
+  const r = policyDecide(spawn("d0d0e001"), COORD, ps, cfg);
+  assert.equal(r.rule, "doneWhenRequired");
+  assert.match(r.blockReason, /has no Done when/);
+  assert.notEqual(policyDecide(spawn("d0d0e001", "Done when: the page returns 200\n"), COORD, ps, cfg).rule, "doneWhenRequired");
+  assert.notEqual(policyDecide(spawn("d0d0e002"), COORD, ps, cfg).rule, "doneWhenRequired");
+  assert.notEqual(policyDecide(spawn("d0d0e001"), COORD, ps, Object.assign({}, CFG, { board: { wip: 10 } })).rule, "doneWhenRequired", "off unless configured");
+});
+
+test("the open-board print changes with a column or note and ignores closed items", async () => {
+  const { boardPrint } = await import("../board.js");
+  const a = new Map([["a1", { id: "a1", status: "todo", note: "x" }], ["a2", { id: "a2", status: "done", note: "old" }]]);
+  const b = new Map([["a1", { id: "a1", status: "todo", note: "x" }], ["a2", { id: "a2", status: "done", note: "changed" }]]);
+  assert.equal(boardPrint(a), boardPrint(b), "a closed item's change does not count");
+  assert.notEqual(boardPrint(a), boardPrint(new Map([["a1", { id: "a1", status: "in_progress", note: "x" }]])));
+  assert.notEqual(boardPrint(a), boardPrint(new Map([["a1", { id: "a1", status: "todo", note: "y" }]])));
+});

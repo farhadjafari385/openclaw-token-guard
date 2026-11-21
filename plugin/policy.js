@@ -1049,6 +1049,12 @@ function policyDecide(event, ctx, pstate, rawConfig, log, now = Date.now()) {
           return block("ownerBlocked", `token-guard: ${id} waits on the owner or an outside party (${String(board.get(id).note).slice(0, 160)}). ` +
             "Another task hits the same wall. When that is done, move the item to To do with task_inbox set and a note starting \"Operator:\" that says what changed, then dispatch.");
         }
+        // A task with no checkable finish line burns tokens and ends "partly done" (owner 2026-11-21: "actually done").
+        if (policy.board.requireDoneWhen && !String(board.get(id).done_when || "").trim() &&
+            !String(params.task).split("\n").some((l) => /^[\s>*#_-]*done when\s*:\s*\S/i.test(l))) {
+          return block("doneWhenRequired", `token-guard: ${id} has no Done when. Write the exact live check that proves it is done ` +
+            "(a URL that answers, a job or order id, a store panel's status text, a screenshot) with task_inbox set, or put a `Done when:` line in the brief, then dispatch.");
+        }
         if (running.has(id)) return block("boardBusy", `token-guard: ${id} is already being worked on in another task. Wait for that result; one task at a time per item.`);
         // The same stuck item again and again burns the owner's tokens and starves the rest of the board.
         const maxNoProgress = policy.board.maxNoProgress === undefined ? 3 : Number(policy.board.maxNoProgress) || 0;
