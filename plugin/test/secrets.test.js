@@ -75,8 +75,10 @@ test("refuses a curl POST body (and any command line) that carries a secret", ()
 
 test("refuses a git push whose new commits carry a secret", () => {
   const repo = fs.mkdtempSync(path.join(os.tmpdir(), "tg-push-"));
-  const git = (...a) => execFileSync("git", ["-C", repo, ...a], { stdio: "ignore", env: Object.assign({}, process.env, { GIT_AUTHOR_NAME: "t", GIT_AUTHOR_EMAIL: "t@t", GIT_COMMITTER_NAME: "t", GIT_COMMITTER_EMAIL: "t@t" }) });
+  const git = (...a) => execFileSync("git", ["-C", repo, ...a], { stdio: "ignore", env: Object.assign({}, process.env, { GIT_AUTHOR_NAME: "t", GIT_AUTHOR_EMAIL: "t@t", GIT_COMMITTER_NAME: "t", GIT_COMMITTER_EMAIL: "t@t", GIT_CEILING_DIRECTORIES: path.dirname(repo) }) });
   git("init", "-q", "-b", "main");
+  // never fall through to an enclosing repo (2026-11-22: "clean"/"oops" commits landed in the guard's own checkout)
+  assert.ok(fs.existsSync(path.join(repo, ".git")), "the temp repo was not created");
   fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
   git("add", "-A");
   git("commit", "-qm", "clean");
