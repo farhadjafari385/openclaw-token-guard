@@ -1382,3 +1382,90 @@ test("a spent task releases its item at once: a fresh spawn is accepted, follow-
     Date.now = realNow;
   }
 });
+
+test("safety mode: the orchestrator's messages go where it sent them, once, and never to an invented group", async () => {
+  const root = harness();
+  process.env.OC_INBOX_FILE = path.join(root, "inbox.jsonl");
+  process.env.OC_INBOX_BIN = path.join(REPO, "bin", "oc-inbox");
+  const MAIN = "agent:coordinator:main";
+  const now = Date.now();
+  // the same state in which enforce mode moves the orchestrator's answer out of the owner's chat (test above)
+  const job = { key: "agent:social:subagent:s1", agentId: "social", label: "shop: 5 posts", status: "ended", topic: 151,
+    requesterSessionKey: MAIN, resultMsgId: 900, endedAt: now - 60000, spawnedAt: now - 3600000 };
+  fs.writeFileSync(path.join(root, "state", "jobs.json"), JSON.stringify({ version: 1, jobs: { [job.key]: job },
+    ownerMsgs: { 1: { id: 77, at: now - 600000, text: "the video is still bad, fix it" } } }));
+  const telegram = [];
+  globalThis.fetch = async (url, opts = {}) => {
+    if (String(url).startsWith("https://api.telegram.org/")) {
+      telegram.push(JSON.parse(opts.body || "{}"));
+      return { ok: true, json: async () => ({ ok: true, result: { message_id: 9000 + telegram.length } }) };
+    }
+    return { ok: false, status: 404, json: async () => ({}) };
+  };
+  const handlers = {};
+  const runs = [];
+  const api = {
+    pluginConfig: {
+      mode: "safety",
+      orchestratorAgent: "coordinator",
+      ownerId: "42",
+      knownChats: ["-100", "-1005550000001"],
+      projects: { shop: { topic: 151 }, infra: { topic: 152 } },
+      board: { enabled: true, requireItems: false, agent: "product", view: false },
+      topics: { enabled: true, chatId: "-100", teamTopic: 160 },
+      mirror: { enabled: true, chatId: "-100", systemTopic: 160, defaultTopic: 160, projectTopics: { shop: 151, infra: 152 }, minIntervalMs: 0,
+        botTokenFiles: { coordinator: path.join(root, "bot.token"), social: path.join(root, "bot.token") } },
+      jobs: { stateFile: path.join(root, "state", "jobs.json"), idleWakeSession: "agent:coordinator:explicit:team-ops" },
+      triage: { enabled: false },
+    },
+    logger: { info: () => {}, warn: () => {}, error: () => {}, debug: () => {} },
+    on: (name, fn) => { (handlers[name] = handlers[name] || []).push(fn); },
+    registerService: () => {},
+    registerTool: () => {},
+    runtime: { subagent: { run: async (r) => { runs.push(r); return { runId: "r" }; }, waitForRun: async () => ({ status: "ok" }), getSessionMessages: async () => ({ messages: [] }), deleteSession: async () => ({}) } },
+  };
+  const entry = (await import(pathToFileURL(path.join(root, "plugin", "index.js")).href)).default;
+  entry.register(api);
+  const send = (event, ctx) => { let out; for (const h of handlers.message_sending || []) out = h(event, ctx) ?? out; return out; };
+  const call = async (event, ctx) => { let out; for (const h of handlers.before_tool_call || []) out = (await h(event, ctx)) ?? out; return out; };
+  const ORC = { channelId: "telegram", accountId: "orchestrator", sessionKey: MAIN, agentId: "coordinator", runId: "run1" };
+
+  // an answer to the owner stays in the owner's chat although a task's result is newer than the owner's message
+  assert.equal(send({ to: "telegram:42", content: "One post is live and four are left; I am sending the next one now, here is the link." }, ORC), undefined);
+  // a question the owner must answer reaches the owner: it is not held back
+  assert.equal(send({ to: "telegram:42", content: "@owner the store asks for the card's 3-D Secure code: which card should we use, the business one?" }, ORC), undefined);
+  // a post that names another project stays in the topic the orchestrator chose
+  assert.equal(send({ to: "telegram:-100", threadId: 151, content: "The shop checkout fix is merged; the infra pipeline for it is green as well." },
+    Object.assign({}, ORC, { sessionKey: "agent:coordinator:telegram:group:-100:topic:151" })), undefined);
+  await settle();
+  assert.equal(telegram.length, 0, "the guard reposted or pointed somewhere");
+  assert.equal(runs.length, 0, "the guard woke the orchestrator over its own message");
+
+  // the same answer again in another topic, and again in the owner's chat: sent once
+  const text = "The disk clean-up is merged and ran on the server: 31 GB free now, and the timer runs it every night at 03:00.";
+  assert.equal(send({ to: "telegram:-100", threadId: 160, content: text }, ORC), undefined);
+  const again = send({ to: "telegram:-100", threadId: 152, content: text.replace("31 GB free now", "31 GB are free now") }, ORC);
+  assert.equal(again && again.cancel, true);
+  assert.equal((send({ to: "telegram:42", content: text }, ORC) || {}).cancel, true);
+  // but when the owner then asks in the private chat, the answer there is sent even if it was said in a topic
+  for (const h of handlers.message_received || []) h({ senderId: "42", content: "is the disk fixed or not?", messageId: "88" }, { channelId: "telegram" });
+  assert.equal(send({ to: "telegram:42", content: text }, ORC), undefined);
+  assert.equal((send({ to: "telegram:42", content: text }, ORC) || {}).cancel, true); // once
+  // another bot saying it is not a repeat
+  assert.equal(send({ to: "telegram:-100", threadId: 152, content: text }, { channelId: "telegram", accountId: "devops", sessionKey: "agent:devops:subagent:x" }), undefined);
+
+  // a group id that does not exist becomes the team group; real chats and the owner pass
+  const post = (target, extra = {}) => ({ toolName: "message", params: Object.assign({ action: "send", channel: "telegram", target, message: "Status: the release is out." }, extra) });
+  const fixed = await call(post("-1001111111111", { threadId: "154" }), ORC);
+  assert.equal(fixed.params.target, "-100");
+  assert.equal(fixed.params.threadId, "154");
+  assert.equal((await call(post("-1002222222222:topic:153"), ORC)).params.target, "-100:topic:153");
+  for (const ok of ["-100", "42", "-1005550000001", "-100:topic:151"]) {
+    const r = await call(post(ok), ORC);
+    assert.equal(Boolean(r && r.params && r.params.target !== ok), false, ok);
+  }
+
+  // an item recorded while the owner's last message was about something else does not carry those words
+  const added = await call({ toolName: "task_inbox", params: { action: "add", project: "infra", title: "Patch the gateway CVE", owner: "devops", details: "Upgrade to the fixed release." } }, ORC);
+  assert.doesNotMatch(JSON.stringify((added && added.params) || {}), /video is still bad/);
+});

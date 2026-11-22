@@ -218,3 +218,23 @@ test("the secret refusal shows commands that the guard itself allows", async () 
   assert.equal(examples.length, 2);
   for (const c of examples) assert.ok(!secretReadViolation(c, cfg), `the example is refused: ${c}`);
 });
+
+test("signing an Android build with a keystore from the secrets folder is allowed; printing the keystore password is not", () => {
+  const ok = [
+    "apksigner sign --ks ~/.openclaw/secrets/misspixel.jks --ks-pass file:$HOME/.openclaw/secrets/misspixel.pass --out app-signed.apk app-aligned.apk",
+    "apksigner sign --ks ~/.openclaw/secrets/misspixel.jks --ks-pass stdin app.apk < ~/.openclaw/secrets/misspixel.pass",
+    "cat ~/.openclaw/secrets/misspixel.pass | apksigner sign --ks ~/.openclaw/secrets/misspixel.jks --ks-pass stdin app.apk",
+    "jarsigner -keystore ~/.openclaw/secrets/ir.hub.restore.jks -storepass:file ~/.openclaw/secrets/ir.hub.restore.pass app.aab upload",
+    "./gradlew assembleBazaarRelease -Pandroid.injected.signing.store.file=$HOME/.openclaw/secrets/ir.hub.restore.jks",
+    "KEYSTORE_PASSWORD=$(cat ~/.openclaw/secrets/ir.hub.restore.pass) KEY_ALIAS=upload ./gradlew assembleMyketRelease",
+  ];
+  for (const c of ok) assert.equal(secretReadViolation(c, {}), "", c);
+  const leaks = [
+    "cat ~/.openclaw/secrets/misspixel.pass",
+    "apksigner sign --ks ~/.openclaw/secrets/misspixel.jks app.apk; cat ~/.openclaw/secrets/misspixel.pass",
+    "KEYSTORE_PASSWORD=$(cat ~/.openclaw/secrets/ir.hub.restore.pass) printenv",
+    "cat ~/.openclaw/secrets/misspixel.pass | tee /tmp/p | apksigner sign --ks ~/.openclaw/secrets/misspixel.jks --ks-pass stdin app.apk",
+    "base64 ~/.openclaw/secrets/misspixel.jks",
+  ];
+  for (const c of leaks) assert.notEqual(secretReadViolation(c, {}), "", c);
+});

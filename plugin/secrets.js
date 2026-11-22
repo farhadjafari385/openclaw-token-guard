@@ -233,6 +233,11 @@ const CONSUMERS = [
   /\bGIT_ASKPASS=/,                                            // git asks a helper for the token
   /\b(?:ssh|scp|sftp|rsync)\b[^\n]*\s-i\s/,                    // an SSH key as identity file
   /\bGIT_SSH_COMMAND=/,
+  // Android signing (2026-11-22: the store builds waited two days because every signing route was refused): the tool
+  // reads the keystore, and its password from a file, stdin or its own environment, and prints neither.
+  /\b(?:apksigner|jarsigner)\b[^\n]*?(?:\s--ks(?:[=\s]|-pass[=\s])|\s-keystore\s|\s-storepass:(?:file|env)\s)/,
+  /(?:^|\s)(?:\.\/)?gradlew?\b[^\n]*\.(?:jks|keystore|p12)\b/,                                  // Gradle given the keystore's path
+  /\b[A-Za-z_][A-Za-z0-9_]*=["']?\$\(\s*(?:cat\s|<)[^)]*\)["']?\s[^\n]*?(?:\.\/)?gradlew?\b/,   // Gradle given the password in its environment
 ];
 // Commands that only look at names, sizes or existence.
 const METADATA = /^\s*(?:ls|stat|test|\[|\[\[|file|du|wc\s+-[cl]|find)\b/;

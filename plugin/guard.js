@@ -1,4 +1,5 @@
 import os from "node:os";
+import { enforces, ruleOn } from "./safety.js";
 
 // Pure, unit-testable decision logic for token-guard. No OpenClaw imports here.
 //
@@ -506,15 +507,18 @@ function decide(event, ctx, state, rawConfig, log, now = Date.now()) {
 
   let callSig = "";
   try { callSig = `${toolName}|${JSON.stringify(params)}`; } catch { callSig = ""; }
+  // Mode "safety" (safety.js): a rule that is off there never fires, so the checks after it still run.
+  const on = (rule) => ruleOn(cfg.mode, rule);
   const block = (rule, reason) => {
-    if (callSig && rule !== "retryBlocked") run.blockedSigs.set(callSig, 0);
+    const stop = enforces(cfg.mode, rule);
+    if (callSig && rule !== "retryBlocked" && (stop || cfg.mode !== "safety")) run.blockedSigs.set(callSig, 0);
     state.blocks.set(rule, (state.blocks.get(rule) || 0) + 1);
     if (typeof log === "function") {
-      log(enforce ? "warn" : "info", `token-guard ${enforce ? "blocked" : "would block"} ${toolName} (${rule})`, {
+      log(stop ? "warn" : "info", `token-guard ${stop ? "blocked" : "would block"} ${toolName} (${rule})`, {
         rule, agentId, sessionKey, toolName,
       });
     }
-    return enforce ? { block: true, blockReason: reason } : undefined;
+    return stop ? { block: true, blockReason: reason } : undefined;
   };
 
   // An identical call that was already blocked in this run is refused again without re-evaluating it.
@@ -534,13 +538,13 @@ function decide(event, ctx, state, rawConfig, log, now = Date.now()) {
     run.sinceCheckpoint = 0;
   } else {
     run.sinceCheckpoint += 1;
-    if (run.toolCalls > cfg.maxToolCallsPerRun) {
+    if (on("maxToolCallsPerRun") && run.toolCalls > cfg.maxToolCallsPerRun) {
       return block("maxToolCallsPerRun",
         `token-guard: this run used its budget of ${cfg.maxToolCallsPerRun} tool calls. ` +
         (subagent ? "End now with a short report of what is done and what remains."
           : "Post a short status with the message tool (done, remaining, next step) and end your turn; the work continues in a fresh run."));
     }
-    if (!subagent && cfg.checkpointEvery > 0 && run.sinceCheckpoint > cfg.checkpointEvery) {
+    if (on("checkpoint") && !subagent && cfg.checkpointEvery > 0 && run.sinceCheckpoint > cfg.checkpointEvery) {
       run.sinceCheckpoint = 0;
       return block("checkpoint",
         `token-guard: checkpoint after ${cfg.checkpointEvery} tool calls. Post a one-line progress update ` +
@@ -552,7 +556,7 @@ function decide(event, ctx, state, rawConfig, log, now = Date.now()) {
   const statusCheck = STATUS_TOOLS.has(toolName) || (toolName === "subagents" && (params.action || "list") === "list");
   if (statusCheck && !matchesAny(sessionKey, cfg.statusExemptSessionPatterns)) {
     run.statusChecks += 1;
-    if (run.statusChecks > cfg.maxStatusChecksPerRun) {
+    if (on("maxStatusChecksPerRun") && run.statusChecks > cfg.maxStatusChecksPerRun) {
       return block("maxStatusChecksPerRun",
         `token-guard: more than ${cfg.maxStatusChecksPerRun} session status checks in one run. ` +
         "Do not chase workers: a waiting worker is woken by its waiter. Act on what you know, or end your turn.");
@@ -565,12 +569,12 @@ function decide(event, ctx, state, rawConfig, log, now = Date.now()) {
     if (action === "poll" || action === "log" || action === "list") {
       run.pollTotal += 1;
       const maxRun = subagent ? cfg.subagentMaxPollsPerRun : cfg.maxPollsPerRun;
-      if (run.pollTotal > maxRun) return block("maxPollsPerRun", pollRemedy(`process ${action} #${run.pollTotal} in this run`, subagent));
+      if (on("maxPollsPerRun") && run.pollTotal > maxRun) return block("maxPollsPerRun", pollRemedy(`process ${action} #${run.pollTotal} in this run`, subagent));
       if (!subagent && action !== "list") {
         const job = String(params.sessionId || "unknown");
         const count = (run.pollByJob.get(job) || 0) + 1;
         run.pollByJob.set(job, count);
-        if (count > cfg.maxPollsPerJob) return block("maxPollsPerJob", pollRemedy(`check #${count} of job ${job}`, subagent));
+        if (on("maxPollsPerJob") && count > cfg.maxPollsPerJob) return block("maxPollsPerJob", pollRemedy(`check #${count} of job ${job}`, subagent));
       }
     }
     return undefined;
@@ -597,7 +601,7 @@ function decide(event, ctx, state, rawConfig, log, now = Date.now()) {
       return undefined;
     }
 
-    if (command.length > MAX_PARSE_CHARS && callsInterpreter(command)) {
+    if (on("oversizeCommand") && command.length > MAX_PARSE_CHARS && callsInterpreter(command)) {
       return block("oversizeCommand",
         `token-guard: blocked a ${command.length}-character command that runs bash/sh/zsh/dash/ssh/python: ` +
         `it is too large to check for sleeps. Write the script to a file in a separate step (cat > file <<'EOF'), then run the file.`);
@@ -605,13 +609,13 @@ function decide(event, ctx, state, rawConfig, log, now = Date.now()) {
     const sleepSeconds = totalSleepSeconds(command);
     if (!background) {
       // awaitResults still waits in the foreground, so sleeps stay checked.
-      if (sleepSeconds >= cfg.maxForegroundSleepSeconds) {
+      if (on("foregroundSleep") && sleepSeconds >= cfg.maxForegroundSleepSeconds) {
         return block("foregroundSleep", waitRemedy(`a foreground sleep of ${sleepSeconds}s`, subagent));
       }
-      if (hasSleepLoop(command, cfg.minLoopSleepSeconds)) {
+      if (on("sleepLoop") && hasSleepLoop(command, cfg.minLoopSleepSeconds)) {
         return block("sleepLoop", waitRemedy("a sleep/watch loop", subagent));
       }
-    } else if (background && !subagent && sleepSeconds >= cfg.maxBackgroundSleepSeconds) {
+    } else if (on("backgroundSleep") && background && !subagent && sleepSeconds >= cfg.maxBackgroundSleepSeconds) {
       return block("backgroundSleep",
         `token-guard: blocked a background sleep of ${sleepSeconds}s: every timed wake re-reads the whole session. ` +
         "Run `~/.openclaw/bin/oc-wait --every 30 --timeout 2h -- <command that exits 0 when done>` in the background instead; it wakes you once, when the condition is met.");
@@ -621,7 +625,7 @@ function decide(event, ctx, state, rawConfig, log, now = Date.now()) {
     if (norm) {
       const count = (run.commandCounts.get(norm) || 0) + 1;
       run.commandCounts.set(norm, count);
-      if (count >= cfg.maxRepeatCommand) {
+      if (on("repeatCommand") && count >= cfg.maxRepeatCommand) {
         return block("repeatCommand",
           `token-guard: blocked: the same command ran ${count} times in this run with no progress in between. ` +
           (subagent ? SUBAGENT_WAIT_HOWTO : WAIT_HOWTO));

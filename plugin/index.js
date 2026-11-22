@@ -54,6 +54,10 @@ export default definePluginEntry({
   description: "Enforces the team's rules on every tool call, follows every task to the end, and mirrors team work into Telegram.",
   register(api) {
     const cfg = api.pluginConfig || {};
+    // Mode "safety" (safety.js, owner 2026-11-22): the guard protects, it does not manage. Besides the rules that are
+    // off there, the guard no longer moves, holds or rewrites what the orchestrator says: a message goes where the
+    // orchestrator sent it (2026-11-20..22: 50 of its messages were moved to another topic, away from the owner's question).
+    const safetyMode = cfg.mode === "safety";
     const orchestrator = cfg.orchestratorAgent || "coordinator";
     const jobsCfg = mergeJobsConfig(cfg.jobs);
     const log = (level, message, meta) => {
@@ -260,6 +264,19 @@ export default definePluginEntry({
       if (event && event.error) return false;
       return !/"(ok)"\s*:\s*false|"status"\s*:\s*"error"/.test(JSON.stringify((event && event.result) || ""));
     };
+    // A chat id that is none of the team's chats is an invented one (2026-11-20..22: 20+ sends to group ids that do not
+    // exist; each failed and the answer came late or twice). It becomes the team group, topic kept.
+    const knownChats = new Set([chatId, ownerId, ...(Array.isArray(cfg.knownChats) ? cfg.knownChats.map(String) : [])].filter(Boolean));
+    const withKnownChat = (p) => {
+      if (!p || !chatId || !Array.isArray(cfg.knownChats)) return null;
+      const field = ["target", "to", "chatId"].find((k) => typeof p[k] === "string" || typeof p[k] === "number");
+      if (!field) return null;
+      const raw = String(p[field]);
+      const id = (/-?\d+/.exec(raw) || [""])[0];
+      if (!/^-100\d*$/.test(id) || knownChats.has(id)) return null; // only group ids; names and user ids pass
+      log("info", "token-guard replaced an unknown group id with the team group", { from: raw.slice(0, 60) });
+      return Object.assign({}, p, { [field]: raw.replace(id, chatId) });
+    };
     // An orchestrator post in a project topic answers the newest unanswered result there, and mentions its worker.
     const threadOrchestratorPost = (p) => {
       if (!p || p.replyTo || String(p.action || "send") !== "send") return null;
@@ -282,27 +299,29 @@ export default definePluginEntry({
       // The owner's exact words are the spec; they travel with the item into every brief.
       const asks = (fresh().ownerAsks || []).filter((a) => a.topic === topic && Date.now() - a.at < 2 * 3600000);
       const words = String((asks.length ? asks[asks.length - 1].text : ((store.data.ownerMsgs || {})[String(topic)] || {}).text) || "").trim();
-      if (words && !/Owner said: «/.test(String(p.details || ""))) out.details = `Owner said: «${words}»\n${p.details || ""}`.trim();
+      if (!safetyMode && words && !/Owner said: «/.test(String(p.details || ""))) out.details = `Owner said: «${words}»\n${p.details || ""}`.trim();
       return out;
     };
     // Every brief carries, for each of its items, the owner's exact words and what happened on it before.
     const withOwnerWords = (p) => {
       const ids = itemsFromBrief(String(p.task || ""));
-      if (!ids.length || /The owner's exact words/.test(String(p.task || ""))) return null;
+      if (!ids.length || /The owner's exact words|Already on these items/.test(String(p.task || ""))) return null;
       const board = loadInboxItems();
       const parts = [];
       for (const id of ids) {
         const it = board.get(id);
         if (!it) continue;
-        let said = /Owner said: «([\s\S]*?)»/.exec(String(it.details || ""));
+        let said = safetyMode ? null : /Owner said: «([\s\S]*?)»/.exec(String(it.details || ""));
         if (said && String(p.task || "").includes(said[1].slice(0, 60))) said = null; // already in the brief
         const noteNow0 = String(it.note || "").trim();
         const past = (it.history || []).filter((h) => h.note && h.by !== "system" && String(h.note).trim() !== noteNow0).slice(-4).map((h) => `  - ${h.from} -> ${h.to}: ${String(h.note).slice(0, 240)}`);
         const noteNow = String(it.note || "").trim();
+        if (safetyMode && !noteNow && !past.length) continue; // nothing on the item yet: the brief stands as written
         parts.push(`- ${id} ${it.title || ""}${said ? `\n  Owner said: «${said[1].slice(0, 1200)}»` : ""}` +
           `${noteNow ? `\n  Latest note on the item: ${noteNow.slice(0, 900)}` : ""}${past.length ? `\n  Earlier on this item:\n${past.join("\n")}` : ""}`);
       }
       if (!parts.length) return null;
+      if (safetyMode) return Object.assign({}, p, { task: `${p.task}\n\nAlready on these items (continue from here, do not redo what is right):\n${parts.join("\n")}` });
       return Object.assign({}, p, { task: `${p.task}\n\nThe owner's exact words (this is the spec: do exactly this, keep the change minimal, and do not redo work that is already right):\n${parts.join("\n")}` });
     };
     // Every brief names the skills of that agent that fit the task (from openclaw-team's skill catalog).
@@ -576,6 +595,7 @@ export default definePluginEntry({
             rememberSpawn(params || event.params || {}, ctx);
           }
           const bare = String(event.toolName || "").split("__").pop();
+          if (bare === "message") params = withKnownChat(params || event.params || {}) || params;
           if (ctx && ctx.agentId === orchestrator && bare === "message") params = threadOrchestratorPost(params || event.params || {}) || params;
           if (ctx && (ctx.agentId === orchestrator || ctx.agentId === pm) && bare === "task_inbox" && String((params || event.params || {}).action || "") === "add") {
             params = withSource(params || event.params || {}, ctx.sessionKey) || params;
@@ -764,17 +784,35 @@ export default definePluginEntry({
 
     // ---- the same message twice to the same chat and topic: the repeat is dropped ----
     const sentRecently = new Map();
+    const lastSentTo = new Map(); // chat and topic -> when this bot last sent there
     api.on("message_sending", safe("message_sending:dedupe", (event, ctx) => {
       if (cfg.dedupe && cfg.dedupe.enabled === false) return undefined;
       const text = event && event.content;
       if (typeof text !== "string") return undefined;
       // OpenClaw's failure and limit notices have their own handling below (each repeat is answered on purpose).
       if (isRunFailureReply(text) || isLimitReply(text)) return undefined;
-      const dest = `${(ctx && ctx.accountId) || ""}:${(event && event.to) || ""}:${(event && event.threadId) || ""}`;
-      const hit = checkRepeat(sentRecently, dest, text, Date.now(), cfg.dedupe);
-      if (!hit) return undefined;
-      log("info", "token-guard dropped a repeated message", { to: event.to, threadId: event.threadId, accountId: ctx && ctx.accountId, firstSentSecondsAgo: Math.round((Date.now() - hit.at) / 1000) });
-      return { cancel: true, cancelReason: "token-guard: the same message was already sent to this chat; not sent again" };
+      // Safety mode: one bot says a thing once, in whichever chat or topic (2026-11-22: 31 of 72 owner messages drew 3+
+      // look-alike answers, some in another topic or the private chat). Otherwise per chat and topic.
+      const now = Date.now();
+      const account = `${(ctx && ctx.accountId) || ""}`;
+      const here = `${account}:${(event && event.to) || ""}:${(event && event.threadId) || ""}`;
+      const acrossChats = safetyMode && !(cfg.dedupe && cfg.dedupe.acrossChats === false);
+      // The first answer in the chat where the owner has just written is never dropped for having been said elsewhere:
+      // the owner asked here.
+      const toOwner = !!ownerId && String((event && event.to) || "").split(":").pop() === ownerId;
+      const ownerAt = Number(((fresh().ownerMsgs || {})[toOwner || isGeneral(event.threadId) ? "1" : String(event.threadId)] || {}).at) || 0;
+      const answersOwner = ownerAt > 0 && now - ownerAt < 30 * 60000 && (lastSentTo.get(here) || 0) < ownerAt;
+      const peek = (key) => checkRepeat(new Map([[key, (sentRecently.get(key) || []).slice()]]), key, text, now, cfg.dedupe);
+      const hit = peek(here) || (acrossChats && !answersOwner ? peek(account) : null);
+      if (!hit) {
+        checkRepeat(sentRecently, here, text, now, cfg.dedupe);
+        if (acrossChats) checkRepeat(sentRecently, account, text, now, cfg.dedupe);
+        lastSentTo.set(here, now);
+        if (lastSentTo.size > 500) lastSentTo.clear();
+        return undefined;
+      }
+      log("info", "token-guard dropped a repeated message", { to: event.to, threadId: event.threadId, accountId: ctx && ctx.accountId, firstSentSecondsAgo: Math.round((now - hit.at) / 1000) });
+      return { cancel: true, cancelReason: "token-guard: the same message was already sent; not sent again" };
     }), { priority: 95 });
 
     // ---- topics: a reply that belongs in another topic is cancelled and reposted there ----
@@ -815,13 +853,14 @@ export default definePluginEntry({
       // The orchestrator does not stop to ask the owner what it can decide (owner, 2026-11-17): the message is held
       // and the orchestrator is woken to decide and act. At most one hold per session in 10 minutes.
       const question = fromOrc ? ownerQuestion(event.content) : null;
-      if (question && allowHold(ownerAskHolds, sessionKey) && api.runtime && api.runtime.subagent && typeof api.runtime.subagent.run === "function") {
+      if (!safetyMode && question && allowHold(ownerAskHolds, sessionKey) && api.runtime && api.runtime.subagent && typeof api.runtime.subagent.run === "function") {
         const where = toOwner ? `in the owner's private chat (message tool: channel telegram, target ${ownerId})` : `in topic ${event.threadId || 1} of the team group`;
         api.runtime.subagent.run({ sessionKey: jobsCfg.idleWakeSession, deliver: false, message: decideWakeText(question, where) })
           .catch((error) => log("warn", "token-guard could not wake the orchestrator after holding an owner question", { error: String(error && error.message) }));
         log("info", "token-guard held an orchestrator question to the owner", { question: question.slice(0, 160), toOwner });
         return { cancel: true, cancelReason: "token-guard: decide it yourself; the owner is not asked what the team can decide" };
       }
+      if (safetyMode) return undefined; // the message stays where the orchestrator sent it
       const current = toOwner || isGeneral(event.threadId) ? null : Number(event.threadId);
       // The orchestrator answering a result: the answer belongs in that task's project topic, under the
       // worker's result, even when the task was dispatched from another topic's session.

@@ -1,4 +1,5 @@
 import { paceText } from "./pace.js";
+import { enforces, ruleOn } from "./safety.js";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -754,8 +755,11 @@ function policyDecide(event, ctx, pstate, rawConfig, log, now = Date.now()) {
   const params = event.params && typeof event.params === "object" ? event.params : {};
   const orchestrator = agentId === policy.orchestratorAgent;
   const subagent = sessionKey.includes(":subagent:");
-  const enforce = (rawConfig && rawConfig.mode) !== "warn";
+  const mode = (rawConfig && rawConfig.mode) || "enforce";
+  // Mode "safety" (safety.js): a rule that is off there never fires, so the checks after it still run.
+  const on = (rule) => ruleOn(mode, rule);
   const block = (rule, reason) => {
+    const enforce = enforces(mode, rule);
     if (typeof log === "function") log(enforce ? "warn" : "info", `token-guard ${enforce ? "blocked" : "would block"} ${tool} (${rule})`, { rule, agentId, sessionKey, toolName: tool });
     if (pstate && typeof pstate.onBlock === "function") pstate.onBlock(rule, { agentId, sessionKey, tool });
     // A refused dispatch says what can be dispatched instead, so the orchestrator does not spend another turn looking it
@@ -769,10 +773,11 @@ function policyDecide(event, ctx, pstate, rawConfig, log, now = Date.now()) {
   // Per-task budget: a worker over budget may only finish with its final answer.
   const job = pstate && typeof pstate.jobFor === "function" ? pstate.jobFor(sessionKey) : null;
   // Near its time limit likewise: the runtime stops it there without a report.
-  if (job && (job.overBudget || job.timeUp)) {
+  const overBudget = !!(job && job.overBudget && on("taskBudget"));
+  if (job && (overBudget || job.timeUp)) {
     const used = job.toolCalls ? `${job.toolCalls} tool calls` : `${Math.round((job.usedTokens || 0) / 1e6)}M tokens`;
-    const why = job.overBudget ? `used its budget (${used})` : "is a few minutes from its time limit, where it is stopped with no report";
-    return block(job.overBudget ? "taskBudget" : "taskTime",
+    const why = overBudget ? `used its budget (${used})` : "is a few minutes from its time limit, where it is stopped with no report";
+    return block(overBudget ? "taskBudget" : "taskTime",
       `token-guard: this task ${why}. Stop now and write your final answer: ` +
       "RESULT (done / partly done / blocked), what is finished with evidence, what is left, and the exact next step.");
   }
@@ -780,7 +785,7 @@ function policyDecide(event, ctx, pstate, rawConfig, log, now = Date.now()) {
   // One orchestrator run (a wake or an owner message) may make only so many tool calls: one woken run
   // once made 617 Opus calls in six hours, doing checks a worker should do. Telling the owner stays allowed.
   const maxRun = Number(policy.orchestratorMaxCallsPerRun) || 0;
-  if (orchestrator && maxRun > 0 && pstate && typeof pstate.runCalls === "function" && tool !== "message") {
+  if (on("runBudget") && orchestrator && maxRun > 0 && pstate && typeof pstate.runCalls === "function" && tool !== "message") {
     const n = pstate.runCalls(ctx && ctx.runId);
     if (n > maxRun) {
       return block("runBudget",
@@ -800,7 +805,7 @@ function policyDecide(event, ctx, pstate, rawConfig, log, now = Date.now()) {
       const command = stripSecretInput(typeof params.command === "string" ? params.command : "");
       const git = gitViolation(command);
       // The owner's order: every pipeline step runs locally before any push (lint, typecheck, security, tests).
-      if (subagent && GIT_PUSH.test(command) && policy.requireChecksBeforePush !== false) {
+      if (on("pushWithoutChecks") && subagent && GIT_PUSH.test(command) && policy.requireChecksBeforePush !== false) {
         const task = pstate && typeof pstate.jobFor === "function" ? pstate.jobFor(sessionKey) : null;
         if (task && !(task.checksRun > 0)) {
           return block("pushWithoutChecks", "token-guard: run the project's pipeline steps locally before you push (lint, typecheck, tests, security scan, build: the same commands as its CI), and quote each result under \"Local checks\" in your report. Then push.");
@@ -809,7 +814,7 @@ function policyDecide(event, ctx, pstate, rawConfig, log, now = Date.now()) {
       if (git) return block("gitSafety", `token-guard: blocked: ${git}. Merges to main happen only through a reviewed merge request (the Team Lead merges when the pipeline is green).`);
       // One merge at a time per project: a merge while main's pipeline from the last merge still runs cancels that pipeline
       // on the single runner, so parallel MRs kept restarting the deploy (2026-11-17).
-      if (subagent && MERGE_COMMAND.test(command) && pstate && typeof pstate.mergesInFlight === "function") {
+      if (on("mergeQueue") && subagent && MERGE_COMMAND.test(command) && pstate && typeof pstate.mergesInFlight === "function") {
         const task = typeof pstate.jobFor === "function" ? pstate.jobFor(sessionKey) : null;
         const key = (name) => canonicalProject(policy, name) || String(name || "").replace(/\(.*$/, "").trim().toLowerCase();
         const mine = key(task && task.project);
@@ -830,6 +835,7 @@ function policyDecide(event, ctx, pstate, rawConfig, log, now = Date.now()) {
   // the orchestrator (it dispatches tasks) and never outside a task.
   if (tool === "Agent" || tool === "Task") {
     if (!subagent || !job) return block("subagentsOff", "token-guard: Claude Code subagents run only inside a dispatched task, within its brief's Subagents line.");
+    if (!on("subagentLimit")) return undefined; // safety mode: inside its task, the agent decides how many subagents it needs
     const lim = parseSubagents(job.brief);
     if (!lim.max) return block("subagentsOff", "token-guard: this brief allows no subagents (Subagents: max 0). Do the work in this session, or ask the orchestrator in your report for a brief that allows them.");
     if ((job.subagentCalls || 0) >= lim.max) {
@@ -934,13 +940,13 @@ function policyDecide(event, ctx, pstate, rawConfig, log, now = Date.now()) {
       }
       // Blocked is only for what the team cannot do itself: the owner's money, accounts, ID, an owner hold, or a wait on an
       // outside party. Everything else the team unblocks (owner 2026-11-14: "20 blocked items done a day").
-      if (action === "set" && normStatus(String(params.status || "")) === "blocked" && !OWNER_BLOCK.test(String(params.note || ""))) {
+      if (on("blockedReason") && action === "set" && normStatus(String(params.status || "")) === "blocked" && !OWNER_BLOCK.test(String(params.note || ""))) {
         return block("blockedReason",
           "token-guard: Blocked is only for what the team cannot do itself. Say which one in the note: \"owner money: ...\", \"owner account: ...\", " +
           "\"owner ID: ...\", \"owner hold: ...\" (an owner order), \"owner's laptop: ...\" or \"external wait: ...\" (an outside party, with its ticket or date). " +
           "Anything else is the team's to unblock: dispatch the fix now, or split the item.");
       }
-      if (!orchestrator && agentId !== policy.board.agent) {
+      if (on("boardWrite") && !orchestrator && agentId !== policy.board.agent) {
         return block("boardWrite", "token-guard: only the orchestrator and the PM change the board. Put your status in your final answer: the board moves automatically when your task ends.");
       }
       // One request = one item for its whole life: retries and gates move the same item.
@@ -956,7 +962,7 @@ function policyDecide(event, ctx, pstate, rawConfig, log, now = Date.now()) {
         // Finish before adding: the PM may not grow a board that already holds more open work than it can do.
         // (237 items in and 90 done, 2026-11-04..09.) Owner requests, recorded by the orchestrator, always go on.
         const cap = Number(policy.board.maxOpen) || 0;
-        if (cap > 0 && agentId === policy.board.agent && pstate && typeof pstate.boardItems === "function") {
+        if (on("finishFirst") && cap > 0 && agentId === policy.board.agent && pstate && typeof pstate.boardItems === "function") {
           const open = [...pstate.boardItems().values()].filter((it) => OPEN_WORK.has(normStatus(it.status))).length;
           if (open >= cap) {
             return block("finishFirst",
@@ -964,7 +970,7 @@ function policyDecide(event, ctx, pstate, rawConfig, log, now = Date.now()) {
               "it belongs to (task_inbox set, with a note), or leave it out.");
           }
         }
-        if (GATE_TITLE.test(title)) {
+        if (on("itemPerStep") && GATE_TITLE.test(title)) {
           return block("itemPerStep", "token-guard: do not add an item for a retry, a gate or a proof step. Keep the owner's original item and move it (task_inbox set: in_progress, review, qa) and dispatch the next agent on that same item id.");
         }
         const board = pstate && typeof pstate.boardItems === "function" ? pstate.boardItems() : null;
@@ -972,7 +978,7 @@ function policyDecide(event, ctx, pstate, rawConfig, log, now = Date.now()) {
         const capN = Number(policy.board.maxTasksPerItem) || 0;
         const beingSplit = capN > 0 && typeof pstate.itemTasks === "function" ? (it) => pstate.itemTasks(it.id) >= capN : null;
         const twin = board ? similarOpenItem(board, String(params.project || ""), title, beingSplit) : null;
-        if (twin) {
+        if (twin && on("duplicateItem")) {
           return block("duplicateItem", `token-guard: this is the same request as open item ${twin.id} ("${String(twin.title).slice(0, 80)}"). Keep one item per request: update ${twin.id} (task_inbox set, with a note) instead of adding a new one.`);
         }
       }
@@ -982,7 +988,7 @@ function policyDecide(event, ctx, pstate, rawConfig, log, now = Date.now()) {
   if (boardProject) return { params: Object.assign({}, params, { project: boardProject }) }; // stored by its canonical name
 
   // 6. Topics: a group post goes to the topic of the project it is about (or the team topic), never General.
-  if (policy.topics.enabled && tool === "message" && policy.topics.chatId) {
+  if (on("topicMove") && policy.topics.enabled && tool === "message" && policy.topics.chatId) {
     const chat = String(params.target || params.to || params.chatId || "");
     if (chat.includes(String(policy.topics.chatId))) {
       const thread = params.threadId !== undefined ? params.threadId : params.messageThreadId;
@@ -1000,7 +1006,7 @@ function policyDecide(event, ctx, pstate, rawConfig, log, now = Date.now()) {
   }
 
   // 7. A task stays on its task: code roles write only inside their task's project.
-  if (policy.taskPaths.enabled && subagent && job && WRITE_TOOLS.has(tool) && (policy.taskPaths.roles || []).includes(agentId)) {
+  if (on("outOfTask") && policy.taskPaths.enabled && subagent && job && WRITE_TOOLS.has(tool) && (policy.taskPaths.roles || []).includes(agentId)) {
     const name = projectName(policy, job.project || "");
     const root = name && policy.projects[name] && policy.projects[name].path ? expandHome(policy.projects[name].path) : "";
     if (root && !root.includes("<")) {
@@ -1017,7 +1023,7 @@ function policyDecide(event, ctx, pstate, rawConfig, log, now = Date.now()) {
   // 7b. Code map first: a task in a project with a map queries it before it searches or reads code.
   // (Owner's order 2026-11-08: graphify is enforced. Reading and searching code is a third or more of what
   // workers' tools return, and it stays in the session, re-read on every later call.)
-  if (subagent && job && !(job.graphQueries > 0) && policy.graphs && policy.graphs.enabled) {
+  if (on("graphFirst") && subagent && job && !(job.graphQueries > 0) && policy.graphs && policy.graphs.enabled) {
     const map = graphFor(policy, job.project || "", agentId);
     const name = map && map.name;
     const root = name && policy.projects[name] && policy.projects[name].path ? path.resolve(expandHome(policy.projects[name].path)) : "";
@@ -1041,12 +1047,17 @@ function policyDecide(event, ctx, pstate, rawConfig, log, now = Date.now()) {
     // parameters, so what the brief says is what runs).
     const lineModel = briefSetting(params.task, "Model");
     const lineEffort = briefSetting(params.task, "Effort").toLowerCase();
-    const wantModel = lineModel || params.model;
-    const wantThinking = lineEffort || params.thinking;
+    let wantModel = lineModel || params.model;
+    let wantThinking = lineEffort || params.thinking;
+    // Safety mode: a model or effort outside the list is not refused; the task runs on the agent's own setting.
+    let dropModel = false;
+    let dropThinking = false;
     if (wantModel) {
       const m = normaliseModel(wantModel, allowed);
-      if (m === null) return block("spawnModel", `token-guard: model "${wantModel}" is not allowed. Use one of: ${allowed.join(", ")}.`);
+      if (m === null && !on("spawnModel")) { wantModel = ""; dropModel = true; }
+      else if (m === null) return block("spawnModel", `token-guard: model "${wantModel}" is not allowed. Use one of: ${allowed.join(", ")}.`);
     }
+    if (wantThinking && !on("spawnThinking") && !(policy.spawn.allowedThinking || []).includes(String(wantThinking).toLowerCase())) { wantThinking = ""; dropThinking = true; }
     if (wantThinking && !(policy.spawn.allowedThinking || []).includes(String(wantThinking).toLowerCase())) {
       return block("spawnThinking", `token-guard: thinking "${wantThinking}" is not allowed. Use one of: ${(policy.spawn.allowedThinking || []).join(", ")}.`);
     }
@@ -1067,7 +1078,8 @@ function policyDecide(event, ctx, pstate, rawConfig, log, now = Date.now()) {
     if (policy.graphs && policy.graphs.enabled) {
       const kept = String(task).split("\n").filter((l) => !/^[\s>*_-]*Code map\b/i.test(l) && !/graphify\s+\w+[^\n]*--graph\s/.test(l));
       task = kept.join("\n");
-      if (map) task = `${task.trimEnd()}\nCode map (required before you search or read code): ${mapCommand(map)}, then open only the files it names.`;
+      if (map && on("graphFirst")) task = `${task.trimEnd()}\nCode map (required before you search or read code): ${mapCommand(map)}, then open only the files it names.`;
+      else if (map) task = `${task.trimEnd()}\nCode map (query it before you search or read code): ${mapCommand(map)}, then open only the files it names.`;
     }
     if (policy.board.enabled && policy.board.requireItems && pstate && typeof pstate.boardItems === "function") {
       const board = pstate.boardItems();
@@ -1081,21 +1093,21 @@ function policyDecide(event, ctx, pstate, rawConfig, log, now = Date.now()) {
         if (!DISPATCHABLE.has(st)) return block("boardItems", `token-guard: ${id} is ${st} on the board. Reopen it with task_inbox set before dispatching.`);
         // Parked on the owner: a new task hits the same wall. It is dispatched again only after someone moves it out
         // of Blocked with a note on what changed (the owner signed in, paid, answered).
-        if (st === "blocked" && OWNER_BLOCK.test(String(board.get(id).note || ""))) {
+        if (on("ownerBlocked") && st === "blocked" && OWNER_BLOCK.test(String(board.get(id).note || ""))) {
           return block("ownerBlocked", `token-guard: ${id} waits on the owner or an outside party (${String(board.get(id).note).slice(0, 160)}). ` +
             "Another task hits the same wall. When that is done, move the item to To do with task_inbox set and a note starting \"Operator:\" that says what changed, then dispatch.");
         }
         // A task with no checkable finish line burns tokens and ends "partly done" (owner 2026-11-21: "actually done").
-        if (policy.board.requireDoneWhen && !String(board.get(id).done_when || "").trim() &&
+        if (on("doneWhenRequired") && policy.board.requireDoneWhen && !String(board.get(id).done_when || "").trim() &&
             !String(params.task).split("\n").some((l) => /^[\s>*#_-]*done when\s*:\s*\S/i.test(l))) {
           return block("doneWhenRequired", `token-guard: ${id} has no Done when. Write the exact live check that proves it is done ` +
             "(a URL that answers, a job or order id, a store panel's status text, a screenshot) with task_inbox set, or put a `Done when:` line in the brief, then dispatch.");
         }
-        if (running.has(id)) return block("boardBusy", `token-guard: ${id} is already being worked on in another task. Wait for that result; one task at a time per item.`);
+        if (on("boardBusy") && running.has(id)) return block("boardBusy", `token-guard: ${id} is already being worked on in another task. Wait for that result; one task at a time per item.`);
         // The same stuck item again and again burns the owner's tokens and starves the rest of the board.
         const maxNoProgress = policy.board.maxNoProgress === undefined ? 3 : Number(policy.board.maxNoProgress) || 0;
         const streak = maxNoProgress > 0 && typeof pstate.noProgressStreak === "function" ? pstate.noProgressStreak(id, board.get(id)) : 0;
-        if (maxNoProgress > 0 && streak >= maxNoProgress) {
+        if (on("loopBreak") && maxNoProgress > 0 && streak >= maxNoProgress) {
           return block("loopBreak", `token-guard: ${id} has had ${streak} tasks in a row that moved nothing (blocked, partly, failed). Another try burns tokens the same way. ` +
             "Dispatch another item now (task_inbox queue). For this one: remove what blocks it, or split it into small items that one task can finish (task_inbox add), " +
             "or, if only the owner can clear it, move it to Blocked with an owner reason (owner money/account/ID/hold, external wait). After splitting or removing the blocker, move it with a note starting \"Rescoped:\" to try again.");
@@ -1103,23 +1115,23 @@ function policyDecide(event, ctx, pstate, rawConfig, log, now = Date.now()) {
         // A whole feature on one item: it takes half the team's tasks and rarely reaches Done. No note lifts this one.
         const maxTasksPerItem = Number(policy.board.maxTasksPerItem) || 0;
         const had = maxTasksPerItem > 0 && typeof pstate.itemTasks === "function" ? pstate.itemTasks(id) : 0;
-        if (maxTasksPerItem > 0 && had >= maxTasksPerItem) {
+        if (on("splitItem") && maxTasksPerItem > 0 && had >= maxTasksPerItem) {
           return block("splitItem", `token-guard: ${id} has had ${had} tasks without reaching Done: it is a feature, not one item. It gets no more tasks. ` +
             "Split what is left into small items that one task can finish (one MR, one fix, one check each; task_inbox add, same project, rank them) and dispatch those. " +
             `Then close ${id}: Done if what it delivered stands on its own (say what, in the note), otherwise Dropped with "split into <ids>".`);
         }
       }
       const projects = new Set(ids.map((id) => String(board.get(id).project || "").toLowerCase()));
-      if (projects.size > 1) return block("mixedProjects", `token-guard: these items belong to different projects (${[...projects].join(", ")}). One task, one project: dispatch them separately.`);
+      if (on("mixedProjects") && projects.size > 1) return block("mixedProjects", `token-guard: these items belong to different projects (${[...projects].join(", ")}). One task, one project: dispatch them separately.`);
       const briefProject = projectName(policy, firstLine(params.task, "Project")) || String(firstLine(params.task, "Project")).toLowerCase().split(/[\s(]/)[0];
       const itemProject = [...projects][0];
-      if (briefProject && itemProject && !itemProject.includes(briefProject) && !briefProject.includes(itemProject) && projectName(policy, itemProject) !== briefProject) {
+      if (on("projectMismatch") && briefProject && itemProject && !itemProject.includes(briefProject) && !briefProject.includes(itemProject) && projectName(policy, itemProject) !== briefProject) {
         return block("projectMismatch", `token-guard: the brief says Project ${briefProject} but its items are ${itemProject}. Fix the brief or the items.`);
       }
       // Tasks one agent may run at once (board.maxTasksByAgent): one more would wait on the same agent.
       const target = String(params.agentId || "");
       const cap = Number((policy.board.maxTasksByAgent || {})[target]) || 0;
-      if (cap > 0 && typeof pstate.runningTasks === "function") {
+      if (on("agentBusy") && cap > 0 && typeof pstate.runningTasks === "function") {
         const n = pstate.runningTasks(target);
         if (n >= cap) {
           return block("agentBusy", `token-guard: ${target} already runs ${n} task${n === 1 ? "" : "s"}, its limit at once. Dispatch another agent's item now (task_inbox queue shows what can start); this one can start when one of ${target}'s tasks ends.`);
@@ -1127,7 +1139,7 @@ function policyDecide(event, ctx, pstate, rawConfig, log, now = Date.now()) {
       }
       // The queue: one item at a time, in the PM's order. The item in hand gets its next gate; a new
       // item starts only when nothing is in hand, and only the one at the head of the queue.
-      if (typeof pstate.queue === "function" && Number(policy.board.wip) > 0) {
+      if (on("queueOrder") && typeof pstate.queue === "function" && Number(policy.board.wip) > 0) {
         const q = pstate.queue();
         const inHand = new Set(q.active.map((it) => it.id));
         const fresh = ids.filter((id) => !inHand.has(id));
@@ -1152,7 +1164,7 @@ function policyDecide(event, ctx, pstate, rawConfig, log, now = Date.now()) {
       }
     }
     // The gateway's event loop was blocked a moment ago: a task started now gets no exec (MCP CONNECT_TIMEOUT).
-    if (tool === "sessions_spawn" && pstate && typeof pstate.loopHold === "function") {
+    if (on("gatewayBusy") && tool === "sessions_spawn" && pstate && typeof pstate.loopHold === "function") {
       let busy = null;
       try { busy = pstate.loopHold(); } catch { busy = null; }
       if (busy && busy.until > now) return block("gatewayBusy", busy.text);
@@ -1174,6 +1186,8 @@ function policyDecide(event, ctx, pstate, rawConfig, log, now = Date.now()) {
       return block("bothLimited", `token-guard: Claude (until ${at(claudeUntil)} UTC) and Codex (until ${at(codexUntil)} UTC) are both at their usage limits, so this task would fail at once. Do not dispatch now and leave its items in To do: the job tracker wakes you again once a limit has reset.`);
     }
     const input = Object.assign({}, params, { task });
+    if (dropModel) delete input.model;
+    if (dropThinking) delete input.thinking;
     if (wantModel) input.model = wantModel;
     if (wantThinking) input.thinking = wantThinking;
     if (input.model) input.model = normaliseModel(input.model, allowed);

@@ -49,8 +49,30 @@
         "type": "string",
         "enum": [
           "enforce",
+          "safety",
           "warn"
-        ]
+        ],
+        "description": "enforce: every rule. safety: only the rules that protect the owner (secrets, the gateway, access, git history, real limits, who does what); the process rules are off. warn: log only."
+      },
+      "knownChats": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        },
+        "description": "Telegram group ids the team's bots are in. A message tool call to any other group id goes to the team group (an invented id)."
+      },
+      "dedupe": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "enabled": { "type": "boolean" },
+          "windowMinutes": { "type": "number" },
+          "minChars": { "type": "number" },
+          "similarity": { "type": "number" },
+          "keep": { "type": "number" },
+          "acrossChats": { "type": "boolean" }
+        },
+        "description": "The same (or nearly the same) message from one bot within the window is sent once: in safety mode across all chats and topics (acrossChats false: per chat and topic)."
       },
       "maxPollsPerJob": {
         "type": "integer",
