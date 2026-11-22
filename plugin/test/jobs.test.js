@@ -112,16 +112,26 @@ test("idle check skips items covered by a running task and quiet periods without
   assert.deepEqual(scanJobs(d2, CFG, 100 * MIN, env({ inboxItems: [] })), []);
 });
 
-test("daily wake cap", () => {
+test("the daily cap holds reminders, never the delivery of a finished task's result", () => {
   const d = emptyState();
-  const cfg = mergeJobsConfig({ maxWakesPerDay: 1 });
+  const cfg = mergeJobsConfig({ maxWakesPerDay: 1, rewakeAfterMinutes: 10 });
+  // the day's cap is long used up by other wakes (CI results, agents' wakes count in wakesByDay)
+  d.wakesByDay[new Date(10 * MIN).toISOString().slice(0, 10)] = 86;
   spawned(d, 0);
   recordEnd(d, CHILD, "ok", "", 0);
   recordSpawn(d, { childSessionKey: "agent:qa:subagent:2", agentId: "qa", label: "x", requesterSessionKey: ORC }, "boot1", 0, cfg);
   recordEnd(d, "agent:qa:subagent:2", "ok", "", 0);
   const a = scanJobs(d, cfg, 10 * MIN, env());
-  assert.equal(a.filter((x) => x.kind === "wake").length, 1);
-  assert.equal(a.filter((x) => x.kind === "post" && /automatic reminders/.test(x.text)).length, 1);
+  // both results reach the orchestrator, and nobody is told that the reminders ran out
+  assert.equal(a.filter((x) => x.kind === "wake" && x.reason === "ended").length, 2);
+  assert.equal(a.filter((x) => x.kind === "post" && /automatic reminders/.test(x.text)).length, 0);
+  assert.deepEqual(Object.values(d.jobs).map((j) => j.wakes), [1, 1]);
+  // nobody acted: the second round are reminders, and the cap of 1 lets one through and says so once
+  const b = scanJobs(d, cfg, 25 * MIN, env());
+  assert.equal(b.filter((x) => x.kind === "wake").length, 1);
+  assert.equal(b.filter((x) => x.kind === "post" && /automatic reminders/.test(x.text)).length, 1);
+  // the reminder that was held is not counted as sent
+  assert.deepEqual(Object.values(d.jobs).map((j) => j.wakes).sort(), [1, 2]);
 });
 
 test("task budget and Claude limit state", () => {

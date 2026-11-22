@@ -61,6 +61,7 @@ function emptyState() {
     orcActivity: {},
     idle: { lastCheckAt: 0, streak: 0, sig: "", escalatedSig: "" },
     wakesByDay: {},
+    remindersByDay: {},
     notes: {},
     ownerMsgs: {}, // { "<topic>": { id, at } }: the owner's latest message per topic, for reply threading
     askedApproval: {}, // { "<item id>": ts }: the owner was asked to approve it
@@ -136,6 +137,8 @@ function mergeStates(a, b) {
   for (const [k, v] of Object.entries(b.orcActivity || {})) out.orcActivity[k] = Math.max(v, out.orcActivity[k] || 0);
   out.wakesByDay = Object.assign({}, b.wakesByDay);
   for (const [k, v] of Object.entries(a.wakesByDay || {})) out.wakesByDay[k] = Math.max(v, out.wakesByDay[k] || 0);
+  out.remindersByDay = Object.assign({}, b.remindersByDay);
+  for (const [k, v] of Object.entries(a.remindersByDay || {})) out.remindersByDay[k] = Math.max(v, out.remindersByDay[k] || 0);
   const ia = a.idle || {}, ib = b.idle || {};
   out.idle = (ia.lastCheckAt || 0) >= (ib.lastCheckAt || 0) ? ia : ib;
   out.boardMessages = Object.assign({}, b.boardMessages, a.boardMessages);
@@ -424,10 +427,24 @@ function dayKey(now) {
   return new Date(now).toISOString().slice(0, 10);
 }
 
+// The daily cap is for reminders (a stalled task, a result nobody acted on, idle work), counted on their own.
+// 2026-11-22: every wake counted against it (CI results, agents' wakes), so the cap was used up by midday and the
+// results of tasks dispatched from the owner's chat were silently dropped for the rest of the day.
 function canWake(data, cfg, now) {
   const day = dayKey(now);
-  return (data.wakesByDay[day] || 0) < cfg.maxWakesPerDay;
+  return ((data.remindersByDay || {})[day] || 0) < cfg.maxWakesPerDay;
 }
+
+function countReminder(data, now) {
+  const day = dayKey(now);
+  data.remindersByDay = data.remindersByDay || {};
+  data.remindersByDay[day] = (data.remindersByDay[day] || 0) + 1;
+  for (const d of Object.keys(data.remindersByDay)) if (d < dayKey(now - 7 * 86400000)) delete data.remindersByDay[d];
+}
+
+// Delivering a finished task's result, a task cut off by a restart, or a worker's request for another role is the
+// work itself, not a reminder: it is never held back by the daily cap.
+const DELIVERY_WAKES = new Set(["result", "interrupted", "raise"]);
 
 function countWake(data, now) {
   const day = dayKey(now);
@@ -463,7 +480,8 @@ function scanJobs(data, rawCfg, now, env) {
     if ((data.claudeLimitedUntil || 0) > now && (!env.codexEnabled || (data.codexLimitedUntil || 0) > now)) return false;
     // Ahead of the weekly pace: the guard's own wakes wait too (each costs a full orchestrator turn).
     if (data.paceHold && data.paceHold.until > now) return false;
-    if (!canWake(data, cfg, now)) {
+    const delivery = DELIVERY_WAKES.has(reason);
+    if (!delivery && !canWake(data, cfg, now)) {
       const day = dayKey(now);
       if (data.notes.wakeCap !== day) {
         data.notes.wakeCap = day;
@@ -471,8 +489,9 @@ function scanJobs(data, rawCfg, now, env) {
       }
       return false;
     }
-    countWake(data, now);
-    actions.push({ kind: "wake", sessionKey, message, reason });
+    if (!delivery) countReminder(data, now);
+    countWake(data, now); // every wake, for the day's count
+    actions.push({ kind: "wake", sessionKey, message, reason: reason === "result" ? "ended" : reason });
     return true;
   };
 
@@ -534,13 +553,14 @@ function scanJobs(data, rawCfg, now, env) {
       if (!seen && now - job.endedAt >= (job.quietCompletion && !job.wakes ? 0 : cfg.wakeAfterEndMinutes * 60000)) {
         const due = !job.lastWakeAt || now - job.lastWakeAt >= cfg.rewakeAfterMinutes * 60000;
         if (job.wakes < cfg.maxWakesPerJob && due) {
-          job.wakes += 1;
-          job.lastWakeAt = now;
-          wake(job.requesterSessionKey,
+          // The first wake delivers the result (never capped); later ones are reminders. A wake that could not be
+          // sent (a usage limit, the reminder cap) is not counted, so the result is delivered when it can be.
+          const sent = wake(job.requesterSessionKey,
             `[job-tracker] Task finished: ${describe(job)}, verdict ${job.verdict || taskVerdict(job)} (run ${job.outcome})${job.error ? ` (${job.error})` : ""} [job ${job.short}].\n` +
             `Done when: ${job.doneWhen || "(see brief)"}\nResult:\n${job.resultText || "(no final text was captured; read it with sessions_history on " + job.key + ")"}\n` +
             `${job.missingEvidence && job.missingEvidence.length ? `\nWARNING: these files cited as proof do not exist: ${job.missingEvidence.join(", ")}. Treat those claims as unproven.\n` : ""}\n${ACT_NOW}`,
-            "ended");
+            job.wakes ? "ended" : "result");
+          if (sent) { job.wakes += 1; job.lastWakeAt = now; }
         } else if (job.wakes >= cfg.maxWakesPerJob && !job.escalated && due) {
           job.escalated = true;
           actions.push({ kind: "post", agentId: pm, topic: job.topic || "system", html: true, replyTo: job.resultMsgId || null, text: unactedText(voice, job, minutes(now - job.endedAt), job.wakes) });
