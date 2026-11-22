@@ -20,6 +20,7 @@ import { inboxArgs, loadInboxItems, runInbox } from "./inbox.js";
 import { processBoot } from "./boot.js";
 import { selectSkills, skillsLine } from "./skills.js";
 import { mergeTriageConfig, triageSnapshot, triageSignature, TRIAGE_PROMPT, parseTriage, triageWakeMessage } from "./triage.js";
+import { checkRepeat } from "./dedupe.js";
 import { parseCiLink, ciRequest, ciState, failedParts, DEFAULT_CI, curlJson } from "./ci.js";
 import { allowAgentWake, wakeMessage, DEFAULT_WAKE, WAKE_REASONS } from "./wake.js";
 import fs from "node:fs";
@@ -436,6 +437,18 @@ export default definePluginEntry({
       return key ? store.data.jobs[key] : undefined;
     };
 
+    // The owner's chats (the DM and the group topics) are for talking to the owner only. A task dispatched
+    // from one used to report back into it: OpenClaw's completion notice, the guard's finished/stall/CI wakes
+    // and "delivery blocked" notices all ran as turns in the owner's chat session. On 2026-11-22 that session
+    // was busy with them when the owner wrote, the owner's messages failed ("session changed before durable
+    // user-turn admission"), were replayed and answered twice, and the wake turns' own text ("I haven't sent
+    // the owner anything this turn") reached the owner. Every task now reports to the ops session instead.
+    const ownerChatSession = (key) => {
+      const k = String(key || "");
+      return k.startsWith(`agent:${orchestrator}:`) && !/:(explicit|subagent|cron|hook|acp):/.test(k);
+    };
+    const wakeHome = (key) => (ownerChatSession(key) && jobsCfg.idleWakeSession && !ownerChatSession(jobsCfg.idleWakeSession) ? jobsCfg.idleWakeSession : key);
+
     // Dispatch details from the spawn call, matched to the child when it starts.
     const pending = [];
     const rememberSpawn = (params, ctx) => {
@@ -447,7 +460,8 @@ export default definePluginEntry({
         model: params.model ? String(params.model) : "",
         thinking: params.thinking ? String(params.thinking) : "",
         runTimeoutSeconds: Number(params.runTimeoutSeconds) || 0,
-        requesterSessionKey: (ctx && ctx.sessionKey) || "",
+        requesterSessionKey: wakeHome((ctx && ctx.sessionKey) || ""),
+        quietCompletion: ownerChatSession(ctx && ctx.sessionKey),
       });
       while (pending.length > 50 || (pending.length && Date.now() - pending[0].at > 30 * 60000)) pending.shift();
     };
@@ -469,7 +483,8 @@ export default definePluginEntry({
         label: label || p.label,
         project,
         topic: topicFor(cfg.mirror, project, requesterThread),
-        requesterSessionKey: requesterSessionKey || p.requesterSessionKey,
+        requesterSessionKey: wakeHome(requesterSessionKey || p.requesterSessionKey),
+        quietCompletion: Boolean(p.quietCompletion) || ownerChatSession(requesterSessionKey),
         model: p.model,
         thinking: p.thinking,
         runTimeoutSeconds: p.runTimeoutSeconds,
@@ -556,6 +571,8 @@ export default definePluginEntry({
             const p0 = params || event.params || {};
             const handed = withHandoffs(p0.task, Object.values(fresh().jobs));
             if (handed) params = Object.assign({}, p0, { task: handed });
+            // From an owner chat: no completion notice back into that chat; the guard wakes the ops session.
+            if (ownerChatSession(ctx.sessionKey)) params = Object.assign({}, params || event.params || {}, { expectsCompletionMessage: false });
             rememberSpawn(params || event.params || {}, ctx);
           }
           const bare = String(event.toolName || "").split("__").pop();
@@ -744,6 +761,21 @@ export default definePluginEntry({
       const out = redactDeep(message, cfg);
       return out !== message ? { message: out } : undefined;
     }), { priority: 100 });
+
+    // ---- the same message twice to the same chat and topic: the repeat is dropped ----
+    const sentRecently = new Map();
+    api.on("message_sending", safe("message_sending:dedupe", (event, ctx) => {
+      if (cfg.dedupe && cfg.dedupe.enabled === false) return undefined;
+      const text = event && event.content;
+      if (typeof text !== "string") return undefined;
+      // OpenClaw's failure and limit notices have their own handling below (each repeat is answered on purpose).
+      if (isRunFailureReply(text) || isLimitReply(text)) return undefined;
+      const dest = `${(ctx && ctx.accountId) || ""}:${(event && event.to) || ""}:${(event && event.threadId) || ""}`;
+      const hit = checkRepeat(sentRecently, dest, text, Date.now(), cfg.dedupe);
+      if (!hit) return undefined;
+      log("info", "token-guard dropped a repeated message", { to: event.to, threadId: event.threadId, accountId: ctx && ctx.accountId, firstSentSecondsAgo: Math.round((Date.now() - hit.at) / 1000) });
+      return { cancel: true, cancelReason: "token-guard: the same message was already sent to this chat; not sent again" };
+    }), { priority: 95 });
 
     // ---- topics: a reply that belongs in another topic is cancelled and reposted there ----
     const pointed = new Set();

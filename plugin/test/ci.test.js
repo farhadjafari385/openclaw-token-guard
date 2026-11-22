@@ -51,3 +51,17 @@ test("an MR with no pipeline holds the queue only a few minutes by default", () 
   assert.ok(DEFAULT_CI.noPipelineMinutes <= 3, `noPipelineMinutes is ${DEFAULT_CI.noPipelineMinutes}`);
   assert.ok(DEFAULT_CI.noPipelineMinutes >= 2, "GitLab needs a moment to link a new pipeline");
 });
+
+test("parseCiLink: a master pipeline quoted as context does not win over the task's own MR", async () => {
+  const { parseCiLink } = await import("../ci.js");
+  const t = "Context: master pipeline https://gitlab.com/g/infra/-/pipelines/3098426770 is green.\nOpened https://gitlab.com/g/infra/-/merge_requests/292 for the fix.";
+  const l = parseCiLink(t);
+  assert.equal(l.kind, "gitlab-mr");
+  assert.equal(l.id, "292");
+});
+
+test("parseCiLink: the RESULT line's link wins", async () => {
+  const { parseCiLink } = await import("../ci.js");
+  const t = "See https://gitlab.com/g/a/-/merge_requests/7\nRESULT: waiting https://gitlab.com/g/a/-/pipelines/55";
+  assert.equal(parseCiLink(t).id, "55");
+});

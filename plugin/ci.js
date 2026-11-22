@@ -5,7 +5,19 @@ import { execFile } from "node:child_process";
 // poll: 30-38% of the engineers' calls were waiting before this. Pure: no OpenClaw imports, no network.
 
 // The CI link in a report: a GitLab pipeline or merge request, a GitHub Actions run or pull request.
+// The task's own link wins: the RESULT line's, then a merge request or pull request (the task's own change),
+// then the first pipeline. On 2026-11-22 three tasks quoted the same master pipeline as context, the watch
+// followed it for all three and moved an unmerged MR's item to QA.
 function parseCiLink(text) {
+  const all = String(text || "");
+  const resultLine = all.split("\n").filter((l) => /\bRESULT\b/i.test(l) && /https:\/\//.test(l)).pop();
+  if (resultLine) { const own = parseOneCiLink(resultLine); if (own) return own; }
+  const mr = /https:\/\/(gitlab\.com\/[\w.\-/]+?\/-\/merge_requests|github\.com\/[\w.-]+\/[\w.-]+\/pull)\/\d+/.exec(all);
+  if (mr) return parseOneCiLink(mr[0]);
+  return parseOneCiLink(all);
+}
+
+function parseOneCiLink(text) {
   const t = String(text || "");
   let m = /https:\/\/gitlab\.com\/([\w.\-/]+?)\/-\/pipelines\/(\d+)/.exec(t);
   if (m) return { kind: "gitlab-pipeline", project: m[1], id: m[2], url: m[0] };

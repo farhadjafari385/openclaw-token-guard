@@ -217,6 +217,7 @@ function recordSpawn(data, info, bootId, now, cfg) {
     project: info.project || prev.project || "",
     topic: info.topic || prev.topic || null,
     requesterSessionKey: info.requesterSessionKey || prev.requesterSessionKey || "",
+    quietCompletion: Boolean(info.quietCompletion || prev.quietCompletion),
     model: info.model || prev.model || "",
     thinking: info.thinking || prev.thinking || "",
     doneWhen: info.doneWhen || prev.doneWhen || "",
@@ -529,7 +530,8 @@ function scanJobs(data, rawCfg, now, env) {
       }
       const seenAt = data.orcActivity[job.requesterSessionKey] || 0;
       const seen = seenAt > (job.endedAt || 0) + 2000;
-      if (!seen && now - job.endedAt >= cfg.wakeAfterEndMinutes * 60000) {
+      // A task dispatched from an owner chat sends no completion notice of its own: wake at once.
+      if (!seen && now - job.endedAt >= (job.quietCompletion && !job.wakes ? 0 : cfg.wakeAfterEndMinutes * 60000)) {
         const due = !job.lastWakeAt || now - job.lastWakeAt >= cfg.rewakeAfterMinutes * 60000;
         if (job.wakes < cfg.maxWakesPerJob && due) {
           job.wakes += 1;

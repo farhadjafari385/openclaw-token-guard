@@ -669,6 +669,70 @@ test("a task whose run ended is closed at once, even without an end event, and i
   }
 });
 
+// 2026-11-22: tasks dispatched from the owner's DM reported into it; wakes and "delivery blocked" turns collided with the
+// owner's messages, which failed, were replayed and answered twice.
+test("a task dispatched from the owner's chat reports to the ops session, never back into the owner's chat", async () => {
+  const root = harness();
+  process.env.OC_INBOX_FILE = path.join(root, "inbox.jsonl");
+  process.env.OC_INBOX_BIN = path.join(REPO, "bin", "oc-inbox");
+  const telegram = [];
+  globalThis.fetch = async (url, opts = {}) => {
+    if (String(url).startsWith("https://api.telegram.org/")) {
+      telegram.push(JSON.parse(opts.body || "{}"));
+      return { ok: true, json: async () => ({ ok: true, result: { message_id: 6000 + telegram.length } }) };
+    }
+    return { ok: false, status: 404, json: async () => ({}) };
+  };
+  const handlers = {};
+  const logs = [];
+  const services = [];
+  const runs = [];
+  const api = {
+    pluginConfig: {
+      orchestratorAgent: "coordinator",
+      board: { enabled: false },
+      topics: { enabled: false },
+      mirror: { enabled: true, chatId: "-100", systemTopic: 160, defaultTopic: 160, minIntervalMs: 0,
+        botTokenFiles: { coordinator: path.join(root, "bot.token"), writer: path.join(root, "bot.token") } },
+      jobs: { stateFile: path.join(root, "state", "jobs.json"), idleWakeSession: "agent:coordinator:explicit:team-ops", refusal: { enabled: false } },
+      triage: { enabled: false },
+    },
+    logger: { info: (m) => logs.push(m), warn: (m) => logs.push(m), error: (m) => logs.push(m), debug: () => {} },
+    on: (name, fn) => { (handlers[name] = handlers[name] || []).push(fn); },
+    registerService: (s) => services.push(s),
+    registerTool: () => {},
+    runtime: { subagent: { run: async (r) => { runs.push(r); return { runId: "r" }; }, getSessionMessages: async () => ({ messages: [] }) } },
+  };
+  const entry = (await import(pathToFileURL(path.join(root, "plugin", "index.js")).href)).default;
+  entry.register(api);
+  let tick;
+  const realSetInterval = globalThis.setInterval;
+  globalThis.setInterval = (fn) => { tick = fn; return { unref() {} }; };
+  for (const s of services) if (s.start) s.start();
+  globalThis.setInterval = realSetInterval;
+  const realNow = Date.now;
+  let skew = 11 * 60000;
+  Date.now = () => realNow() + skew;
+  const call = (name, event, ctx) => { for (const h of handlers[name] || []) h(event, ctx); };
+  const child = "agent:writer:subagent:f1";
+  const job = () => JSON.parse(fs.readFileSync(path.join(root, "state", "jobs.json"), "utf8")).jobs[child];
+  try {
+    const res = handlers.before_tool_call.map((h) => h({ toolName: "sessions_spawn", params: { agentId: "writer", task: brief("ee55ff66"), label: "shop: follow-up" } },
+      { agentId: "coordinator", sessionKey: "agent:coordinator:main", runId: "run-f" })).find(Boolean);
+    assert.equal(res && res.params && res.params.expectsCompletionMessage, false, "no completion notice into the owner's chat");
+    call("subagent_spawned", { childSessionKey: child, agentId: "writer", label: "shop: follow-up" }, { requesterSessionKey: "agent:coordinator:main" });
+    assert.ok(await until(() => job() && job().status === "running"));
+    assert.equal(job().requesterSessionKey, "agent:coordinator:explicit:team-ops");
+    call("agent_end", { messages: [{ role: "assistant", content: [{ type: "text", text: "Done.\n\nRESULT: done\n- the price renders" }] }] }, { sessionKey: child, agentId: "writer" });
+    call("subagent_progress", { childSessionKey: child, phase: "ended", outcome: "ok" }, {});
+    if (tick) await tick();
+    assert.ok(await until(() => runs.some((r) => r.sessionKey === "agent:coordinator:explicit:team-ops" && /Task finished/.test(r.message || ""))), "ops was not woken at once");
+    assert.ok(!runs.some((r) => r.sessionKey === "agent:coordinator:main"), "the owner's chat got a wake");
+  } finally {
+    Date.now = realNow;
+  }
+});
+
 // 2026-11-14: the owner got ~860 team messages a day, three per task (dispatch, "On it", result), and could not
 // see what was delivered. With resultsOnly, Telegram gets the outcome alone, naming its task.
 test("results only: no dispatch or acknowledgement post, no CI-wait step, and the result names its task", async () => {
