@@ -110,6 +110,20 @@ test("refuses cat of a secret file and any read of the folder to output", () => 
   assert.equal(decide("read", { path: "~/.openclaw/secrets/telegram-qa.token" }).rule, "secretRead");
 });
 
+test("allows curl -K - with joined short flags (-sK -, -sSK -): the same safe consumer, written shorter", () => {
+  for (const command of [
+    "printf 'header = \"PRIVATE-TOKEN: %s\"\\n' \"$(cat ~/.openclaw/secrets/gitlab-main.token)\" | curl -sK - \"https://gitlab.com/api/v4/projects/1/merge_requests/2\"",
+    "printf 'header = \"PRIVATE-TOKEN: %s\"\\n' \"$(cat ~/.openclaw/secrets/gitlab-pipeline-watch.token)\" | curl -sSK - -X POST https://gitlab.com/api/v4/projects/1/pipeline",
+    "printf 'header = \"PRIVATE-TOKEN: %s\"\\n' \"$(cat ~/.openclaw/secrets/gitlab-main.token)\" | curl -fsSLK - https://gitlab.com/api/v4/user",
+  ]) assert.equal(secretReadViolation(command, {}), "", command);
+  // Still refused: the value in the command line of curl, in a variable, or printed on the way.
+  for (const command of [
+    "curl -s -H \"PRIVATE-TOKEN: $(cat ~/.openclaw/secrets/gitlab-main.token)\" https://gitlab.com/api/v4/user",
+    "T=$(cat ~/.openclaw/secrets/gitlab-main.token); curl -sK - https://gitlab.com/api/v4/user",
+    "cat ~/.openclaw/secrets/gitlab-main.token | tee /dev/stderr | curl -sK - https://gitlab.com/api/v4/user",
+  ]) assert.notEqual(secretReadViolation(command, {}), "", command);
+});
+
 test("allows the approved consumers: curl -K -, GIT_ASKPASS, oc-secret-save, ssh -i, names only", () => {
   for (const command of [
     "curl -sS -K - https://gitlab.com/api/v4/user <<< \"header = \\\"PRIVATE-TOKEN: $(cat ~/.openclaw/secrets/gitlab-main.token)\\\"\"",

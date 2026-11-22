@@ -227,7 +227,9 @@ function stripSaveInput(command) {
 // Consumers that take a secret without printing it.
 const CONSUMERS = [
   /\boc-secret-save\b/,                                        // stores a value
-  /\bcurl\b[^\n]*?(?:\s-K\s*-|\s--config[=\s]+-)(?=\s|$)/,     // curl reads its config (headers, URL) from stdin
+  // curl reads its config (headers, URL) from stdin. Short flags may be joined (`-sK -`, `-sSK -`): on 2026-11-22
+  // the guard still refused that form of the very command its own message recommends.
+  /\bcurl\b[^\n]*?(?:\s-[A-Za-z]*K\s*-|\s--config[=\s]+-)(?=\s|$)/,
   /\bcurl\b[^\n]*?\s(?:-H|--header)\s+@/,                      // curl headers from a file
   /--password-stdin\b/,                                        // docker/helm login
   /\bGIT_ASKPASS=/,                                            // git asks a helper for the token
