@@ -28,6 +28,7 @@ import { ownerQuestion, allowHold, decideWakeText } from "./ownerask.js";
 import { mergePaceConfig, paceHold, paceText } from "./pace.js";
 import { startLoopWatch, loopHold, loopText } from "./loopwatch.js";
 import { execFile } from "node:child_process";
+import { dueForFreshStart, requestFreshStart, wakeOnlySession } from "./fresh.js";
 import { mergeRefusalConfig, isLoginRefusal, recordRefusal, dueRefusals, closeRefusals, refusalsWithinHour, retryWakeText } from "./refusal.js";
 
 // No top-level await: OpenClaw loads plugin entries through require(), which
@@ -94,6 +95,31 @@ export default definePluginEntry({
 
     const store = createJobStore(jobsCfg.stateFile);
     store.load();
+
+    // The session that receives the wakes starts fresh when it is quiet (fresh.js): its history is otherwise
+    // written to the prompt cache again at almost every wake and re-read on every call.
+    const freshState = { at: 0, triedAt: 0 };
+    const freshenWakeSession = async (sessionKey) => {
+      const now = Date.now();
+      if (!sessionKey || sessionKey !== jobsCfg.idleWakeSession || !wakeOnlySession(sessionKey)) return false;
+      const lastActivity = Number((store.data.orcActivity || {})[sessionKey]) || 0;
+      if (!dueForFreshStart(freshState, now, lastActivity, jobsCfg.fresh)) return false;
+      freshState.triedAt = now;
+      const res = await requestFreshStart(execFile, jobsCfg.fresh, sessionKey);
+      if (res.ok) {
+        freshState.at = Date.now();
+        log("info", "token-guard started the orchestrator's team session fresh", { sessionKey });
+        return true;
+      }
+      // "still active", a starting gateway, a slow host: the wake goes to the session as it is; asked again later.
+      log("info", "token-guard left the orchestrator's team session as it is", { error: res.error });
+      return false;
+    };
+    // One way to wake the orchestrator: a fresh session first when one is due, then the run (never auto-replied).
+    const wakeOrchestrator = async (sessionKey, message) => {
+      await freshenWakeSession(sessionKey);
+      return api.runtime.subagent.run({ sessionKey, message, deliver: false });
+    };
     const paceCfg = mergePaceConfig(cfg.pace);
     // The weekly-pace hold in force now, or null.
     const paced = () => {
@@ -1120,13 +1146,15 @@ export default definePluginEntry({
           try {
             if (!api.runtime || !api.runtime.subagent || typeof api.runtime.subagent.run !== "function") throw new Error("runtime.subagent.run unavailable");
             // deliver: false, so a wake never auto-replies in a DM; the orchestrator posts in the project topic itself.
-            await api.runtime.subagent.run({ sessionKey: action.sessionKey, message: action.message, deliver: false });
+            await wakeOrchestrator(action.sessionKey, action.message);
             log("info", "token-guard woke the orchestrator", { reason: action.reason, sessionKey: action.sessionKey });
           } catch (error) {
             const msg = String(error && error.message);
             log("warn", "token-guard could not wake the orchestrator", { reason: action.reason, error: msg });
-            if (/not completed startup|still starting|unavailable/i.test(msg)) {
-              rollbackWake(action); // agents still loading: try again on a later tick, quietly
+            // Agents still loading, or two wakes reached the session at the same moment ("Subagent registration owner
+            // changed during preparation", 11 times in 30 h on 2026-11-23): try again on a later tick, quietly.
+            if (/not completed startup|still starting|unavailable|registry persistence|owner changed/i.test(msg)) {
+              rollbackWake(action);
             } else {
               systemNote(`wakefail:${action.reason}`, `🚩 Job tracker could not wake the orchestrator (${action.reason}): ${msg.slice(0, 160)}`);
             }
@@ -1236,8 +1264,8 @@ export default definePluginEntry({
         const day = new Date(now).toISOString().slice(0, 10);
         store.data.wakesByDay[day] = (store.data.wakesByDay[day] || 0) + 1;
         if (!paced() && api.runtime && api.runtime.subagent && typeof api.runtime.subagent.run === "function") {
-          await api.runtime.subagent.run({ sessionKey: jobsCfg.idleWakeSession, deliver: false,
-            message: `[ci] The pipeline of "${job.label}" ended: ${outcome} (${w.url}). Board: ${moved}. ${todo} One item at a time: this item stays in hand until it is Done or Blocked.` })
+          await wakeOrchestrator(jobsCfg.idleWakeSession,
+            `[ci] The pipeline of "${job.label}" ended: ${outcome} (${w.url}). Board: ${moved}. ${todo} One item at a time: this item stays in hand until it is Done or Blocked.`)
             .catch((error) => log("warn", "token-guard could not wake the orchestrator after CI", { error: String(error && error.message) }));
         }
       }
@@ -1417,7 +1445,7 @@ export default definePluginEntry({
       store.touch();
       store.save();
       log("info", "token-guard triage woke the orchestrator", { effort: decision.effort });
-      await sub.run({ sessionKey: jobsCfg.idleWakeSession, message: triageWakeMessage(decision, snapshot), deliver: false });
+      await wakeOrchestrator(jobsCfg.idleWakeSession, triageWakeMessage(decision, snapshot));
     };
 
     // A wake that could not be delivered is not counted, so it is tried again.
