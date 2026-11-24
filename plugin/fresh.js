@@ -5,6 +5,8 @@
 // new wake, plus 80k tokens re-read on every call. The board is the orchestrator's memory, so the session that
 // receives the wakes is reset (OpenClaw's sessions.reset, what /new does) when it is quiet. OpenClaw refuses the
 // reset while the session is active or changing, so a running turn is never cut and its tasks keep their requester.
+// The reset runs by itself on the job tracker's tick, never in front of a wake: the command needs 15 s and more on
+// a loaded host, and a wake sent while the reset is under way is refused ("another lifecycle mutation in progress").
 //
 // Off unless the config switches it on (jobs.fresh.enabled): it runs the `openclaw` command, and a test suite on
 // the gateway's own host must never reach the live gateway (2026-11-23: it did, three resets of the team session).
@@ -15,7 +17,7 @@ const DEFAULTS = {
   everyMinutes: 30,   // a fresh start at most this often
   quietMinutes: 3,    // only when the orchestrator has made no tool call in this session for this long
   retryMinutes: 5,    // after a refused or failed reset, wait this long before asking again
-  timeoutSeconds: 90, // the wake goes ahead after this long, reset or not
+  timeoutSeconds: 120, // how long the command waits for the gateway (the reset took 15-120 s on a loaded host; the command's own default is 10 s)
 };
 
 function mergeFreshConfig(cfg) {
@@ -47,8 +49,8 @@ function requestFreshStart(exec, rawCfg, sessionKey) {
   const cfg = mergeFreshConfig(rawCfg);
   return new Promise((resolve) => {
     try {
-      exec(cfg.command, ["gateway", "call", "sessions.reset", "--params", JSON.stringify({ key: sessionKey }), "--json"],
-        { timeout: cfg.timeoutSeconds * 1000, maxBuffer: 8 << 20, env: process.env },
+      exec(cfg.command, ["gateway", "call", "sessions.reset", "--params", JSON.stringify({ key: sessionKey }), "--timeout", String(cfg.timeoutSeconds * 1000), "--json"],
+        { timeout: (cfg.timeoutSeconds + 60) * 1000, maxBuffer: 8 << 20, env: process.env },
         (error) => resolve(error ? { ok: false, error: String(error.message || error).slice(0, 160) } : { ok: true }));
     } catch (error) {
       resolve({ ok: false, error: String(error && error.message).slice(0, 160) });

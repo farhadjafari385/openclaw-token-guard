@@ -39,12 +39,17 @@ test("the request is OpenClaw's sessions.reset for that one key; a refusal or a 
   const calls = [];
   const ok = await requestFreshStart((cmd, args, opts, cb) => { calls.push({ cmd, args, timeout: opts.timeout }); cb(null); }, { enabled: true, command: "/x/openclaw", timeoutSeconds: 30 }, "agent:coordinator:explicit:team-ops");
   assert.deepEqual(ok, { ok: true });
-  assert.deepEqual(calls, [{ cmd: "/x/openclaw", args: ["gateway", "call", "sessions.reset", "--params", "{\"key\":\"agent:coordinator:explicit:team-ops\"}", "--json"], timeout: 30000 }]);
+  assert.deepEqual(calls, [{ cmd: "/x/openclaw", args: ["gateway", "call", "sessions.reset", "--params", "{\"key\":\"agent:coordinator:explicit:team-ops\"}", "--timeout", "30000", "--json"], timeout: 90000 }]);
   const refused = await requestFreshStart((cmd, args, opts, cb) => cb(new Error("Session agent:coordinator:explicit:team-ops is still active; try again in a moment.")), ON, "k");
   assert.equal(refused.ok, false);
   assert.match(refused.error, /still active/);
   const thrown = await requestFreshStart(() => { throw new Error("spawn openclaw ENOENT"); }, ON, "k");
   assert.deepEqual(thrown, { ok: false, error: "spawn openclaw ENOENT" });
+});
+
+test("the command is given two minutes for the gateway's answer: its own default of 10 s is shorter than a reset on a loaded host", () => {
+  const c = mergeFreshConfig({ enabled: true });
+  assert.equal(c.timeoutSeconds, 120);
 });
 
 test("bad settings fall back to the defaults", () => {
@@ -54,9 +59,12 @@ test("bad settings fall back to the defaults", () => {
 
 test("the plugin routes the job-tracker, triage and CI wakes through one helper and retries a wake race quietly", () => {
   const src = fs.readFileSync(fileURLToPath(new URL("../index.js", import.meta.url)), "utf8");
-  assert.match(src, /sessionKey !== jobsCfg\.idleWakeSession \|\| !wakeOnlySession\(sessionKey\)/);
+  assert.match(src, /freshState\.busy \|\| !sessionKey \|\| !wakeOnlySession\(sessionKey\)/);
   assert.ok((src.match(/await wakeOrchestrator\(/g) || []).length >= 3);
-  assert.match(src, /registry persistence\|owner changed/);
+  assert.match(src, /registry persistence\|owner changed\|lifecycle mutation\|still active/);
+  // a wake never waits for the reset: it runs on the tick, in the background
+  assert.doesNotMatch(src, /await (freshenTick|freshenWakeSession|requestFreshStart)\(/);
+  assert.match(src, /store\.refresh\(\);\n      \/\/ only the active copy[^\n]*\n      try \{ freshenTick\(\); \}/);
   // no other place runs the reset
   assert.equal((src.match(/requestFreshStart\(/g) || []).length, 1);
   assert.doesNotMatch(src, /"sessions\.reset"/);

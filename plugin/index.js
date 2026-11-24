@@ -97,27 +97,33 @@ export default definePluginEntry({
     store.load();
 
     // The session that receives the wakes starts fresh when it is quiet (fresh.js): its history is otherwise
-    // written to the prompt cache again at almost every wake and re-read on every call.
-    const freshState = { at: 0, triedAt: 0 };
-    const freshenWakeSession = async (sessionKey) => {
+    // written to the prompt cache again at almost every wake and re-read on every call. It runs by itself on the
+    // tick, in the background: a wake never waits for it.
+    const freshState = { at: 0, triedAt: 0, wakeAt: 0, busy: false };
+    const freshenTick = () => {
+      const sessionKey = jobsCfg.idleWakeSession;
+      if (freshState.busy || !sessionKey || !wakeOnlySession(sessionKey)) return false;
       const now = Date.now();
-      if (!sessionKey || sessionKey !== jobsCfg.idleWakeSession || !wakeOnlySession(sessionKey)) return false;
-      const lastActivity = Number((store.data.orcActivity || {})[sessionKey]) || 0;
+      // quiet = no tool call by the orchestrator in that session and no wake sent to it for a while
+      const lastActivity = Math.max(Number((store.data.orcActivity || {})[sessionKey]) || 0, freshState.wakeAt);
       if (!dueForFreshStart(freshState, now, lastActivity, jobsCfg.fresh)) return false;
       freshState.triedAt = now;
-      const res = await requestFreshStart(execFile, jobsCfg.fresh, sessionKey);
-      if (res.ok) {
-        freshState.at = Date.now();
-        log("info", "token-guard started the orchestrator's team session fresh", { sessionKey });
-        return true;
-      }
-      // "still active", a starting gateway, a slow host: the wake goes to the session as it is; asked again later.
-      log("info", "token-guard left the orchestrator's team session as it is", { error: res.error });
-      return false;
+      freshState.busy = true;
+      requestFreshStart(execFile, jobsCfg.fresh, sessionKey).then((res) => {
+        freshState.busy = false;
+        if (res.ok) {
+          freshState.at = Date.now();
+          log("info", "token-guard started the orchestrator's team session fresh", { sessionKey });
+        } else {
+          // "still active", a starting gateway, a slow host: the session stays as it is; asked again later.
+          log("info", "token-guard left the orchestrator's team session as it is", { error: res.error });
+        }
+      });
+      return true;
     };
-    // One way to wake the orchestrator: a fresh session first when one is due, then the run (never auto-replied).
+    // One way to wake the orchestrator (never auto-replied).
     const wakeOrchestrator = async (sessionKey, message) => {
-      await freshenWakeSession(sessionKey);
+      if (sessionKey === jobsCfg.idleWakeSession) freshState.wakeAt = Date.now();
       return api.runtime.subagent.run({ sessionKey, message, deliver: false });
     };
     const paceCfg = mergePaceConfig(cfg.pace);
@@ -1091,6 +1097,8 @@ export default definePluginEntry({
       if (!jobsCfg.enabled || !isActive()) return;
       if (Date.now() - BOOT_STARTED_AT < BOOT_GRACE_MS) return;
       store.refresh();
+      // only the active copy of the plugin, and not while the gateway is still starting
+      try { freshenTick(); } catch (error) { log("warn", "token-guard fresh start check failed", { error: String(error && error.message) }); }
       try { await paceTick(); } catch (error) { log("warn", "token-guard pace check failed", { error: String(error && error.message).slice(0, 160) }); }
       // The spawned run ended and the task has been quiet since, but no end event came: close it.
       for (const job of Object.values(store.data.jobs)) {
@@ -1151,9 +1159,10 @@ export default definePluginEntry({
           } catch (error) {
             const msg = String(error && error.message);
             log("warn", "token-guard could not wake the orchestrator", { reason: action.reason, error: msg });
-            // Agents still loading, or two wakes reached the session at the same moment ("Subagent registration owner
-            // changed during preparation", 11 times in 30 h on 2026-11-23): try again on a later tick, quietly.
-            if (/not completed startup|still starting|unavailable|registry persistence|owner changed/i.test(msg)) {
+            // Agents still loading, two wakes at the same moment ("Subagent registration owner changed during
+            // preparation", 11 times in 30 h on 2026-11-23), or the session is just being reset ("another
+            // lifecycle mutation in progress"): try again on a later tick, quietly.
+            if (/not completed startup|still starting|unavailable|registry persistence|owner changed|lifecycle mutation|still active/i.test(msg)) {
               rollbackWake(action);
             } else {
               systemNote(`wakefail:${action.reason}`, `🚩 Job tracker could not wake the orchestrator (${action.reason}): ${msg.slice(0, 160)}`);

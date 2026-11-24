@@ -1469,3 +1469,82 @@ test("safety mode: the orchestrator's messages go where it sent them, once, and 
   const added = await call({ toolName: "task_inbox", params: { action: "add", project: "infra", title: "Patch the gateway CVE", owner: "devops", details: "Upgrade to the fixed release." } }, ORC);
   assert.doesNotMatch(JSON.stringify((added && added.params) || {}), /video is still bad/);
 });
+
+test("the orchestrator's team session starts fresh on a quiet tick, in the background: never while it works, never in front of a wake", async () => {
+  const root = harness();
+  process.env.OC_INBOX_FILE = path.join(root, "inbox.jsonl");
+  process.env.OC_INBOX_BIN = path.join(REPO, "bin", "oc-inbox");
+  fs.writeFileSync(path.join(root, "state", "jobs.json"), JSON.stringify({ version: 1, jobs: {} }));
+  // a stand-in for the `openclaw` command: it records how it was called and answers like the gateway
+  const calls = path.join(root, "reset-calls.log");
+  const fake = path.join(root, "fake-openclaw.sh");
+  fs.writeFileSync(fake, `#!/bin/sh\necho "$@" >> ${calls}\necho '{"ok":true}'\n`, { mode: 0o755 });
+  globalThis.fetch = async () => ({ ok: false, status: 404, json: async () => ({}) });
+  const handlers = {};
+  const logs = [];
+  const services = [];
+  const runs = [];
+  const WAKE = "agent:coordinator:explicit:team-ops";
+  const api = {
+    pluginConfig: {
+      orchestratorAgent: "coordinator",
+      board: { enabled: false },
+      topics: { enabled: false },
+      mirror: { enabled: false },
+      triage: { enabled: false },
+      jobs: { stateFile: path.join(root, "state", "jobs.json"), idleWakeSession: WAKE, refusal: { enabled: false },
+        fresh: { enabled: true, command: fake, everyMinutes: 30, quietMinutes: 3, retryMinutes: 5 } },
+    },
+    logger: { info: (m) => logs.push(m), warn: (m) => logs.push(m), error: (m) => logs.push(m), debug: () => {} },
+    on: (name, fn) => { (handlers[name] = handlers[name] || []).push(fn); },
+    registerService: (s) => services.push(s),
+    registerTool: () => {},
+    runtime: { subagent: { run: async (p) => { runs.push(p); return { runId: `r${runs.length}` }; }, waitForRun: async () => ({ status: "ok" }), getSessionMessages: async () => ({ messages: [] }), deleteSession: async () => ({}) } },
+  };
+  const entry = (await import(pathToFileURL(path.join(root, "plugin", "index.js")).href)).default;
+  entry.register(api);
+  let tick;
+  const realSetInterval = globalThis.setInterval;
+  globalThis.setInterval = (fn) => { tick = fn; return { unref() {} }; };
+  for (const s of services) if (s.start) s.start();
+  globalThis.setInterval = realSetInterval;
+  const realNow = Date.now;
+  let skew = 0;
+  Date.now = () => realNow() + skew;
+  const call = (name, event, ctx) => { let out; for (const h of handlers[name] || []) out = h(event, ctx) ?? out; return out; };
+  const resets = () => (fs.existsSync(calls) ? fs.readFileSync(calls, "utf8").trim().split("\n").filter(Boolean) : []);
+  const fresh = () => logs.filter((l) => /started the orchestrator's team session fresh/.test(l)).length;
+  try {
+    // the gateway is still starting: nothing
+    await tick();
+    await new Promise((r) => setTimeout(r, 300));
+    assert.equal(resets().length, 0, "a reset during the gateway's start");
+    // past the start, the session quiet: one reset, with OpenClaw's sessions.reset for that one key
+    skew = 11 * 60000;
+    await tick();
+    assert.ok(await until(() => fresh() === 1), `no fresh start on a quiet tick: ${logs.filter((l) => /team session/.test(l)).join(" | ")}`);
+    assert.deepEqual(resets(), [`gateway call sessions.reset --params {"key":"${WAKE}"} --timeout 120000 --json`]);
+    // not again within the half hour
+    skew += 10 * 60000;
+    await tick();
+    await new Promise((r) => setTimeout(r, 300));
+    assert.equal(resets().length, 1, "a second reset 10 minutes after the first");
+    // half an hour later, but the orchestrator made a tool call in that session a minute ago: it is working, no reset
+    skew += 31 * 60000;
+    call("before_tool_call", { toolName: "task_inbox", params: { action: "plan" } }, { agentId: "coordinator", sessionKey: WAKE, runId: "run-1" });
+    skew += 1 * 60000;
+    await tick();
+    await new Promise((r) => setTimeout(r, 300));
+    assert.equal(resets().length, 1, "a reset while the orchestrator was working");
+    // four quiet minutes later: fresh again
+    skew += 4 * 60000;
+    await tick();
+    assert.ok(await until(() => fresh() === 2), "no fresh start once the session was quiet again");
+    assert.equal(resets().length, 2);
+    // the reset never used the plugin's own run or delete calls
+    assert.equal(runs.filter((r) => r.sessionKey === WAKE).length, 0);
+  } finally {
+    Date.now = realNow;
+    for (const s of services) if (s.stop) s.stop();
+  }
+});
