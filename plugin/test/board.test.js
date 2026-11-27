@@ -53,7 +53,26 @@ test("board view and overview", () => {
   assert.match(text, /⛔ Blocked \(1\)\n  • DNS · 1a1a1a1a\n     ↳ needs Cloudflare scope/);
   assert.match(text, /reply here: approve e5f6a7b8/);
   assert.doesNotMatch(text, /0f0f0f0f/);
-  assert.match(renderOverview({ demo: items }), /• demo: 🔄 1 in progress, ⛔ 1 blocked, ✅ 1 done/);
+  const overview = renderOverview({ demo: items }, Date.UTC(2026, 10, 4, 12, 0));
+  assert.equal(overview, "📋 Team board · updated 12:00 UTC\n\ndemo: 🔄 1 in progress · ⛔ 1 blocked\n\n✅ 1 done, waiting for your approval");
+});
+
+test("team overview: one short line per project, only to do / in progress / review / blocked", () => {
+  const mk = (n, status) => Array.from({ length: n }, (_, i) => ({ id: `x${i}`, title: "t", status }));
+  const byProject = {
+    quiet: [...mk(5, "backlog"), ...mk(2, "archived")],
+    web: [...mk(3, "todo"), ...mk(1, "qa"), ...mk(2, "review"), ...mk(4, "backlog")],
+    team: [...mk(1, "in_progress"), ...mk(2, "blocked")],
+  };
+  const text = renderOverview(byProject, Date.UTC(2026, 10, 4, 12, 0));
+  const lines = text.split("\n");
+  assert.equal(lines[0], "📋 Team board · updated 12:00 UTC");
+  assert.deepEqual(lines.slice(2), ["team: 🔄 1 in progress · ⛔ 2 blocked", "web: 📌 3 to do · 👀 3 review"]);
+  assert.doesNotMatch(text, /quiet|backlog|•|,/);
+  assert.match(renderOverview({}), /No open work\./);
+  const many = {};
+  for (let i = 0; i < 600; i++) many[`project-${i}`] = mk(1, "todo");
+  assert.ok(renderOverview(many).length <= 3900);
 });
 
 test("board audit finds lost, waiting, incomplete and missed work", () => {

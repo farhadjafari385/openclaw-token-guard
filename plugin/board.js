@@ -184,19 +184,29 @@ function renderBoard(projectName, items, now = Date.now(), maxPerColumn = 8) {
   return lines.join("\n").slice(0, 3900);
 }
 
+// The team-wide board post: one line per project, only the counts that matter on a phone.
+// Review and QA are one count; backlog, done and dropped are left out. Projects with nothing active are skipped.
+const OVERVIEW_COLS = [["todo", "📌", "to do"], ["in_progress", "🔄", "in progress"], ["review", "👀", "review"], ["blocked", "⛔", "blocked"]];
+
 function renderOverview(byProject, now = Date.now()) {
-  const lines = [`📋 Team board · updated ${new Date(now).toISOString().slice(11, 16)} UTC`, ""];
+  const lines = [`📋 Team board · updated ${new Date(now).toISOString().slice(11, 16)} UTC`];
+  let waiting = 0;
+  const rows = [];
   for (const [project, items] of Object.entries(byProject)) {
     const counts = {};
     for (const it of items) {
-      const s = normStatus(it.status);
-      if (s !== "archived") counts[s] = (counts[s] || 0) + 1;
+      const s = normStatus(it.status) === "qa" ? "review" : normStatus(it.status);
+      counts[s] = (counts[s] || 0) + 1;
+      if ((s === "done" || s === "dropped") && !it.owner_approved_ts) waiting++;
     }
-    const parts = COLUMNS.filter((c) => counts[c]).map((c) => `${ICONS[c]} ${counts[c]} ${SHORT[c]}`);
-    if (parts.length) lines.push(`• ${project}: ${parts.join(", ")}`);
+    const parts = OVERVIEW_COLS.filter(([c]) => counts[c]).map(([c, icon, label]) => `${icon} ${counts[c]} ${label}`);
+    if (parts.length) rows.push({ line: `${project}: ${parts.join(" · ")}`, blocked: counts.blocked || 0 });
   }
-  if (lines.length === 2) lines.push("No open work.");
-  return lines.join("\n");
+  rows.sort((x, y) => y.blocked - x.blocked);
+  if (rows.length) lines.push("", ...rows.map((r) => r.line));
+  else lines.push("", "No open work.");
+  if (waiting) lines.push("", `✅ ${waiting} done, waiting for your approval`);
+  return lines.join("\n").slice(0, 3900);
 }
 
 // Board problems that code can see for free. The PM audit fixes the rest.
