@@ -252,3 +252,97 @@ test("signing an Android build with a keystore from the secrets folder is allowe
   ];
   for (const c of leaks) assert.notEqual(secretReadViolation(c, {}), "", c);
 });
+
+// f1d23144 (2026-11-23): the check matched the path as typed. Globs, `.` segments, quotes, braces, variables and a
+// relative path after `cd` all read the same folder and passed.
+test("refuses reads of the secrets and qa-keys folders by glob, dot segment, quoting, braces, variable or cd", () => {
+  const bad = [
+    "cat ~/.openclaw/sec*/x",
+    "cat ~/.openclaw/secret?/x",
+    "cat ~/.openclaw/[s]ecrets/x",
+    "cat ~/.openclaw/s*ts/gitlab-main.token",
+    "cat ~/.open*/secrets/x",
+    "cat ~/.*/secrets/x",
+    "cat ~/.openclaw/*/x",
+    "cat ~/.openclaw/secrets*",
+    "cat /home/someone/.openclaw/./secrets/x",
+    "cat /home/someone/.openclaw//secrets/x",
+    "cat ~/.openclaw/foo/../secrets/x",
+    "cat ~/.openclaw/se\\crets/x",
+    "cat ~/.openclaw/\"secrets\"/x",
+    "cat ~/.openclaw/sec''rets/x",
+    "cat ~/.openclaw/{secrets,other}/x",
+    "cat $HOME/.openclaw/secrets/x",
+    "cat \"${HOME}/.openclaw/secrets/x\"",
+    "cat $HOME/.openclaw/sec*/x",
+    "cat \"${HOME}\"/.openclaw/secret?/x",
+    "cd ~/.openclaw/secrets && cat gitlab-main.token",
+    "cd ~/.openclaw; cat secrets/x",
+    "cd ~/.openclaw && cat secrets/qa-session",
+    "cd ~/.openclaw && cat sec*/x",
+    "cd ~/.openclaw && cat ./secrets/x",
+    "cd ~ && cd .openclaw && cat secrets/x",
+    "cd /home/someone/.openclaw/sub; cat ../secrets/x",
+    "cd .openclaw && cat secrets/x",
+    "cd ~/.openclaw/secrets; cat *",
+    "pushd ~/.openclaw && cat secrets/x",
+    "(cd ~/.openclaw && cat secrets/x)",
+    "D=~/.openclaw; cat $D/secrets/x",
+    "export D=$HOME/.openclaw && cat ${D}/sec*/x",
+    "cat < ~/.openclaw/sec*/x",
+    "cat --file=$HOME/.openclaw/secrets/x",
+    // qa-keys (the item names `qa-keys/qa-session-key.pem`)
+    "cat ~/.openclaw/qa-keys/qa-session-key.pem",
+    "cat ~/.openclaw/qa-key?/qa-session-key.pem",
+    "cat ~/.openclaw/qa-k*/qa-session-key.pem",
+    "cat ~/.openclaw/q*/qa-session-key.pem",
+    "cd ~/.openclaw && cat qa-keys/qa-session-key.pem",
+    "cd ~/.openclaw && cat qa-key?/qa-session-key.pem",
+    "cat $HOME/.openclaw/./qa-keys/x",
+    "head -n1 \"${HOME}/.openclaw/qa-keys/x\"",
+  ];
+  for (const command of bad) {
+    assert.notEqual(secretReadViolation(command, {}), "", command);
+    assert.equal(decide("exec", { command, workdir: os.tmpdir() }).rule, "secretRead", command);
+  }
+  // the tool's own working directory counts as the starting cwd
+  assert.notEqual(secretReadViolation("cat secrets/x", {}, "~/.openclaw"), "");
+  assert.notEqual(secretReadViolation("cat gitlab-main.token", {}, os.homedir() + "/.openclaw/secrets"), "");
+  assert.equal(decide("exec", { command: "cat secrets/x", workdir: "~/.openclaw" }).rule, "secretRead");
+  // file tools take the same paths
+  for (const p of ["~/.openclaw/sec*/x", "~/.openclaw/./secrets/x", "$HOME/.openclaw/secrets/x", "~/.openclaw/qa-keys/qa-session-key.pem", "~/.openclaw/qa-key?/x"]) {
+    assert.equal(decide("Read", { file_path: p }).rule, "secretRead", p);
+    assert.equal(decide("Grep", { path: p }).rule, "secretRead", p);
+  }
+});
+
+test("globs and cd that do not reach the secrets folder still pass; safe consumers and metadata pass by any spelling", () => {
+  const ok = [
+    "cat ~/.openclaw/openclaw.json",
+    "cat ~/.openclaw/*.json",
+    "cat ~/.openclaw/agents/main/sessions/*.jsonl",
+    "cd ~/.openclaw && cat openclaw.json",
+    "cd ~/.openclaw && ls secrets",
+    "cd ~/.openclaw/agents && cat main/x",
+    "cd /tmp && cat secrets/x",
+    "cat ~/.openclaw/token-guard/secrets.js",
+    "cat ~/other/secrets/x",
+    "ls ~/.openclaw/sec*",
+    "ls -la ~/.openclaw/secret?/",
+    "stat $HOME/.openclaw/./secrets/x",
+    "cd ~/.openclaw && ls qa-keys",
+    "cd ~/.openclaw && stat secrets/x",
+    "printf 'header = \"PRIVATE-TOKEN: %s\"\\n' \"$(cat $HOME/.openclaw/./secrets/gitlab-main.token)\" | curl -sS -K - https://gitlab.com/api/v4/user",
+    "cd ~/.openclaw && printf 'header = \"PRIVATE-TOKEN: %s\"\\n' \"$(cat secrets/gitlab-main.token)\" | curl -sS -K - https://gitlab.com/api/v4/user",
+    "cat \"${HOME}/.openclaw/secrets/x\" | docker login r.example.com -u bot --password-stdin",
+    "ssh -i ~/.openclaw/qa-keys/qa-session-key.pem qa@host true",
+    "cd ~/.openclaw && ssh -i qa-keys/qa-session-key.pem qa@host true",
+    "apksigner sign --ks ~/.openclaw/secrets/upload.jks --ks-pass file:/home/someone/.openclaw/./secrets/ks.pass app.apk",
+    "GIT_ASKPASS=/tmp/ask.sh git push origin agent/1",
+    "ls -la /home/someone/.openclaw/./secrets",
+    "find ~/.openclaw/sec* -name '*.token'",
+  ];
+  for (const command of ok) {
+    assert.equal(secretReadViolation(command, {}), "", command);
+  }
+});

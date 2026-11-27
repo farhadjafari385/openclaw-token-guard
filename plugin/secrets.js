@@ -216,7 +216,116 @@ function findSecretDeep(value, cfg, depth = 0) {
 
 // ---- reading the secrets folder ----
 
-const SECRET_DIR_RE = /(?:~|\$HOME|\$\{HOME\}|\/home\/[^/\s'"]+|\/root)?\/?\.openclaw\/secrets\b/;
+const SECRET_DIR_RE = /(?:~|\$HOME|\$\{HOME\}|\/home\/[^/\s'"]+|\/root)?\/?\.openclaw\/(?:secrets|qa-keys)\b/;
+
+// The literal regex above only sees the path as typed. These helpers resolve a command the way the shell would
+// (2026-11-23, f1d23144): globs (`sec*`, `secret?`, `[s]ecrets`), `.`/`..`/`//` segments, quotes and backslashes inside
+// a name, braces, $HOME/${HOME}/~ and simple VAR=path assignments, and a relative path after `cd`.
+const PROTECTED_DIRS = ["secrets", "qa-keys"];
+const HOME_MARK = "/H";
+
+function globRe(g) {
+  let re = "";
+  for (let i = 0; i < g.length; i++) {
+    const c = g[i];
+    if (c === "*") re += "[^/]*";
+    else if (c === "?") re += "[^/]";
+    else if (c === "[") {
+      const j = g.indexOf("]", i + 2);
+      if (j < 0) { re += "\\["; continue; }
+      let body = g.slice(i + 1, j);
+      if (body[0] === "!") body = "^" + body.slice(1);
+      re += `[${body.replace(/\\/g, "\\\\")}]`;
+      i = j;
+    } else re += c.replace(/[.+^${}()|\\/\]]/g, "\\$&");
+  }
+  try { return new RegExp(`^${re}$`); } catch { return null; }
+}
+
+// Does one path component (literal or glob) name this directory?
+function compNames(comp, literal) {
+  if (!/[*?[]/.test(comp)) return comp === literal;
+  if (literal.startsWith(".") && !comp.startsWith(".")) return false; // a glob never matches a leading dot by itself
+  const re = globRe(comp);
+  return !!re && re.test(literal);
+}
+
+function stackHits(stack) {
+  for (let i = 0; i + 1 < stack.length; i++) {
+    if (compNames(stack[i], ".openclaw") && PROTECTED_DIRS.some((d) => compNames(stack[i + 1], d))) return true;
+  }
+  return false;
+}
+
+// A path as a normalised component list, relative paths joined onto cwd (a stack; ["?"] = unknown).
+function resolveStack(word, cwd) {
+  let p = word;
+  if (/^~(?:\/|$)/.test(p)) p = HOME_MARK + p.slice(1);
+  else if (/^\/home\/[^/]+(?:\/|$)/.test(p)) p = p.replace(/^\/home\/[^/]+/, HOME_MARK);
+  else if (/^\/root(?:\/|$)/.test(p)) p = p.replace(/^\/root/, HOME_MARK);
+  const stack = p.startsWith("/") ? [] : cwd.slice();
+  for (const c of p.split("/")) {
+    if (c === "" || c === ".") continue;
+    if (c === "..") { if (stack.length && stack[stack.length - 1] !== "?") stack.pop(); continue; }
+    stack.push(c);
+  }
+  return stack;
+}
+
+function expandBraces(w, out = [], depth = 0) {
+  const m = /\{([^{}]*,[^{}]*)\}/.exec(w);
+  if (!m || depth > 4 || out.length > 64) { out.push(w); return out; }
+  for (const alt of m[1].split(",")) expandBraces(w.slice(0, m.index) + alt + w.slice(m.index + m[0].length), out, depth + 1);
+  return out;
+}
+
+function statementWords(st, vars) {
+  let t = st.replace(/\$\(|[`<>|()&]/g, " ").replace(/['"\\]/g, "");
+  for (let i = 0; i < 3; i++) {
+    t = t.replace(/\$\{(\w+)\}|\$(\w+)/g, (m, a, b) => {
+      const n = a || b;
+      if (n === "HOME") return "~";
+      return Object.prototype.hasOwnProperty.call(vars, n) ? vars[n] : m;
+    });
+  }
+  const out = [];
+  for (const w of t.split(/\s+/).filter(Boolean)) out.push(...expandBraces(w));
+  return out;
+}
+
+// Per statement: does it name the protected folders once resolved? Walks the statements in order, following
+// `cd`, `pushd` and `NAME=value`. Returns one boolean per statement.
+function resolvedHits(stmts, cwd0) {
+  let cwd = cwd0 ? resolveStack(cwd0, ["?"]) : ["?"];
+  const vars = {};
+  return stmts.map((st) => {
+    const words = statementWords(st, vars);
+    if (!words.length) return false;
+    const cdm = /^(?:cd|pushd)$/.test(words[0]);
+    if (cdm) {
+      const target = words.slice(1).find((w) => !w.startsWith("-")) || "~";
+      const stack = target === "-" ? ["?"] : resolveStack(target, cwd);
+      const hit = stackHits(stack);
+      cwd = target.includes("$") ? ["?"] : stack;
+      return hit || stackHits(cwd);
+    }
+    const asg = words.filter((w) => w !== "export" && w !== "declare").filter((w) => /^[A-Za-z_]\w*=/.test(w));
+    if (asg.length && asg.length === words.filter((w) => w !== "export" && w !== "declare").length) {
+      for (const a of asg) { const i = a.indexOf("="); vars[a.slice(0, i)] = a.slice(i + 1); }
+    }
+    const inProtected = stackHits(cwd);
+    let hit = false;
+    words.forEach((w, i) => {
+      for (const part of new Set([w, ...w.split(/[=:]/)])) {
+        if (!part) continue;
+        if (stackHits(resolveStack(part, cwd))) { hit = true; return; }
+        // cwd is inside the folder: any plain relative argument names a file in it (not the command, not a flag)
+        if (inProtected && i > 0 && !part.startsWith("-") && !/^[/~$]/.test(part)) { hit = true; return; }
+      }
+    });
+    return hit;
+  });
+}
 
 // The value given to oc-secret-save on a heredoc is the one place a value may appear: it is the input.
 const SAVE_HEREDOC = /(\boc-secret-save\b[^\n]*?<<-?[ \t]*(['"]?)([A-Za-z_][A-Za-z0-9_]*)\2[^\n]*\n)[\s\S]*?\n[ \t]*\3[ \t]*(?=\n|$)/g;
@@ -252,14 +361,15 @@ function statements(command) {
 }
 
 // Why a command reads the secrets folder in a way that can print a value, or "".
-function secretReadViolation(rawCommand, cfg) {
+function secretReadViolation(rawCommand, cfg, cwd) {
   const s = mergeSecrets(cfg);
   const command = stripSaveInput(rawCommand);
-  if (!SECRET_DIR_RE.test(command)) return "";
   const extra = (s.allowCommands || []).map((r) => { try { return new RegExp(r); } catch { return null; } }).filter(Boolean);
   const askpass = /\bGIT_ASKPASS\b/.test(command);
-  for (const st of statements(command)) {
-    if (!SECRET_DIR_RE.test(st)) continue;
+  const stmts = statements(command);
+  const resolved = resolvedHits(stmts, cwd);
+  for (const [i, st] of stmts.entries()) {
+    if (!SECRET_DIR_RE.test(st) && !resolved[i]) continue;
     if (extra.some((re) => re.test(st))) continue;
     if (METADATA.test(st) && !LEAKY.test(st)) continue;
     if (CONSUMERS.some((re) => re.test(st)) && !LEAKY.test(st)) continue;
@@ -279,7 +389,9 @@ function underSecrets(p, cfg) {
   const s = mergeSecrets(cfg);
   const dir = path.resolve(expandHome(s.dir));
   const abs = path.resolve(expandHome(String(p || "")));
-  return abs === dir || abs.startsWith(dir + path.sep) || SECRET_DIR_RE.test(String(p || ""));
+  if (abs === dir || abs.startsWith(dir + path.sep) || SECRET_DIR_RE.test(String(p || ""))) return true;
+  const word = String(p || "").replace(/['"\\]/g, "");
+  return expandBraces(word).some((w) => stackHits(resolveStack(w.replace(/^\$\{?HOME\}?/, "~"), ["?"])));
 }
 
 function toolPaths(params) {
@@ -338,7 +450,7 @@ function secretDecide(event, ctx, cfg, log) {
   }
   if (SHELL_TOOLS.has(tool)) {
     const command = typeof params.command === "string" ? params.command : "";
-    const why = secretReadViolation(command, cfg);
+    const why = secretReadViolation(command, cfg, params.workdir || params.cwd);
     if (why) return block("secretRead", `token-guard: \`${why}\` reads the secrets folder where its value can be printed. ${HOW}`);
   }
 
