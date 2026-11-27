@@ -10,6 +10,10 @@ import { execFileSync } from "node:child_process";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { findSecret, redactText, redactDeep, secretDecide, secretReadViolation, envEntries } from "../secrets.js";
 
+// Run from a git pre-push hook, git exports GIT_DIR and friends, which would point every temp-repo command in this file
+// (and the guard's own `git -C <dir> log`) at the hook's repository instead of the temp one.
+for (const k of ["GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_PREFIX", "GIT_COMMON_DIR", "GIT_OBJECT_DIRECTORY", "GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_QUARANTINE_PATH"]) delete process.env[k];
+
 const PLUGIN = path.join(path.dirname(fileURLToPath(import.meta.url)), "..");
 const REPO = path.join(PLUGIN, "..");
 
