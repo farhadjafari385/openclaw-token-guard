@@ -76,6 +76,30 @@ class TestOcSecretSave(unittest.TestCase):
         self.assertEqual(self.run_tool(["link.token"], "v").returncode, 2)
         self.assertNotEqual(self.run_tool([], "v").returncode, 0)
 
+    def load_tool(self):
+        from importlib.machinery import SourceFileLoader
+        return SourceFileLoader("oc_secret_save", TOOL).load_module()
+
+    def test_the_folder_comes_from_the_system_account_not_from_HOME(self):
+        import pwd
+        tool = self.load_tool()
+        old_home, old_dir = os.environ.get("HOME"), os.environ.pop("OC_SECRETS_DIR", None)
+        try:
+            os.environ["HOME"] = os.path.join(self.tmp.name, "fake-home")
+            expected = os.path.join(pwd.getpwuid(os.getuid()).pw_dir, ".openclaw", "secrets")
+            self.assertEqual(tool.secrets_dir(), expected)
+            self.assertNotIn("fake-home", tool.secrets_dir())
+            os.environ["OC_SECRETS_DIR"] = self.dir  # the tests' own override still works
+            self.assertEqual(tool.secrets_dir(), self.dir)
+        finally:
+            os.environ.pop("OC_SECRETS_DIR", None)
+            if old_dir is not None:
+                os.environ["OC_SECRETS_DIR"] = old_dir
+            if old_home is None:
+                os.environ.pop("HOME", None)
+            else:
+                os.environ["HOME"] = old_home
+
 
 if __name__ == "__main__":
     unittest.main()

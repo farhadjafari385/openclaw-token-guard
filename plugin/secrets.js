@@ -295,9 +295,9 @@ function statementWords(st, vars) {
 
 // Per statement: does it name the protected folders once resolved? Walks the statements in order, following
 // `cd`, `pushd` and `NAME=value`. Returns one boolean per statement.
-function resolvedHits(stmts, cwd0) {
+function resolvedHits(stmts, cwd0, vars0) {
   let cwd = cwd0 ? resolveStack(cwd0, ["?"]) : ["?"];
-  const vars = {};
+  const vars = Object.assign({}, vars0 || {});
   return stmts.map((st) => {
     const words = statementWords(st, vars);
     if (!words.length) return false;
@@ -361,13 +361,38 @@ function statements(command) {
 }
 
 // Why a command reads the secrets folder in a way that can print a value, or "".
-function secretReadViolation(rawCommand, cfg, cwd) {
+// The environment a shell tool call passes to its command (`env` or `environment`): an object, or a list of KEY=VALUE.
+// ed6d6050: the guard read only `command`, so `{ command: "cat $F", env: { F: "~/.openclaw/secrets/x" } }` got through.
+function envEntries(params) {
+  const raw = params && (params.env || params.environment);
+  const out = {};
+  if (Array.isArray(raw)) {
+    for (const e of raw) {
+      const i = typeof e === "string" ? e.indexOf("=") : -1;
+      if (i > 0) out[e.slice(0, i)] = e.slice(i + 1);
+    }
+  } else if (raw && typeof raw === "object") {
+    for (const [k, v] of Object.entries(raw)) if (typeof v === "string" || typeof v === "number") out[k] = String(v);
+  }
+  return out;
+}
+
+function secretReadViolation(rawCommand, cfg, cwd, env) {
   const s = mergeSecrets(cfg);
   const command = stripSaveInput(rawCommand);
   const extra = (s.allowCommands || []).map((r) => { try { return new RegExp(r); } catch { return null; } }).filter(Boolean);
   const askpass = /\bGIT_ASKPASS\b/.test(command);
   const stmts = statements(command);
-  const resolved = resolvedHits(stmts, cwd);
+  const vars = env && typeof env === "object" ? env : {};
+  const resolved = resolvedHits(stmts, cwd, vars);
+  // An environment variable that itself names the secrets folder hands the path to whatever the command runs (a
+  // script, `sh -c`, python reading os.environ): allowed only when the command is a safe consumer.
+  const envKey = Object.keys(vars).find((k) => SECRET_DIR_RE.test(vars[k]) || resolvedHits([`x ${vars[k]}`], cwd)[0]);
+  if (envKey !== undefined && !extra.some((re) => stmts.some((st) => re.test(st))) &&
+      !(stmts.some((st) => CONSUMERS.some((re) => re.test(st))) && !LEAKY.test(command)) &&
+      !(stmts.every((st) => METADATA.test(st)) && !LEAKY.test(command))) {
+    return `env ${envKey}=<path in the secrets folder> + ${stmts[0].length > 80 ? `${stmts[0].slice(0, 77)}...` : stmts[0]}`;
+  }
   for (const [i, st] of stmts.entries()) {
     if (!SECRET_DIR_RE.test(st) && !resolved[i]) continue;
     if (extra.some((re) => re.test(st))) continue;
@@ -450,7 +475,7 @@ function secretDecide(event, ctx, cfg, log) {
   }
   if (SHELL_TOOLS.has(tool)) {
     const command = typeof params.command === "string" ? params.command : "";
-    const why = secretReadViolation(command, cfg, params.workdir || params.cwd);
+    const why = secretReadViolation(command, cfg, params.workdir || params.cwd, envEntries(params));
     if (why) return block("secretRead", `token-guard: \`${why}\` reads the secrets folder where its value can be printed. ${HOW}`);
   }
 
@@ -487,6 +512,7 @@ export {
   resetSecretCache,
   secretDecide,
   secretReadViolation,
+  envEntries,
   secretish,
   stripSaveInput,
 };

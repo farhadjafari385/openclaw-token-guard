@@ -8,7 +8,11 @@ import os from "node:os";
 import path from "node:path";
 import { execFileSync } from "node:child_process";
 import { fileURLToPath, pathToFileURL } from "node:url";
-import { findSecret, redactText, redactDeep, secretDecide, secretReadViolation } from "../secrets.js";
+import { findSecret, redactText, redactDeep, secretDecide, secretReadViolation, envEntries } from "../secrets.js";
+
+// Run from a git pre-push hook, git exports GIT_DIR and friends, which would point every temp-repo command in this file
+// (and the guard's own `git -C <dir> log`) at the hook's repository instead of the temp one.
+for (const k of ["GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_PREFIX", "GIT_COMMON_DIR", "GIT_OBJECT_DIRECTORY", "GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_QUARANTINE_PATH"]) delete process.env[k];
 
 const PLUGIN = path.join(path.dirname(fileURLToPath(import.meta.url)), "..");
 const REPO = path.join(PLUGIN, "..");
@@ -345,4 +349,36 @@ test("globs and cd that do not reach the secrets folder still pass; safe consume
   for (const command of ok) {
     assert.equal(secretReadViolation(command, {}), "", command);
   }
+});
+
+test("the exec env field is checked: a variable naming the secrets folder is refused unless the command is a safe consumer (ed6d6050)", () => {
+  const refused = [
+    ["cat $F", { F: "~/.openclaw/secrets/gitlab-main.token" }],
+    ["cat \"$F\"", { F: "/home/someone/.openclaw/secrets/gitlab-main.token" }],
+    ["cat $F", { F: "$HOME/.openclaw/sec*/gitlab-main.token" }],
+    ["cat $F", { F: "~/.openclaw/qa-k*/qa-session-key.pem" }],
+    ["cat $D/$N", { D: "~/.openclaw/secr*", N: "gitlab-main.token" }],
+    ["python3 show.py", { F: "~/.openclaw/secrets/gitlab-main.token" }],
+    ["sh -c 'cat $F'", { F: "~/.openclaw/s*/qa-key*" }],
+  ];
+  for (const [command, env] of refused) {
+    assert.notEqual(secretReadViolation(command, {}, undefined, env), "", `${command} ${JSON.stringify(env)}`);
+    const r = decide("exec", { command, env });
+    assert.equal(r && r.rule, "secretRead", command);
+    assert.equal(decide("exec", { command, environment: Object.entries(env).map(([k, v]) => `${k}=${v}`) }).rule, "secretRead", command);
+  }
+  const ok = [
+    ["cat $F", { F: "/tmp/notes.txt" }],
+    ["cat $F", { F: "~/.openclaw/openclaw.json" }],
+    ["ls $F", { F: "~/.openclaw/secrets" }],
+    ["printf 'header = \"PRIVATE-TOKEN: %s\"\\n' \"$(cat $F)\" | curl -sS -K - https://gitlab.com/api/v4/user", { F: "~/.openclaw/secrets/gitlab-main.token" }],
+  ];
+  for (const [command, env] of ok) {
+    assert.equal(secretReadViolation(command, {}, undefined, env), "", `${command} ${JSON.stringify(env)}`);
+    assert.equal(decide("exec", { command, env }), undefined, command);
+  }
+  assert.deepEqual(envEntries({ env: ["A=1", "B=x=y", "bad"] }), { A: "1", B: "x=y" });
+  assert.deepEqual(envEntries({}), {});
+  // a secret value (not a path) in env is still caught by the value scan
+  assert.equal(decide("exec", { command: "true", env: { T: VALUE } }).rule, "secretInCommand");
 });
